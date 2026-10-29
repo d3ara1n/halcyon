@@ -189,7 +189,7 @@ quit 0
     script_path.write_text(script)
     ast.parse(script.split("\npython\n", 1)[1].split("\nend\n", 1)[0], filename=str(script_path))
     output = (logs / "install.log").open("w")
-    child = subprocess.Popen(["riscv64-elf-gdb", "-q", "-nx", "--batch", "-x", str(script_path)], stdout=output, stderr=subprocess.STDOUT)
+    child = subprocess.Popen(["riscv64-elf-gdb", "-q", "-nx", "--batch", "-x", str(script_path)], stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
     return child, output, logs
 
 

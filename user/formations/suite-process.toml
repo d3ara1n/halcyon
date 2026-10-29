@@ -1,0 +1,5 @@
+# process 领域的输入与选择。
+[instance.kernel]
+settings.suite = "process"
+settings.mode = []
+inputs."kernel.image.test_target" = "init/image.test_target"

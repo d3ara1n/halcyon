@@ -52,7 +52,7 @@ def start(kernel, port, target_file, controller_pid):
         ast.parse(body, filename=str(script_path))
     output = (logs / "exit.log").open("w")
     child = subprocess.Popen(["riscv64-elf-gdb", "-q", "-nx", "--batch", "-x", str(script_path)],
-                             stdout=output, stderr=subprocess.STDOUT)
+                             stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
     return child, output, logs
 
 

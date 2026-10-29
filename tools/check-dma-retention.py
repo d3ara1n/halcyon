@@ -80,7 +80,7 @@ quit 0
         raise RuntimeError(f'incomplete DMA/IPI combination evidence: {logs}')
     (logs/'evidence.json').write_text(json.dumps({
         **evidence, 'gdb_exit': result.returncode, 'status': 'completed',
-        'scope': 'virt core actual DMA pins; SBI reset rejection, boot DONE observer and four terminal parks',
+        'scope': 'isolated DMA suite pins; SBI reset rejection, boot DONE observer and four terminal parks',
         'limits': 'addresses are not programmed into hardware; no DMA quiescence, IOMMU, timing or exclusive wake-source claim',
     }, indent=2)+'\n')
     print(f'DMA retention acceptance passed: {logs}')

@@ -1,0 +1,4 @@
+# 只核出生输入采用与 task 正常收集，不夹带领域业务。
+[instance.kernel]
+settings.suite = "startup"
+settings.mode = []

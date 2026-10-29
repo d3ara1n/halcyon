@@ -1,0 +1,9 @@
+# 普通 DMA 及保留责任观察使用，其他资源专项不创建保留子进程。
+[instance.kernel]
+inputs."kernel.retention" = "init/pool.retention"
+inputs."kernel.image.test_kernel" = "init/image.test_kernel"
+
+[pool.retention]
+# 两份既有单进程工作集，独立持有跨 reset 的两个 fixture。
+work_pages = 8192
+metadata_bytes = 2097152

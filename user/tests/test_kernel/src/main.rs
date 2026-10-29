@@ -134,7 +134,6 @@ fn launch_children(
     harness: &mut Harness,
     services: Handle,
     pm_domain: Handle,
-    acceptance: Handle,
     pm_image: &[u8],
     target_image: &[u8],
 ) -> Result<Handle, &'static str> {
@@ -147,17 +146,6 @@ fn launch_children(
     let delegated = harness
         .duplicate(pm_domain, JOB_FULL_RIGHTS)
         .map_err(|_| "pm domain delegation failed")?;
-    let target = spawn(SpawnRequest {
-        memory_pool: memory_pool(),
-        parent: current_process(),
-        job: acceptance,
-        image: target_image,
-        payload: &[],
-        grants: &[],
-        control_rights: SUPERVISOR_RIGHTS,
-    })
-    .map_err(|_| "target spawn failed")?;
-    job_checks::test_derive_kill(harness, acceptance, target.pid, target.control)?;
     let target = spawn(SpawnRequest {
         memory_pool: memory_pool(),
         parent: current_process(),
@@ -214,111 +202,122 @@ fn run(
     target: &[u8],
     hammer: Option<&[u8]>,
 ) -> Result<(), &'static str> {
-    if mode().memory() {
-        let job = harness
-            .create_job(services, memory_pool(), JOB_FULL_RIGHTS)
-            .map_err(|_| "memory workload job create failed")?;
-        if !race_checks::thread_memory_suite(job, hammer.ok_or("memory workload hammer missing")?) {
-            return Err("memory workload thread suite failed");
+    match startup::suite() {
+        "memory" => {
+            if mode().memory() {
+                let job = harness
+                    .create_job(services, memory_pool(), JOB_FULL_RIGHTS)
+                    .map_err(|_| "memory workload job create failed")?;
+                if !race_checks::thread_memory_suite(
+                    job,
+                    hammer.ok_or("memory workload hammer missing")?,
+                ) {
+                    return Err("memory workload thread suite failed");
+                }
+                harness.collect_job(job)?;
+                harness.close_control(job)?;
+            } else {
+                memory_checks::test_memory_mapping()?;
+                memory_checks::test_process_funding(services)?;
+                memory_checks::test_pool_budget();
+            }
         }
-        harness.collect_job(job)?;
-        harness.close_control(job)?;
-        debug!("memory workload collected");
-        return Ok(());
+        "ipc" => {
+            let job = harness
+                .create_job(services, memory_pool(), JOB_FULL_RIGHTS)
+                .map_err(|_| "IPC workload job create failed")?;
+            ipc_thread_checks::shared_sender();
+            ipc_thread_checks::notification_roles();
+            once_checks::run(harness, job, target)?;
+            ipc_checks::test_capability_badges_and_affine_owners();
+            ipc_checks::test_send_once();
+            ipc_checks::test_wait_set_retirement();
+            ipc_checks::test_writable_level();
+            ipc_thread_checks::threaded_receive();
+            if mode().stress() {
+                ipc_checks::stress_control_plane();
+            }
+            harness.collect_job(job)?;
+            harness.close_control(job)?;
+        }
+        "process" => {
+            let job = harness
+                .create_job(services, memory_pool(), JOB_FULL_RIGHTS)
+                .map_err(|_| "process workload job create failed")?;
+            let child = spawn(SpawnRequest {
+                memory_pool: memory_pool(),
+                parent: current_process(),
+                job,
+                image: target,
+                payload: &[],
+                grants: &[],
+                control_rights: SUPERVISOR_RIGHTS,
+            })
+            .map_err(|_| "derive target spawn failed")?;
+            job_checks::test_derive_kill(harness, job, child.pid, child.control)?;
+            ipc_thread_checks::committed_kill(job, target);
+            job_checks::test_building_kill(job);
+            job_checks::test_job_management(harness, job, target)?;
+            if mode().stress() {
+                race_checks::race_matrix(
+                    harness,
+                    job,
+                    target,
+                    hammer.ok_or("race hammer missing")?,
+                )?;
+            }
+            harness.collect_job(job)?;
+            harness.close_control(job)?;
+        }
+        "transport" => run_transport(harness, services, pm_image, target)?,
+        "mmio" => {
+            let root = startup::ecam_handle().ok_or("MMIO platform root missing")?;
+            if mode().ordinary() {
+                mmio_checks::run(root)?;
+            }
+            mmio_checks::process_retirement(root, services, target)?;
+        }
+        "irq" => {
+            let root = startup::irq_handle().ok_or("IRQ platform root missing")?;
+            if mode().ordinary() {
+                irq_checks::run(root)?;
+            }
+            if mode().has(Mode::IRQ_EXIT) {
+                irq_checks::process_retirement(root, services, target)?;
+            }
+        }
+        "dma" => {
+            let root = startup::dma_handle().ok_or("DMA platform root missing")?;
+            if mode().ordinary() {
+                dma_checks::run(root)?;
+            }
+            dma_checks::process_retirement(root, services, target)?;
+        }
+        "time" => time_checks::run(),
+        // 有限组态的 task：出生采用由 startup 完成，随后执行同一 Job 收集与完成报告。
+        "startup" => {}
+        _ => return Err("kernel acceptance suite unknown"),
     }
-    memory_checks::test_memory_mapping()?;
-    let ecam = startup::ecam_handle();
-    if let Some(ecam) = ecam {
-        mmio_checks::run(ecam)?;
-    }
-    let irq = startup::irq_handle();
-    if let Some(irq) = irq {
-        irq_checks::run(irq)?;
-    }
-    let dma = startup::dma_handle();
-    if let Some(dma) = dma {
-        dma_checks::run(dma)?;
-    }
-    if !mode().stress() {
-        memory_checks::test_process_funding(services)?;
+    harness.collect_services()?;
+    Ok(())
+}
+
+fn run_transport(
+    harness: &mut Harness,
+    services: Handle,
+    pm_image: &[u8],
+    target: &[u8],
+) -> Result<(), &'static str> {
+    tunnel_checks::test_tunnel_failure_owners();
+    tunnel_checks::test_tunnel_geometry();
+    rpc_checks::test_rpc_reject_cleanup();
+    if mode().stress() {
+        tunnel_checks::test_tunnel_lifecycle();
     }
     let pm_domain = harness
         .create_job(services, memory_pool(), JOB_FULL_RIGHTS)
         .map_err(|_| "pm domain job create failed")?;
-    let acceptance = harness
-        .create_job(services, memory_pool(), JOB_FULL_RIGHTS)
-        .map_err(|_| "acceptance job create failed")?;
-    ipc_thread_checks::shared_sender();
-    ipc_thread_checks::notification_roles();
-    memory_checks::test_pool_budget();
-    let pm_mailbox = launch_children(harness, services, pm_domain, acceptance, pm_image, target)?;
-    once_checks::run(harness, acceptance, target)?;
-    let pair = create(
-        Rights::READ | Rights::WAIT | Rights::MANAGE,
-        Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
-    )
-    .expect("mailbox create failed");
-
-    let event = { let mut pair = libkernel::shared::object::HandlePair::new(Handle::INVALID, Handle::INVALID); /* SAFETY: ABI 夹具独占有效输出及新表项关闭责任。 */ unsafe { libkernel::sys_notification_create(
-        Rights::READ | Rights::WAIT | Rights::MANAGE,
-        Rights::SIGNAL | Rights::TRANSIT | Rights::DUPLICATE, &mut pair) }.map(|()| pair) }
-    .expect("notification create failed");
-    let moves = [HandleMove {
-        handle: event.peer,
-        rights: Rights::SIGNAL,
-    }];
-
-    // —— 同步消息 + Handle move + Notification 单来源快路径 ——
-    match unsafe { send_raw(pair.peer, 114, &[5u8, 1u8, 4u8], &moves) } {
-        Ok(()) => match receive(pair.owner) {
-            Ok(message) => {
-                debug!(
-                    "message: kind={}, payload={:?}",
-                    message.header.kind, message.payload
-                );
-                let moved = message
-                    .handles
-                    .get(0)
-                    .expect("notification slot missing")
-                    .as_handle();
-                /* SAFETY: 原始 ABI 夹具的值参数，不改变表项关闭责任。 */
-                unsafe { libkernel::sys_notification_signal(moved, 0x5) }
-                    .expect("notification signal failed");
-                let _result = wait_until(
-                    event.owner,
-                    ObjectSignals::READABLE,
-                    libkernel::time::timeout_millis(0).unwrap(),
-                )
-                .expect("notification wait failed");
-                let bits =
-                    { let mut bits = 0; /* SAFETY: ABI 夹具借用有效 handle，输出在同步调用期间私有。 */ unsafe { libkernel::sys_notification_take(event.owner, u64::MAX, &mut bits) }.map(|()| bits) }.expect("notification take failed");
-                debug!("notification: bits={:#x}", bits);
-            }
-            Err(e) => debug!("receive failed: {:?}", e),
-        },
-        Err(e) => debug!("send failed: {:?}", e),
-    }
-    let _ = unsafe { close(event.owner) };
-    let _ = unsafe { close(pair.peer) };
-    let _ = unsafe { close(pair.owner) };
-
-    tunnel_checks::test_tunnel_failure_owners();
-    tunnel_checks::test_tunnel_geometry();
-    ipc_checks::test_capability_badges_and_affine_owners();
-    if mode().stress() {
-        ipc_checks::stress_control_plane();
-    }
-    if mode().stress() {
-        tunnel_checks::test_tunnel_lifecycle();
-    }
-    ipc_checks::test_send_once();
-    ipc_checks::test_wait_set_retirement();
-    rpc_checks::test_rpc_reject_cleanup();
-    ipc_checks::test_writable_level();
-    ipc_thread_checks::threaded_receive();
-    time_checks::run();
-    ipc_thread_checks::committed_kill(acceptance, target);
-
+    let pm_mailbox = launch_children(harness, services, pm_domain, pm_image, target)?;
     // —— 数据面：建隧道 → Invitation 经消息面转移 → 阻塞读流 ——
     let (tunnel, invitation) = match blocking::Consumer::create(
         memory_pool(),
@@ -411,18 +410,6 @@ fn run(
     ipc_checks::test_writable_wake(harness, pm_mailbox)?;
     harness.close_control(pm_mailbox)?;
 
-    // —— live kill 正路径：Building 目标的确定性 Kill/自动退休/终态验证 ——
-    job_checks::test_building_kill(acceptance);
-
-    job_checks::test_job_management(harness, acceptance, target)?;
-    if mode().stress() {
-        race_checks::race_matrix(
-            harness,
-            acceptance,
-            target,
-            hammer.ok_or("race hammer missing")?,
-        )?;
-    }
     // —— 事件面：自动退休已发布对端终态，电平等待立即返回 ——
     let peer_closed = tunnel_checks::wait_supervision_signal(
         harness
@@ -486,9 +473,6 @@ fn run(
 
     harness.close_control(pm_domain)?;
     rpc_checks::exercise_cancellable_rpc(harness)?;
-    harness.collect_job(acceptance)?;
-    harness.close_control(acceptance)?;
-    harness.collect_services()?;
     Ok(())
 }
 

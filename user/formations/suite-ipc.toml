@@ -1,0 +1,5 @@
+# ipc 领域的输入与选择。
+[instance.kernel]
+settings.suite = "ipc"
+settings.mode = []
+inputs."kernel.image.test_target" = "init/image.test_target"

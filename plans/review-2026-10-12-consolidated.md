@@ -37,7 +37,7 @@
 - [对象链修复档案](archived/review-2026-10-07-object-chain.md#r4-b1不可恢复门铃终态)已经明确选择不可恢复 `runtime_stop`：不保证失去门铃的无 timer hart 被再次唤醒；任意后续唤醒先检查停止事实，再 park；资源留到重启，不推进正常回收，不保证设备/DMA 撤销。
 - [runtime_stop.rs](../os/kernel/src/runtime_stop.rs) 的 REQUESTED/STOPPED 是全局不可逆事实，PARKED 只记录实际进入 Rust park 的 hart；[sched::idle](../os/kernel/src/sched.rs)在 WFI 前后检查停止。[当前实现说明](../notes/impls/internals.md#ipi-门铃与-remote-call)明确“不把 PARKED 当全 admitted 完成 barrier，不等它参与退款”。
 - `git diff ac9d7d9 HEAD -- os/kernel/src/runtime_stop.rs os/kernel/src/sched.rs` 为空；本轮没有用后续代码替固定树补保证。
-- 既有真实 IPI 注入验证的是“后续真实广播唤醒后先停驻”，不证明无未来门铃也全部 PARKED；[构建手册](BUILD-AND-TEST.md#qemu-路线与选择)与该边界一致。
+- 既有真实 IPI 注入验证的是“后续真实广播唤醒后先停驻”，不证明无未来门铃也全部 PARKED；[构建手册](BUILD-AND-TEST.md#验收入口)与该边界一致。
 
 **未来影响：** 设备隔离、共享供应释放或完整全 hart 屏障不能消费这个 fail-stop 当作完成证明。若未来明确要求门铃不可恢复时仍完成设备收束或全体确认，应先在设备/平台/系统终局设计中确定新合同；归 D04/D08，不能把新需求反写成当前 F2 bug。
 
@@ -55,7 +55,7 @@
 
 - **合法 WaitSet Remove 的真实 Busy/Quota 注入不适用。** [WaitSet::remove](../os/kernel/src/task/wait_set.rs)（250—260）有锁摘 token、锁外 Drop/kick，不分配且没有 Busy/Quota 分支；未知 token 为 ObjectNotFound，Runtime 按已退休处理。通用 SourceOps 的失败保 owner/回执/费用已有 host 边界；不能要求当前内核制造不存在的资源拒绝。对应 FAL F-01、执行 E-02 的这一部分退出；真实映射撤销失败与异步回执组合仍归 E03。
 - **独占、合法、非映射 Handle/Delivery Close 的资源性失败不适用。** [FAL 主计划再核](todo-2026-10-07-fal-service-redesign.md#提交前机制收敛)第 1674—1678 行、C08/C10 已区分叶能力 Close 与映射 Unmap。旧 close-retry 暂存删除不能被旧报告恢复为施工要求；错误 raw handle 与进程已经退出是另一失败合同。
-- **Copy 的非零目标 accepted 后取消已有实现及运行记录。** 当前[正式消费者](../user/services/srv_init/src/filesystem/copy.rs)经真实 ReadAt 确认非零前缀，再取消并核最终前缀、并发隔离和退款；验收器仍要求对应锚点。[主计划第二轮验证与第三轮最终收口](archived/ref-2026-10-27-oal-fs-delivery-history.md#第三轮最终收口)记录最终 C10/C11 聚合覆盖该门，原证据路径为 `artifacts/convergence3/acceptance-summary.json`。该原始产物当前不在工作区，运行结果按已交付工作记录取证，未重新逐 guest 验证。FAL F-05 中“未接通/未运行”的表述不适用于其主固定目标 `a1ca124`；不因此宣称所有取消交错已覆盖。坏帧/Delivery 特定失败仍归 E04。
+- **Copy 的非零目标 accepted 后取消有历史实现及运行记录。** 当时的 `srv_init/src/filesystem/copy.rs` 消费者经真实 ReadAt 确认非零前缀，再取消并核最终前缀、并发隔离和退款；该消费者在组态切面 B 已删，旧验收锚点由[验收清理](todo-2026-10-29-acceptance-groups.md)删除，不再作为当前可运行覆盖。[主计划第二轮验证与第三轮最终收口](archived/ref-2026-10-27-oal-fs-delivery-history.md#第三轮最终收口)记录最终 C10/C11 聚合覆盖该门，原证据路径为 `artifacts/convergence3/acceptance-summary.json`。该原始产物当前不在工作区，运行结果按已交付工作记录取证，未重新逐 guest 验证。FAL F-05 中“未接通/未运行”的表述不适用于其主固定目标 `a1ca124`；不因此宣称所有取消交错已覆盖。坏帧/Delivery 特定失败仍归 E04。
 - **普通 RPC queued/sent unknown、迟到旧 txid 和 sealed live waiter 不能笼统记成“没有组合证据”。** 当前消费者/主计划已有实际场景；旧执行 E-01、运输 E-03 仅保留尚未定位到证据的精确 Wake 拒绝、异常输出及平台边界，见 E04/E07。后续不能为了重验已覆盖部分扩大任务。
 
 ## 仍影响未来施工的设计闭合责任

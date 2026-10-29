@@ -14,10 +14,9 @@ MEMORY_SCRIPT := invocation_directory()/"os/platforms"/PLATFORM/MODEL/"memory.x"
 # compile
 RUSTFLAGS_OS := "-Clinker=riscv64-elf-ld"
 RUSTFLAGS_USER := ""
-# 用户态部署由 initfs 中的组态决定；同一 srv_init 二进制按组态装配，不进入内核 ABI。
-# 每个组态是 user/formations/ 下若干源的深合并，后者覆盖前者。
-FORMATION := env_var_or_default("ERHINO_FORMATION", "core")
-FORMATION_SOURCES := if FORMATION == "system" { "system" } else if FORMATION == "memory" { "memory" } else if FORMATION == "nofd" { "system acceptance" } else if FORMATION == "stress" { "system acceptance fp stress" } else if FORMATION == "core" { "system acceptance fp" } else { "system acceptance fp mode-" + FORMATION }
+# 组态源由统一验收目录选择；直接演示默认正式 System。
+FORMATION_SOURCES := env_var_or_default("ERHINO_FORMATION_SOURCES", "system")
+HOST_TARGET := `rustc -vV | awk '/^host:/ {print $2}'`
 
 TARGET_DIR := invocation_directory()/"artifacts"
 KERNEL_TARGET_DIR := TARGET_DIR/"cargo"/PLATFORM/MODEL
@@ -29,7 +28,7 @@ KERNEL_BIN := KERNEL_ELF+".bin"
 # 官方 DTB 固定生成路径；ERHINO_DTB 只覆盖 QEMU 载入的 -dtb（异构
 # 域变体用，见 virt-hetero/virt-nofd），不重定向 make_dtb 的产出。
 DTB_DEFAULT := MODEL_DIR/"device.dtb"
-DTB := env_var_or_default("ERHINO_DTB", DTB_DEFAULT)
+DTB := if env_var_or_default("ERHINO_DTB", "") == "" { DTB_DEFAULT } else { env_var("ERHINO_DTB") }
 INIT_PAYLOAD := TARGET_DIR/"initfs.tar" # init 私有 payload，内核不解释
 BOOT_PACKAGE := TARGET_DIR/"boot-package.bin"
 
@@ -51,10 +50,9 @@ QEMU_LAUNCH := "qemu-system-riscv64 -M "+MODEL+" -m "+QEMU_MEMORY+" -nographic -
 # 环境变量会穿透嵌套 just 调用；recipe 参数与 --set 不穿透嵌套子进程。
 THROTTLE := env_var_or_default("THROTTLE", "50")
 # 各路线 QEMU 运行超时只在本处维护，可用同名环境变量覆盖；调整政策见 plans/BUILD-AND-TEST.md。
-SYSTEM_OBSERVE_TIMEOUT := env_var_or_default("SYSTEM_OBSERVE_TIMEOUT", "240")
 VIRT_TIMEOUT := env_var_or_default("VIRT_TIMEOUT", "360")
 VIRT_RELEASE_TIMEOUT := env_var_or_default("VIRT_RELEASE_TIMEOUT", "70")
-# 两轮热插每轮四个30秒等待边界，加原core收束；仅防挂死，不是性能要求。
+# 资源观察沿用原专项预算；只防挂死，不是性能要求。
 VIRT_DEVICE_TIMEOUT := env_var_or_default("VIRT_DEVICE_TIMEOUT", "1120")
 VIRT_STRESS_TIMEOUT := env_var_or_default("VIRT_STRESS_TIMEOUT", "420")
 VIRT_HETERO_TIMEOUT := env_var_or_default("VIRT_HETERO_TIMEOUT", "90")
@@ -71,43 +69,15 @@ alias c := clean
 # 内核 target 的 build-std 许可（host 测试走 --target host，不受影响）
 ZFLAGS := "-Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
 
-# 秒级检查：与 build_kernel 同参
-check:
-    @cd os && cargo check --quiet {{ZFLAGS}}
+# 选择 package 或分面；无参数只列出选择，all 为显式全仓静态检查。
+check scope="":
+    @python3 tools/checks.py check {{scope}}
 
-# 全仓静态 lint：host 纯逻辑 targets 与两套 RISC-V runtime targets 分开，
-# 避免把只在目标架构开放的服务接口误编进 host。完整输出保留在 artifacts/lint。
-clippy:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    mkdir -p artifacts/lint
-    run_lint() {
-        local label="$1"
-        local log="$2"
-        shift 2
-        if "$@" >"$log" 2>&1; then
-            echo "Clippy passed: $label"
-        else
-            status=$?
-            echo "Clippy failed: $label (full log: $log)" >&2
-            # 失败细节由对应日志拥有，终端只报告结果。
-            return "$status"
-        fi
-    }
-    run_lint formation-host artifacts/lint/formation.log \
-        bash -c 'cd shared && cargo clippy -p formation --features host --all-targets --target aarch64-apple-darwin -- -D warnings'
-    run_lint shared-host artifacts/lint/shared.log \
-        bash -c 'cd shared && cargo clippy --workspace --all-targets --target aarch64-apple-darwin -- -D warnings'
-    run_lint os-host artifacts/lint/os-host.log \
-        bash -c 'cd os && cargo clippy --workspace --exclude kernel --all-targets --target aarch64-apple-darwin -- -D warnings'
-    run_lint kernel-target artifacts/lint/kernel.log \
-        bash -c 'cd os && cargo clippy -p kernel --bin kernel {{ZFLAGS}} -- -D warnings'
-    run_lint user-host artifacts/lint/user-host.log \
-        bash -c 'cd user && cargo clippy -p libkernel -p libthread -p libruntime -p libbudget -p libexecution -p librpc -p librunnel -p liboal -p libservice -p libdevice -p libpci -p libdriver -p libusb -p libhid -p libprocess -p libfs --all-targets --target aarch64-apple-darwin -- -D warnings'
-    run_lint user-target artifacts/lint/user-target.log \
-        bash -c 'cd user && cargo clippy --workspace --lib --bins --exclude test_fp {{ZFLAGS_USER}} -- -D warnings'
-    run_lint user-fp artifacts/lint/user-fp.log \
-        bash -c 'cd user && cargo clippy -p test_fp --bin test_fp --target platforms/riscv64gc-unknown-erhino-elf.json {{ZFLAGS_USER}} -- -D warnings'
+clippy scope="":
+    @python3 tools/checks.py clippy {{scope}}
+
+test-host package *filters:
+    @python3 tools/checks.py test {{package}} {{filters}}
 
 clean:
     @python3 tools/clean-build.py
@@ -122,31 +92,37 @@ make_dtb: artifact_dir
     @echo Selected DTS {{PLATFORM}}/{{MODEL}}.dts
     @dtc -O dtb -o "{{DTB_DEFAULT}}" "{{DTS}}"
 
+# 构建前通过同一组态编译器列出引用映像，只编译当前组和必需 init。
 build_user: artifact_dir
     #!/usr/bin/env bash
     set -euo pipefail
-    cd user
-    RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build --workspace --exclude test_fp --bins {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
-    RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build -p test_fp --target platforms/riscv64gc-unknown-erhino-elf.json {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build"
-    python3 ../tools/audit-user-elf.py "{{TARGET_DIR}}"/build/srv_* "{{TARGET_DIR}}"/build/drv_* "{{TARGET_DIR}}"/build/test_*
-    echo -e "\033[0;32mUser space programs build successfully!\033[0m"
+    sources=()
+    for name in {{FORMATION_SOURCES}}; do sources+=("../user/formations/$name.toml"); done
+    (cd shared && cargo run -q -p formation --features host --target {{HOST_TARGET}} -- --list "${sources[@]}") > "{{TARGET_DIR}}/build/selected.images"
+    packages=(-p srv_init)
+    images=("{{TARGET_DIR}}/build/srv_init")
+    fp=false
+    while read -r component; do
+        images+=("{{TARGET_DIR}}/build/$component")
+        if [[ "$component" == test_fp ]]; then fp=true; else packages+=(-p "$component"); fi
+    done < "{{TARGET_DIR}}/build/selected.images"
+    (cd user && RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build "${packages[@]}" --bins {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build")
+    if $fp; then
+        (cd user && RUSTFLAGS="{{RUSTFLAGS_USER}}" cargo build -p test_fp --target platforms/riscv64gc-unknown-erhino-elf.json {{RELEASE}} {{ZFLAGS_USER}} -Z unstable-options --artifact-dir "{{TARGET_DIR}}/build")
+    fi
+    python3 tools/audit-user-elf.py "${images[@]}"
 
-# 编译所选组态并按其引用组装 initfs：根目录 `formation` 与 `image/<组件>`。
+# 编译所选组态并按引用清单组装 initfs；strip 只作用于归档副本。
 make_initfs: build_user
     #!/usr/bin/env bash
     set -euo pipefail
-    rm -rf "{{TARGET_DIR}}/initfs" "{{TARGET_DIR}}/images"
-    mkdir -p "{{TARGET_DIR}}/initfs/image" "{{TARGET_DIR}}/images"
-    for file in "{{TARGET_DIR}}"/build/srv_* "{{TARGET_DIR}}"/build/drv_* "{{TARGET_DIR}}"/build/test_*; do
-        ditto "$file" "{{TARGET_DIR}}/images/$(basename "$file")"
-    done
+    rm -rf "{{TARGET_DIR}}/initfs"
+    mkdir -p "{{TARGET_DIR}}/initfs/image"
     sources=()
-    for name in {{FORMATION_SOURCES}}; do sources+=("user/formations/$name.toml"); done
-    (cd shared && cargo run -q -p formation --features host --target aarch64-apple-darwin -- \
-        "{{TARGET_DIR}}/images" "{{TARGET_DIR}}/initfs/formation" "${sources[@]/#/../}")
+    for name in {{FORMATION_SOURCES}}; do sources+=("../user/formations/$name.toml"); done
+    (cd shared && cargo run -q -p formation --features host --target {{HOST_TARGET}} -- "{{TARGET_DIR}}/build" "{{TARGET_DIR}}/initfs/formation" "${sources[@]}")
     while read -r component; do
-        ditto "{{TARGET_DIR}}/images/$component" "{{TARGET_DIR}}/initfs/image/$component"
-        # 调试器使用 build 目录的完整 ELF；initfs 不携带装载器不消费的符号表。
+        ditto "{{TARGET_DIR}}/build/$component" "{{TARGET_DIR}}/initfs/image/$component"
         riscv64-elf-strip --strip-all "{{TARGET_DIR}}/initfs/image/$component"
     done < "{{TARGET_DIR}}/initfs/formation.images"
     rm "{{TARGET_DIR}}/initfs/formation.images"
@@ -172,9 +148,11 @@ run_qemu_dump_dtb:
 
 # 演示在终端直接显示完整输出；非终端和所有测试只报告结果与日志位置。
 [private]
+[positional-arguments]
 output label purpose +COMMAND:
     #!/usr/bin/env bash
     set -uo pipefail
+    shift 2
     mode="${ERHINO_OUTPUT:-auto}"
     if [[ "{{purpose}}" == test ]]; then mode=summary; fi
     case "$mode" in
@@ -182,11 +160,11 @@ output label purpose +COMMAND:
         live|summary) ;;
         *) echo "ERHINO_OUTPUT must be auto, live, or summary" >&2; exit 2 ;;
     esac
-    if [[ "$mode" == live ]]; then exec {{COMMAND}}; fi
+    if [[ "$mode" == live ]]; then exec "$@"; fi
     mkdir -p artifacts/run
     log="artifacts/run/$(date +%Y%m%d-%H%M%S)-$$-{{label}}.log"
     echo "Starting {{label}}; log: $log"
-    if {{COMMAND}} >"$log" 2>&1; then
+    if "$@" >"$log" 2>&1; then
         if [[ "{{purpose}}" == test ]]; then result=Passed; else result=Completed; fi
         echo "$result {{label}}; log: $log"
     else
@@ -195,215 +173,68 @@ output label purpose +COMMAND:
         exit "$status"
     fi
 
-# 演示入口直接运行系统，不做验收锚点判定或自动收割。
+# 演示不进行自动判定，默认 System 常驻至操作者退出。
 virt mode="debug":
-    @just output virt demo env ERHINO_FORMATION=core just PLATFORM=qemu MODEL=virt MODE={{mode}} run_qemu -smp cores=4
+    @just output virt demo just PLATFORM=qemu MODEL=virt MODE={{mode}} run_qemu -smp cores=4
 
-virt-release:
-    @just virt release
+system mode="release":
+    @env ERHINO_FORMATION_SOURCES=system just virt {{mode}}
 
-# sifive_u 没有可用 shutdown 后端；演示终态由终端用户主动退出。
 sifive_u mode="release":
-    @just output sifive_u demo env ERHINO_FORMATION=core just PLATFORM=qemu MODEL=sifive_u MODE={{mode}} run_qemu -smp cores=5
+    @just output sifive_u demo just PLATFORM=qemu MODEL=sifive_u MODE={{mode}} run_qemu -smp cores=5
 
-# 自动验收独立于演示入口，始终隐藏内部输出。
-acceptance-virt mode="release":
-    @just output acceptance-virt-{{mode}} test env ERHINO_FORMATION=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=virt MODE={{mode}} run_qemu_acceptance_bounded {{if mode == "release" { VIRT_RELEASE_TIMEOUT } else { VIRT_TIMEOUT }}} -smp cores=4
-
-# 单次平台时钟首因调查；原IRQ消费者，100%调试，两错误路径点，不判IRQ门完成。
-investigate-clock:
-    @just output investigate-clock test env THROTTLE=100 ERHINO_FORMATION=core just PLATFORM=qemu MODEL=virt MODE=debug run_clock_failure_config
+# 无参数只列分组；all 也不包含压力与故障注入。
+acceptance *selection:
+    @python3 tools/acceptance.py {{selection}}
 
 [private]
-run_clock_failure_config:
-    @env ERHINO_FORMATION=irq-exit just PLATFORM=qemu MODEL=virt MODE=debug run_clock_failure
+run_acceptance observer: make_dtb make_boot_package build_kernel
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}"
+    dtb="{{DTB}}"
+    variant="${ERHINO_ACCEPTANCE_PLATFORM:-}"
+    if [[ "$variant" == hetero || "$variant" == nofd ]]; then
+        disabled=0
+        if [[ "$variant" == nofd ]]; then disabled=all; fi
+        python3 tools/make-hetero-dts.py "{{DTS}}" "{{MODEL_DIR}}/$variant.dts" "$disabled"
+        dtc -O dtb -o "{{MODEL_DIR}}/$variant.dtb" "{{MODEL_DIR}}/$variant.dts"
+        dtb="{{MODEL_DIR}}/$variant.dtb"
+    fi
+    cores=4
+    if [[ "{{MODEL}}" == sifive_u ]]; then cores=5; fi
+    command=(tools/qemu-throttle.sh {{THROTTLE}} qemu-system-riscv64 -M {{MODEL}} -m {{QEMU_MEMORY}} -nographic -kernel "{{KERNEL_BIN}}" -dtb "$dtb" -device loader,file={{BOOT_PACKAGE}},addr={{BOOT_PACKAGE_ADDR}} {{QEMU_CPU}} {{QEMU_DEVICE}} -smp cores=$cores)
+    budget={{if MODE == "release" { VIRT_RELEASE_TIMEOUT } else { VIRT_TIMEOUT }}}
+    if [[ "${ERHINO_ACCEPTANCE_MODE:-0}" != 0 ]]; then budget={{VIRT_STRESS_TIMEOUT}}; fi
+    case "{{observer}}" in
+        normal) ;;
+        vm-fault)
+            budget={{VIRT_VM_FAULT_TIMEOUT}}
+            command=(python3 tools/check-vm-fault.py --kernel "{{KERNEL_ELF}}" --timeout "$budget" -- "${command[@]}") ;;
+        irq-exit|mmio-publication|mmio-forced|dma-races|dma-shared|dma-quota|dma-install-failure)
+            budget={{VIRT_DEVICE_TIMEOUT}}
+            command=(python3 tools/check-resources.py --{{observer}} --timeout "$budget" -- "${command[@]}") ;;
+        boot-failure)
+            exec python3 tools/check-boot-failure.py --kernel "{{KERNEL_ELF}}" --timeout {{VIRT_BOOT_FAILURE_TIMEOUT}} -- "${command[@]}" ;;
+        platform-funding)
+            exec python3 tools/check-boot-failure.py --platform-funding --funding-case all --kernel "{{KERNEL_ELF}}" --boot-package "{{BOOT_PACKAGE}}" --timeout {{VIRT_BOOT_FAILURE_TIMEOUT}} -- "${command[@]}" ;;
+        ipi-failure)
+            exec python3 tools/check-ipi-failure.py --kernel "{{KERNEL_ELF}}" --timeout {{VIRT_IPI_FAILURE_TIMEOUT}} -- "${command[@]}" ;;
+        clock)
+            exec python3 tools/check-clock-failure.py --kernel "{{KERNEL_ELF}}" --init "{{TARGET_DIR}}/build/srv_init" --boot-package "{{BOOT_PACKAGE}}" --timeout {{VIRT_DEVICE_TIMEOUT}} -- "${command[@]}" ;;
+        vm-repair)
+            exec python3 tools/check-vm-repair.py --kernel "{{KERNEL_ELF}}" --timeout {{VIRT_VM_FAULT_TIMEOUT}} -- "${command[@]}" ;;
+        dma-retention|dma-ipi-retention)
+            options=()
+            if [[ "{{observer}}" == dma-ipi-retention ]]; then options+=(--ipi-failure); fi
+            exec python3 tools/check-dma-retention.py --kernel "{{KERNEL_ELF}}" --boot-package "{{BOOT_PACKAGE}}" --timeout {{VIRT_DMA_RETENTION_TIMEOUT}} "${options[@]}" -- "${command[@]}" ;;
+        *) echo "Unknown acceptance observer: {{observer}}" >&2; exit 2 ;;
+    esac
+    options=()
+    if [[ "{{MODEL}}" == sifive_u ]]; then budget={{SIFIVE_U_TIMEOUT}}; options+=(--allow-reset-failure); fi
+    if [[ "$variant" == hetero ]]; then budget={{VIRT_HETERO_TIMEOUT}}; fi
+    if [[ "$variant" == nofd ]]; then budget={{VIRT_NOFD_TIMEOUT}}; fi
+    exec python3 tools/qemu-acceptance.py --timeout "$budget" "${options[@]}" -- "${command[@]}"
 
-[private]
-run_clock_failure: make_dtb make_boot_package build_kernel
-    @python3 tools/check-clock-failure.py --kernel "{{KERNEL_ELF}}" --init "{{TARGET_DIR}}/build/srv_init" --boot-package "{{BOOT_PACKAGE}}" --timeout {{VIRT_DEVICE_TIMEOUT}} -- tools/qemu-throttle.sh 100 {{QEMU_LAUNCH}} -smp cores=4
-
-acceptance-irq-exit:
-    @just output acceptance-irq-exit test env ERHINO_FORMATION=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=virt MODE=debug run_irq_exit_config
-
-[private]
-run_irq_exit_config:
-    @env ERHINO_FORMATION=irq-exit just PLATFORM=qemu MODEL=virt MODE=debug run_irq_exit
-
-[private]
-run_irq_exit: make_dtb make_boot_package build_kernel
-    @PLATFORM="{{PLATFORM}}" MODEL="{{MODEL}}" MODE="{{MODE}}" ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" QEMU_ACCEPTANCE_PROFILE=core tools/qemu-acceptance.sh -- python3 tools/check-device.py --irq-exit --timeout {{VIRT_DEVICE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
-
-# 原32页MMIO消费者的许可前/后Revoke交错及独立Pool退款。
-acceptance-mmio-publication:
-    @just output acceptance-mmio-publication test env ERHINO_FORMATION=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=virt MODE=debug run_mmio_publication_config
-
-[private]
-run_mmio_publication_config:
-    @env ERHINO_FORMATION=mmio-publication just PLATFORM=qemu MODEL=virt MODE=debug run_mmio_publication
-
-[private]
-run_mmio_publication: make_dtb make_boot_package build_kernel
-    @PLATFORM="{{PLATFORM}}" MODEL="{{MODEL}}" MODE="{{MODE}}" ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" QEMU_ACCEPTANCE_PROFILE=core tools/qemu-acceptance.sh -- python3 tools/check-device.py --mmio-publication --timeout {{VIRT_DEVICE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
-
-acceptance-dma-races:
-    @just output acceptance-dma-races test env ERHINO_FORMATION=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=virt MODE=debug run_dma_races_config
-
-acceptance-mmio-forced:
-    @just output acceptance-mmio-forced test env ERHINO_FORMATION=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=virt MODE=debug run_mmio_forced_config
-
-[private]
-run_mmio_forced_config:
-    @env ERHINO_FORMATION=mmio-forced just PLATFORM=qemu MODEL=virt MODE=debug run_mmio_forced
-
-[private]
-run_mmio_forced: make_dtb make_boot_package build_kernel
-    @PLATFORM="{{PLATFORM}}" MODEL="{{MODEL}}" MODE="{{MODE}}" ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" QEMU_ACCEPTANCE_PROFILE=core tools/qemu-acceptance.sh -- python3 tools/check-device.py --mmio-forced --timeout {{VIRT_DEVICE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
-
-acceptance-dma-shared:
-    @just output acceptance-dma-shared test env ERHINO_FORMATION=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=virt MODE=debug run_dma_races_config shared
-
-acceptance-dma-quota:
-    @just output acceptance-dma-quota test env ERHINO_FORMATION=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=virt MODE=debug run_dma_races_config quota
-
-acceptance-dma-install-failure:
-    @just output acceptance-dma-install-failure test env ERHINO_FORMATION=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=virt MODE=debug run_dma_races_config install-failure
-
-[private]
-run_dma_races_config scenario="races":
-    @env ERHINO_FORMATION=dma-{{scenario}} just PLATFORM=qemu MODEL=virt MODE=debug run_dma_races {{scenario}}
-
-[private]
-run_dma_races scenario="races": make_dtb make_boot_package build_kernel
-    @PLATFORM="{{PLATFORM}}" MODEL="{{MODEL}}" MODE="{{MODE}}" ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" QEMU_ACCEPTANCE_PROFILE=core tools/qemu-acceptance.sh -- python3 tools/check-device.py --dma-{{scenario}} --timeout {{VIRT_DEVICE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
-
-acceptance-sifive_u mode="release":
-    @just output acceptance-sifive_u test env ERHINO_FORMATION=core QEMU_ACCEPTANCE_PROFILE=core just PLATFORM=qemu MODEL=sifive_u MODE={{mode}} run_qemu_acceptance_platform {{SIFIVE_U_TIMEOUT}} -smp cores=5
-
-# 完整 debug 压力验收：core 的全部语义、自动退休与 16/16 竞态矩阵。
-virt-stress:
-    @just output virt-stress test env ERHINO_FORMATION=stress QEMU_ACCEPTANCE_PROFILE=stress just PLATFORM=qemu MODEL=virt MODE=debug run_qemu_acceptance_bounded {{VIRT_STRESS_TIMEOUT}} -smp cores=4
-
-# 多域验收：Base64-only 域 {0} 与 D64 域 {1,2,3}。
-virt-hetero mode="release":
-    @just output virt-hetero test just run_virt_hetero {{mode}}
-
-[private]
-run_virt_hetero mode: artifact_dir
-    @python3 tools/make-hetero-dts.py os/platforms/qemu/virt/device.dts artifacts/virt-hetero.dts 0
-    @dtc -O dtb -o artifacts/virt-hetero.dtb artifacts/virt-hetero.dts
-    @ERHINO_FORMATION=core ERHINO_DTB=artifacts/virt-hetero.dtb QEMU_ACCEPTANCE_PROFILE=hetero just PLATFORM=qemu MODEL=virt MODE={{mode}} run_qemu_acceptance_bounded {{VIRT_HETERO_TIMEOUT}} -smp cores=4
-
-# 无兼容域验收：D64 test_fp 拒绝启动，Base64 负载照常收束。
-virt-nofd mode="release":
-    @just output virt-nofd test just run_virt_nofd {{mode}}
-
-[private]
-run_virt_nofd mode: artifact_dir
-    @python3 tools/make-hetero-dts.py os/platforms/qemu/virt/device.dts artifacts/virt-nofd.dts all
-    @dtc -O dtb -o artifacts/virt-nofd.dtb artifacts/virt-nofd.dts
-    @ERHINO_FORMATION=core ERHINO_DTB=artifacts/virt-nofd.dtb QEMU_ACCEPTANCE_PROFILE=nofd just PLATFORM=qemu MODEL=virt MODE={{mode}} run_qemu_acceptance_bounded {{VIRT_NOFD_TIMEOUT}} -smp cores=4
-
-# 外部调试器在全员 Online / Ready 前注入失败，核验 Gate 与每个 hart 停驻。
-virt-boot-failure:
-    @just output virt-boot-failure test env ERHINO_FORMATION=core just PLATFORM=qemu MODEL=virt MODE=debug run_boot_failure
-
-[private]
-run_boot_failure: make_dtb make_boot_package build_kernel
-    @python3 tools/check-boot-failure.py --kernel "{{KERNEL_ELF}}" --timeout {{VIRT_BOOT_FAILURE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
-
-virt-platform-funding scenario="all":
-    @just output virt-platform-funding test env ERHINO_FORMATION=core just PLATFORM=qemu MODEL=virt MODE=debug run_platform_funding {{scenario}}
-
-[private]
-run_platform_funding scenario="all": make_dtb make_boot_package build_kernel
-    @python3 tools/check-boot-failure.py --platform-funding --funding-case {{scenario}} --kernel "{{KERNEL_ELF}}" --boot-package "{{BOOT_PACKAGE}}" --timeout {{VIRT_BOOT_FAILURE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
-
-# 真实已发布责任的门铃失败验收。
-virt-ipi-failure:
-    @just output virt-ipi-failure test env ERHINO_FORMATION=core just PLATFORM=qemu MODEL=virt MODE=debug run_ipi_failure
-
-[private]
-run_ipi_failure: make_dtb make_boot_package build_kernel
-    @python3 tools/check-ipi-failure.py --kernel "{{KERNEL_ELF}}" --timeout {{VIRT_IPI_FAILURE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
-
-# 只运行既有线程/映射消费者及完整收束，必须命中真实发布窗口 fault 等待。
-virt-vm-fault:
-    @just output virt-vm-fault test env ERHINO_FORMATION=memory just PLATFORM=qemu MODEL=virt MODE=debug run_vm_fault
-
-[private]
-run_vm_fault: make_dtb make_boot_package build_kernel
-    @PLATFORM="{{PLATFORM}}" MODEL="{{MODEL}}" MODE="{{MODE}}" ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" QEMU_ACCEPTANCE_PROFILE=memory tools/qemu-acceptance.sh -- python3 tools/check-vm-fault.py --kernel "{{KERNEL_ELF}}" --timeout {{VIRT_VM_FAULT_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
-
-# 模拟入口故障、保留真实 PTE 与用户现场的修复验收。
-virt-vm-repair:
-    @just output virt-vm-repair test env ERHINO_FORMATION=core just PLATFORM=qemu MODEL=virt MODE=debug run_vm_repair
-
-[private]
-run_vm_repair: make_dtb make_boot_package build_kernel
-    @python3 tools/check-vm-repair.py --kernel "{{KERNEL_ELF}}" -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
-
-# 真实 DMA 静态保留、reset 失败与 init DONE；调试器全速运行，不作为性能证据。
-virt-dma-retention:
-    @just output virt-dma-retention test env ERHINO_FORMATION=core THROTTLE=100 just PLATFORM=qemu MODEL=virt MODE=debug run_dma_retention
-
-[private]
-run_dma_retention: make_dtb make_boot_package build_kernel
-    @python3 tools/check-dma-retention.py --kernel "{{KERNEL_ELF}}" --timeout {{VIRT_DMA_RETENTION_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
-
-# 同一实际pin/停止观察，另核一次request广播IPI失败时原DMA责任不消散。
-virt-dma-ipi-retention:
-    @just output virt-dma-ipi-retention test env ERHINO_FORMATION=core THROTTLE=100 just PLATFORM=qemu MODEL=virt MODE=debug run_dma_ipi_retention
-
-[private]
-run_dma_ipi_retention: make_dtb make_boot_package build_kernel
-    @python3 tools/check-dma-retention.py --kernel "{{KERNEL_ELF}}" --boot-package "{{BOOT_PACKAGE}}" --timeout {{VIRT_DMA_RETENTION_TIMEOUT}} --ipi-failure --logs artifacts/dma-ipi-retention -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4
-
-# 常规跨机制回归：静态门、无调试器的完整 debug 压力和 release core。
-acceptance-core:
-    @just clippy
-    @just virt-stress
-    @just acceptance-virt
-
-# 平台差异仍携带完整 core；各条验收可显式选择 debug。
-acceptance-platforms:
-    @just acceptance-sifive_u
-    @just virt-nofd
-
-acceptance-faults:
-    @just virt-boot-failure
-    @just virt-ipi-failure
-    @just virt-vm-fault
-    @just virt-vm-repair
-    @just virt-dma-retention
-
-# 完整验收只组合测试入口，不调用演示入口。
-acceptance:
-    @just acceptance-core
-    @just acceptance-platforms
-    @just acceptance-faults
-
-# 清理泄漏的孤儿 qemu（PPID=1 残留；agent 裸跑 run_qemu 后易遗漏）。
-# 默认一键清理孤儿；传参透传脚本：-l 仅列出，-y 跳过确认，-f 连有父进程的一并杀。
 clean-qemu *args:
     @./tools/clean-qemu.sh {{if args == "" { "-y" } else { args }}}
-
-[private]
-run_qemu_acceptance_platform timeout +OPTIONS: make_dtb make_boot_package build_kernel
-    @echo -e "\033[0;36mQEMU: Simulating acceptance ({{FORMATION}}, CPU throttled to {{THROTTLE}}%, hard timeout {{timeout}}s)\033[0m"
-    @PLATFORM="{{PLATFORM}}" MODEL="{{MODEL}}" MODE="{{MODE}}" ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" tools/qemu-acceptance.sh --allow-timeout -- timeout --foreground {{timeout}} tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} {{OPTIONS}}
-
-[private]
-run_qemu_acceptance_bounded timeout +OPTIONS: make_dtb make_boot_package build_kernel
-    @echo -e "\033[0;36mQEMU: Simulating acceptance ({{FORMATION}}, CPU throttled to {{THROTTLE}}%, hard timeout {{timeout}}s)\033[0m"
-    @PLATFORM="{{PLATFORM}}" MODEL="{{MODEL}}" MODE="{{MODE}}" ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" tools/qemu-acceptance.sh -- timeout --foreground {{timeout}} tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} {{OPTIONS}}
-
-# 正式静态常驻基座：没有验收消费者，不因空闲自行关机。
-system mode="release":
-    @env ERHINO_FORMATION=system just virt {{mode}}
-
-# 有限观察正式部署；外部收割不计正常停止。
-system-observe:
-    @just output system-observe test env ERHINO_FORMATION=system just PLATFORM=qemu MODEL=virt MODE=debug run_system_observe
-
-run_system_observe: make_dtb make_boot_package build_kernel
-    @ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}" python3 tools/check-system.py --timeout {{SYSTEM_OBSERVE_TIMEOUT}} -- tools/qemu-throttle.sh {{THROTTLE}} {{QEMU_LAUNCH}} -smp cores=4

@@ -1,15 +1,5 @@
-# memory：只运行线程/映射套件，不启动基础服务；借用 stress 的五份工作集。
-finish = "shutdown"
-
-[job.kernel]
-parent = "services"
-pool = "kernel"
-
+# memory 压力/发布窗口观察：复用线程映射消费者与原五份工作集。
 [instance.kernel]
-image = "test_kernel"
-kind = "task"
 pool = { work_pages = 20480, metadata_bytes = 5242880 }
-inputs."memory.pool" = "self/memory.pool"
-inputs."kernel.job" = "init/job.kernel"
 inputs."kernel.image.test_hammer" = "init/image.test_hammer"
 settings.mode = ["memory"]

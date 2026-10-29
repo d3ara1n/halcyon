@@ -109,7 +109,7 @@ quit 0
                     try:
                         boot.stop_group(process)
                     finally:
-                        # 原wrapper继续拥有完整profile判据，失败也保存第一轮原始输出。
+                        # 外层 runner 判定本组完成与正常收集，失败也保留第一轮输出。
                         sys.stdout.write(qemu_log.read_text(errors='replace'))
     output, guest = gdb_log.read_text(), qemu_log.read_text(errors='replace')
     if 'VM_FAULT_PASSED' not in output or 'committed mapping access passed: cookie before return=true' not in guest:
@@ -119,7 +119,7 @@ quit 0
         'retry_fault': hex(retry), 'gdb_exit': gdb_status,
         'observations': [line for line in output.splitlines() if 'FAULT_WAIT ' in line or 'VM_FAULT_PASSED' in line],
         'scope': 'formal test_hammer/thread suite, release cookie then tail-page read/write before Map returns; no injected exception or kernel test switch',
-        'observer': 'detach after first RetryFault; acceptance wrapper checks thread completion, job collection, auxiliary capability cleanup and reset',
+        'observer': 'detach after first RetryFault; acceptance runner checks memory suite completion, formation collection and reset',
         'limits': 'GDB pause is not timing/WCET evidence; stale permission repair and instruction-fence windows need their own evidence',
         'gdb_log': str(gdb_log), 'qemu_log': str(qemu_log),
     }

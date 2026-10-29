@@ -224,24 +224,11 @@ pub(super) fn process_retirement(
     let modes: &[&[u8]] = if crate::mode().has(crate::Mode::DMA_INSTALL_FAILURE) {
         &[b"dma-pin-install-failure"]
     } else if crate::mode().has(crate::Mode::DMA_QUOTA) {
-        &[
-            b"dma-unexposed",
-            b"dma-exposed",
-            b"dma-output-fault",
-            b"dma-pin-quota",
-        ]
+        &[b"dma-pin-quota"]
     } else if crate::mode().has(crate::Mode::DMA_SHARED) {
-        &[
-            b"dma-unexposed",
-            b"dma-exposed",
-            b"dma-output-fault",
-            b"dma-shared",
-        ]
+        &[b"dma-shared"]
     } else if crate::mode().has(crate::Mode::DMA_RACES) {
         &[
-            b"dma-unexposed",
-            b"dma-exposed",
-            b"dma-output-fault",
             b"dma-pin-before",
             b"dma-pin-after",
             b"dma-pin-exit",
@@ -258,7 +245,8 @@ pub(super) fn process_retirement(
         }
     }
     libkernel::debug!(
-        "DMA process retirement acceptance passed: unexposed cancellation, exposed retention and output fault"
+        "DMA process retirement acceptance passed: scenarios={}",
+        modes.len()
     );
     Ok(())
 }

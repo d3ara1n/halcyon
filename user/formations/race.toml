@@ -1,0 +1,3 @@
+# 进程竞态矩阵的两个 hammer 消费者。
+[instance.kernel]
+inputs."kernel.image.test_hammer" = "init/image.test_hammer"

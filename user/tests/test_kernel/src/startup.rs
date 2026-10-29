@@ -60,6 +60,9 @@ impl Mode {
     pub fn stress(self) -> bool {
         self.has(Self::STRESS)
     }
+    pub fn ordinary(self) -> bool {
+        self.0 == 0
+    }
     /// memory 部署复用 stress 的线程套件。
     pub fn memory(self) -> bool {
         self.has(Self::MEMORY)
@@ -84,6 +87,7 @@ impl Role {
 }
 
 struct Settings {
+    suite: &'static str,
     mode: Mode,
     role: Role,
 }
@@ -91,7 +95,7 @@ fn parse_settings(bytes: &[u8]) -> Settings {
     let root = settings::Settings::parse(bytes)
         .expect("kernel acceptance settings invalid")
         .root();
-    root.only(&["mode", "role"])
+    root.only(&["suite", "mode", "role"])
         .expect("kernel acceptance settings key unknown");
     let mut mode = 0;
     if let Some(list) = root.get("mode") {
@@ -110,7 +114,38 @@ fn parse_settings(bytes: &[u8]) -> Settings {
         Some(Ok("retain_fault")) => Role::RetainFault,
         _ => panic!("kernel acceptance role invalid"),
     };
+    let suite = match root.get("suite").map(|value| value.as_str()) {
+        Some(Ok("memory")) => "memory",
+        Some(Ok("ipc")) => "ipc",
+        Some(Ok("process")) => "process",
+        Some(Ok("transport")) => "transport",
+        Some(Ok("mmio")) => "mmio",
+        Some(Ok("irq")) => "irq",
+        Some(Ok("dma")) => "dma",
+        Some(Ok("time")) => "time",
+        Some(Ok("startup")) => "startup",
+        None if role != Role::Main => "dma",
+        _ => panic!("kernel acceptance suite invalid"),
+    };
+    let allowed = match suite {
+        "memory" => Mode::MEMORY | Mode::STRESS,
+        "ipc" | "process" | "transport" => Mode::STRESS,
+        "mmio" => Mode::MMIO_PUBLICATION | Mode::MMIO_FORCED,
+        "irq" => Mode::IRQ_EXIT,
+        "dma" => Mode::DMA_RACES | Mode::DMA_SHARED | Mode::DMA_QUOTA | Mode::DMA_INSTALL_FAILURE,
+        _ => 0,
+    };
+    assert_eq!(
+        mode & !allowed,
+        0,
+        "mode does not belong to the selected suite"
+    );
+    assert!(
+        mode.count_ones() <= 1 || mode == Mode::MEMORY | Mode::STRESS,
+        "multiple acceptance scenarios are not supported"
+    );
     Settings {
+        suite,
         mode: Mode(mode),
         role,
     }
@@ -119,6 +154,7 @@ fn parse_settings(bytes: &[u8]) -> Settings {
 struct Context {
     process: CurrentProcessInfo,
     pool: Handle,
+    suite: &'static str,
     mode: Mode,
     child: bool,
     roots: [Option<Handle>; 3],
@@ -147,6 +183,9 @@ pub(super) fn memory_pool() -> Handle {
 }
 pub(super) fn mode() -> Mode {
     with(|ctx| ctx.mode)
+}
+pub(super) fn suite() -> &'static str {
+    with(|ctx| ctx.suite)
 }
 /// 本进程是否为保留 fixture 子进程。
 pub(super) fn retention_child() -> bool {
@@ -260,6 +299,7 @@ pub(super) fn run() {
     *CONTEXT.lock() = Some(Context {
         process,
         pool: pool.as_handle(),
+        suite: settings.suite,
         mode: settings.mode,
         child,
         roots,
@@ -291,6 +331,10 @@ pub(super) fn run() {
         return;
     }
     let mut harness = Harness::new();
+    debug!(
+        "acceptance suite: {}, mode={}",
+        settings.suite, settings.mode.0
+    );
     if let Err(message) = super::run(
         &mut harness,
         job.as_handle(),
@@ -311,7 +355,7 @@ pub(super) fn run() {
         );
     }
     drop(platform);
-    debug!("kernel acceptance completed");
+    debug!("kernel acceptance completed: {}", settings.suite);
 }
 
 /// 在绑定 retention Pool 的自启动子进程中运行跨 reset 保留的 fixture；主 Pool 不留下跨收集计费。

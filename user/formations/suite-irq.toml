@@ -1,0 +1,6 @@
+# irq 领域的输入与选择。
+[instance.kernel]
+settings.suite = "irq"
+settings.mode = []
+inputs."platform.description" = "init/platform.description"
+inputs."platform.root" = "init/platform.root"

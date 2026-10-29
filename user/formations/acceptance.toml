@@ -1,10 +1,5 @@
-# 验收覆盖层：内核验收 task 先于设备服务运行（平台根别名与 srv_device 串行），全部 task 完成后关机。
+# 独立领域验收；只装配本组 task，完成后由 init 正常收集并关机。
 finish = "shutdown"
-
-[pool.retention]
-# 跨 reset 保留的 DMA fixture：保留子进程与其目标各一份单进程工作集。
-work_pages = 8192
-metadata_bytes = 2097152
 
 [job.kernel]
 parent = "services"
@@ -13,17 +8,7 @@ pool = "kernel"
 [instance.kernel]
 image = "test_kernel"
 kind = "task"
-# core 系四份单进程工作集；stress/memory 覆盖层改为五份。
+# 沿用原 core 四份工作集；压力覆盖层采用原五份，不据此声称精确峰值。
 pool = { work_pages = 16384, metadata_bytes = 4194304 }
 inputs."memory.pool" = "self/memory.pool"
 inputs."kernel.job" = "init/job.kernel"
-inputs."kernel.retention" = "init/pool.retention"
-inputs."kernel.image.srv_pm" = "init/image.srv_pm"
-inputs."kernel.image.test_target" = "init/image.test_target"
-inputs."kernel.image.test_kernel" = "init/image.test_kernel"
-inputs."platform.description" = "init/platform.description"
-inputs."platform.root" = "init/platform.root"
-settings.mode = []
-
-[instance.device]
-after = ["kernel"]

@@ -1,0 +1,7 @@
+# mmio 领域的输入与选择。
+[instance.kernel]
+settings.suite = "mmio"
+settings.mode = []
+inputs."kernel.image.test_target" = "init/image.test_target"
+inputs."platform.description" = "init/platform.description"
+inputs."platform.root" = "init/platform.root"

@@ -1,3 +1,4 @@
-# 资源专项：在 core 内核验收上选择 irq_exit 模式。
+# 资源专项：在所属资源组上选择 irq_exit 模式。
 [instance.kernel]
+inputs."kernel.image.test_target" = "init/image.test_target"
 settings.mode = ["irq_exit"]

@@ -183,7 +183,7 @@ pub(super) fn process_retirement(
     let modes: &[&str] = if crate::mode().has(crate::Mode::MMIO_FORCED) {
         &["mmio-forced-queued", "mmio-forced-publishing"]
     } else if crate::mode().has(crate::Mode::MMIO_PUBLICATION) {
-        &["mmio-close", "mmio-live", "mmio-before", "mmio-after"]
+        &["mmio-before", "mmio-after"]
     } else {
         &["mmio-close", "mmio-live"]
     };

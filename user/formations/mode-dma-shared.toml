@@ -1,3 +1,3 @@
-# 资源专项：在 core 内核验收上选择 dma_shared 模式。
+# 资源专项：在所属资源组上选择 dma_shared 模式。
 [instance.kernel]
 settings.mode = ["dma_shared"]

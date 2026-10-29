@@ -185,7 +185,7 @@ def main():
                 if 'Runtime stopped: platform clock failed' in guest:
                     if facts['status']!='captured':raise RuntimeError(f'clock terminal lacks first-cause snapshot: {logs}')
                     run['status']='first-cause-captured';break
-                if ('init acceptance failed:' in guest or 'system failure terminal entered:' in guest
+                if ('kernel acceptance failed:' in guest or 'system failure terminal entered:' in guest
                         or 'Kernel panicking' in guest or 'Runtime stopped:' in guest):
                     raise RuntimeError(f'consumer failed before a clock cause was observed: {logs}')
                 if process.poll() is not None:

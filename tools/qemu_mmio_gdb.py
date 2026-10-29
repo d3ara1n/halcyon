@@ -236,7 +236,7 @@ quit 0
     script_path = logs / "publication.gdb"
     script_path.write_text(script)
     output = (logs / "publication.log").open("w")
-    child = subprocess.Popen(["riscv64-elf-gdb", "-q", "-nx", "--batch", "-x", str(script_path)], stdout=output, stderr=subprocess.STDOUT)
+    child = subprocess.Popen(["riscv64-elf-gdb", "-q", "-nx", "--batch", "-x", str(script_path)], stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
     return child, output, logs
 
 

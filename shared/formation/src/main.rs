@@ -1,7 +1,7 @@
 //! 组态编译器：读取组态源 TOML，静态校验后写出 initfs 根的二进制组态文件。
 //!
-//! 用法：`formation <组态源.toml> <映像目录> <输出文件>`。映像目录即 initfs 的 `image/`，
-//! 用于核对引用的组件映像存在。未知键一律拒绝，避免组态笔误被静默忽略。
+//! 用法：`formation <映像目录> <输出文件> <组态源.toml>...`；
+//! `formation --list <组态源.toml>...` 在构建前列出引用映像。两者共享合并与校验。
 
 use std::{collections::BTreeMap, fs, path::Path, process::ExitCode};
 
@@ -298,7 +298,7 @@ fn compile(root: Table) -> Result<Formation> {
     })
 }
 
-fn run(sources: &[&Path], images: &Path, output: &Path) -> Result<()> {
+fn run(sources: &[&Path], destination: Option<(&Path, &Path)>) -> Result<()> {
     let mut root = Table::new();
     for source in sources {
         let text =
@@ -310,14 +310,10 @@ fn run(sources: &[&Path], images: &Path, output: &Path) -> Result<()> {
     }
     let formation = compile(root)?;
     formation
-        .validate(|component| images.join(component).is_file())
+        .validate(|component| {
+            destination.is_none_or(|(images, _)| images.join(component).is_file())
+        })
         .map_err(|error| error.to_string())?;
-    let bytes = formation.encode().map_err(|error| error.to_string())?;
-    // 写出前以 init 同一解码路径回读，编码器与解码器不一致在构建期暴露。
-    if Formation::decode(&bytes).as_ref() != Ok(&formation) {
-        return Err("encoded formation does not decode to the same composition".into());
-    }
-    fs::write(output, &bytes).map_err(|error| format!("{}: {error}", output.display()))?;
     // 构建按此清单只把组态引用的映像放入 initfs。
     let mut components: Vec<&str> = formation
         .instances
@@ -335,6 +331,18 @@ fn run(sources: &[&Path], images: &Path, output: &Path) -> Result<()> {
         .collect();
     components.sort_unstable();
     components.dedup();
+    let Some((_, output)) = destination else {
+        for component in components {
+            println!("{component}");
+        }
+        return Ok(());
+    };
+    let bytes = formation.encode().map_err(|error| error.to_string())?;
+    // 写出前以 init 同一解码路径回读，编码器与解码器不一致在构建期暴露。
+    if Formation::decode(&bytes).as_ref() != Ok(&formation) {
+        return Err("encoded formation does not decode to the same composition".into());
+    }
+    fs::write(output, &bytes).map_err(|error| format!("{}: {error}", output.display()))?;
     let list = output.with_extension("images");
     fs::write(&list, components.join("\n") + "\n")
         .map_err(|error| format!("{}: {error}", list.display()))?;
@@ -354,16 +362,22 @@ fn run(sources: &[&Path], images: &Path, output: &Path) -> Result<()> {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    let [_, images, output, sources @ ..] = args.as_slice() else {
-        eprintln!("usage: formation <image-dir> <output> <source.toml>...");
-        return ExitCode::from(2);
+    let (destination, sources) = match args.as_slice() {
+        [_, flag, sources @ ..] if flag == "--list" => (None, sources),
+        [_, images, output, sources @ ..] => {
+            (Some((Path::new(images), Path::new(output))), sources)
+        }
+        _ => {
+            eprintln!("usage: formation [--list | <image-dir> <output>] <source.toml>...");
+            return ExitCode::from(2);
+        }
     };
     if sources.is_empty() {
         eprintln!("usage: formation <image-dir> <output> <source.toml>...");
         return ExitCode::from(2);
     }
     let sources: Vec<&Path> = sources.iter().map(Path::new).collect();
-    match run(&sources, Path::new(images), Path::new(output)) {
+    match run(&sources, destination) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("formation: {error}");

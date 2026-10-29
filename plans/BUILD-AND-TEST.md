@@ -1,135 +1,105 @@
 # 构建与验证
 
-运行构建、测试、QEMU 或调整验收基础设施前读取本篇。任务是否完成由 [AGENTS「任务适用范围与完成条件」](../AGENTS.md#任务适用范围与完成条件)判断；同一路线在施工期间可作开发检查，路线通过本身不宣告机制完成。具体命令和默认参数以 [Justfile](../Justfile) 为执行真值。
+构建、测试、QEMU 或调整验收工具前读取本篇。命令真值在 [Justfile](../Justfile)，验收分组在 [acceptance.py](../tools/acceptance.py)。任务完成条件由 [AGENTS](../AGENTS.md#任务适用范围与完成条件) 拥有。
 
-## 工具链与构建入口
+## 按改动选择验证
 
-- 开发机为 macOS，系统工具为 Homebrew 的 `just`、`dtc`、`qemu`、`riscv64-elf-binutils`、`riscv64-elf-gdb`；系统级安装由用户执行。
-- Rust edition 2024，工具链由根目录 `rust-toolchain` 选择；当前内容是浮动 `nightly`，并未固定日期。取证或比较代码生成时记录实际 rustc 版本。
-- 内核、共享库、用户态分别属于 `os/`、`shared/`、`user/` 三个 workspace，以 path 依赖连接。内核 target 为 `os/riscv64imac-unknown-erhino.json`，用户态默认 target 为 `user/platforms/riscv64imac-unknown-erhino-elf.json`，均使用 build-std；浮点验收 `test_fp` 使用独立 gc target。
-- **统一走 `just`，不裸跑 `cargo build`**。内核链接器 `riscv64-elf-ld` 和链接脚本由构建入口配置，用户态由自定义 target 与 build-std 提供运行环境。
-- 内核 package、默认 binary target 和产物名统一为 `kernel`；本文命令与构建入口以此为准。
-- initfs 使用 tar 时避免 bsdtar 的 `._` AppleDouble 文件混入归档。
+先确定受影响的 package、运行环境和跨组件契约，再选择对应检查。局部通过后停止；同一版本、配置和输入已经通过的检查不重复执行。全仓检查、所有普通领域回归、压力和故障注入是不同选择，没有自动串联关系。
+
+| 改动 | 起始验证 | 扩大范围的条件 |
+|---|---|---|
+| 文档、注释 | 差异与引用核对 | 实际改变构建或执行语义 |
+| 纯逻辑 crate、局部依赖升级 | 对应 package 的 check/clippy、host 测试 | 实际消费者受 API、布局或行为变化影响 |
+| 用户态库/服务 | 对应 target 检查及可用 host 测试；需要运行时行为时选择所属领域 | 修改跨领域契约，或局部失败指向相邻依赖 |
+| 内核机制/共享 ABI | 内核与实际 ABI 消费者检查，相关纯逻辑测试及领域验收 | 责任链跨领域、全局调度/内存/代码生成变化 |
+| 编译器、底层运行时、目标配置 | 受影响 target 编译、所需平台能力和领域组合 | 变化广泛影响代码生成或多平台行为，选择更广普通回归 |
+| 竞态、故障恢复、资源退出 | 对应普通组与相关 stress/故障场景 | 普通行为无法观察目标交错，或现场明确要求专项 |
+
+失败后先保留第一轮日志，区分构建、工具、guest、超时和清理失败，再选择相邻依赖或组合测试。扩大范围服务于定位，不自动从头全跑。跨组件变更可以直接验证实际责任链，不必先等局部失败。历史专项不因年代删除，也不因过去通过而常驻所有改动的验收门。
+
+QEMU 的运行范围由用户决定；agent 不主动启动。分组重建后的运行证据见[本轮记录](todo-2026-10-29-acceptance-groups.md)，未实跑的路线不能称为验收通过。
+
+## 工具链与构建
+
+开发机为 macOS，使用 Homebrew 的 just、dtc、qemu、riscv64-elf-binutils、riscv64-elf-gdb。系统级安装由用户执行。Rust 工具链由根目录 `rust-toolchain` 选择，当前为浮动 nightly；比较代码生成时记录实际版本。
+
+三个 workspace 分别位于 os、shared、user。内核 target 为 `os/riscv64imac-unknown-erhino.json`，用户态为 `user/platforms/riscv64imac-unknown-erhino-elf.json`，均使用 build-std；test_fp 单独使用 gc target。内核 package、binary 和产物名均为 kernel。构建统一走 just。
 
 ```sh
 just build_kernel
-just check
-(cd shared && cargo check)
-just clippy
+just build_user
+just check kernel
+just check test_kernel
+just clippy formation-host
+just clippy libprocess
+just test-host formation
+just test-host libprocess
 ```
 
-`just check` 对 os workspace 执行带 build-std 的 cargo check，包含它的实际依赖，不等于检查所有 workspace。`just clippy` 覆盖 shared/os/user host、kernel/user RISC-V、stress/memory/device/resource feature 与独立 gc target 十一个分面（新增 System 部署），全部使用 `-D warnings`；resource同时编译真实function/IRQ、MMIO/DMA竞争消费者，user RISC-V 同时选择库与程序，覆盖尚未被可执行程序链接的领域库。完整日志写入 `artifacts/lint/`。
+`check`、`clippy` 无参数只显示选择；可传 package，或 `formation-host/shared-host/os-host/kernel/user-host/user/fp` 分面。`all` 显式选择全部静态分面，不运行 QEMU。user 分面覆盖库与程序，浮点程序由 fp 分面独立覆盖。`test-host` 只选一个库 package，可追加 testcase 名称；host target 从 rustc 获取并始终显式传入，不能继承 RISC-V 默认值。formation package 的 host 检查/测试启用 host 编译器 feature。
 
-所有 QEMU 启动路线自动准备产物目录，并通过 `make_dtb` 从对应平台的 `device.dts` 重新生成 `artifacts/<PLATFORM>/<MODEL>/device.dtb`，无需手动预生成；清理产物后可直接运行 `just virt`。`virt-hetero`、`virt-nofd` 在生成变体 DTS 前同样准备目录；`ERHINO_DTB` 只选择 QEMU 加载的 DTB，不改变标准 DTB 的生成位置。
+`build_user` 用组态编译器的 `--list` 模式先合并和校验组态，列出引用映像；仅构建这些映像及 srv_init，按选择审计 ELF。`make_initfs` 用同一编译器核实际映像、编码与解码一致性，装入 `formation` 与 `image/<组件>`，strip 只操作归档副本。TOML 没有第二套解析/合并实现。
 
-## 清理构建产物
+`ERHINO_FORMATION_SOURCES` 选择 `user/formations/` 下的源名列表，后层深合并覆盖前层；直接构建/演示默认 system。验收目录明确设置完整来源与判定字段，不继承旧的负载选择。共享 boot package、initfs 和导出 ELF 路径仍是串行构建产物，同一 checkout 不并行执行构建或 QEMU 路线。
 
-`just clean-preview` 列出将清理的目录，`just clean`（或 `just c`）执行清理。唯一清单由 [clean-build.py](../tools/clean-build.py) 拥有：三个 workspace 的默认 target、平台 Cargo 缓存、导出的程序/内核/DTB、initfs 和启动包；不按环境变量扩展到仓库外。
-
-运行日志、失败现场、调查快照和验证证据留在 `artifacts/` 各自目录，普通清理不删除它们。确需移除证据时先明确具体目录及其引用，单独执行，不以删除整个 artifacts 代替构建清理。清理应在没有构建、QEMU 或调试任务使用这些产物时进行；重新构建会恢复清单中的产物。
-
-## Host 测试
-
-纯逻辑 crate 的 host 测试必须显式指定 host target，不能继承 RISC-V 默认 target 去链接 std。当前开发机命令：
+## 验收入口
 
 ```sh
-(cd os && cargo test --workspace --exclude kernel --target aarch64-apple-darwin)
-(cd shared && cargo test --workspace --target aarch64-apple-darwin)
-(cd user && cargo test -p libkernel -p libthread -p libruntime -p libbudget -p libexecution -p librpc -p librunnel -p liboal -p libservice -p libdevice -p libpci -p libdriver -p libusb -p libhid -p libprocess -p libfs --target aarch64-apple-darwin)
+just acceptance                              # 只列目录
+just acceptance memory                      # 普通映射、Pool、付款/退款
+just acceptance ipc
+just acceptance process
+just acceptance transport
+just acceptance resources dma               # 只跑 DMA
+just acceptance resources                   # 顺序跑 MMIO、IRQ、DMA，各一次
+just acceptance services                    # 正式组态就绪、停止与撤销链
+just acceptance platform nofd
+just acceptance ipc stress
+just acceptance resources dma-quota
+just acceptance memory fault
+just acceptance all --dry-run               # 展示具体命令，不构建或运行
+just acceptance all                         # 显式所有普通领域，不含压力/故障/额外平台
 ```
 
-user 的 host 命令只选择公共库，不能把 RV64 服务二进制纳入 host `--workspace` 测试。根据改动先选择受影响的 package 或现有 testcase。新增测试说明其独立契约和目标错误；无关测试或新增 harness 不作为默认交付物。clippy 编译测试目标不等于执行 host 测试，QEMU 聚合同样不替代它们。
+普通领域默认 release，`--mode debug` 选择调试构建；外部观察器强制 debug。完整可选 case 由无参数目录拥有，以下解释覆盖边界。
 
-## QEMU 路线与选择
-
-部署选择（system 或 core/stress/memory/device/device-reuse 验收）由用户态 `srv_init` 编译期控制，内核不感知测试政策。服务、驱动、验收进程分别位于 `user/services/`、`user/drivers/`、`user/tests/`；验收配置中的进程也可承载正式机制，成熟度由对应 impls 与任务记录分别说明。
-
-| 命令 | 覆盖与用途 |
+| 分组 | 覆盖与边界 |
 |---|---|
-| `just system [mode]` | 静态常驻正式部署，默认 release；仅设备/驱动管理者及单个 fs/registry 宿主，无验收消费者，不因空闲关机 |
-| `just system-observe` | 同一 System debug 部署的有限外部观察，核三必需宿主与 init 在真实 Assembly 来源的无限等待；操作者最后收割不代表正常停止 |
-| `just virt [mode]` | 直接运行 virt 演示；默认 debug，终端实时显示编译和系统输出 |
-| `just virt-stress` | core 加 control/Tunnel 重复压力、非空 WaitSet 进程自动退休与完整 16/16 竞态矩阵 |
-| `just virt-release` | `just virt release` 的演示快捷入口 |
-| `just acceptance-virt [mode]` | virt core 自动验收；默认 release，可指定 debug |
-| `just sifive_u [mode]` | 直接运行 sifive_u 演示；默认 release，终态由用户退出 |
-| `just acceptance-fs-stop-order` | 原 core debug 消费者：secondary 正常领取 Stopped 先；primary 的真实 Dead/DONE 提示已形成后，仅延迟 root 调度超过原阶段窗口，验证原到期复查中 DONE 先及完成优先。核真实 tick 增量、后继 root 实际时钟仍小于冻结总期限，随后完整 core 正常停止；不宣称控制两种普通通知交付顺序 |
-| `just acceptance-device [mode]` | 正式 Devices/FunctionAccess/OAL 键盘客户端：无键盘启动、两轮同端口 QMP 热插、客体确认按下/释放、主机删除与客体 Seat 释放分别确认、IRQ Take/Ack 和实际 worker Pool 退款；随后保留 core 全部业务 |
-| `just acceptance-device-reuse` | 正式 debug ELF/GDB 外部用户 fault：A/B 同 HID PID、停 A 保旧 function/Watch、B 继续输入、C 复用、CPU 故障后 B/C 原 Seat Released 与单次进程收集；以本轮 controller Ready 为插入门，不声称 idle |
-| `just acceptance-device-candidates` | 同一debug复用/QMP路线的显式负装配：真实PCI映像在原固定identity/角色门明确Permission且无物理/子登记授权，等原轮Closed/Released/Detach，在同DeviceId新epoch接真实HID及输入；正常声明和原工作集不变 |
-| `just acceptance-device-manager-fault Device/Driver/Filesystem [wait/start/stopping/loading]` | 同一debug装配和外部GDB：root业务等待、Start后首ecall、正常停止中的指定管理者fault。loading仅Driver：核实际srv_fs首段/首页指纹、剩余复制及未完成子进程未Start即进入终局。均核唯一封口与QMP guest RESET，不以reset证明硬件停止或退款 |
-| `just acceptance-device-reset-rejection` | 真实 xHCI 已交付环地址后使 srv_device fault，拒绝真实 ColdReboot/SystemFailure；复用原 DMA 观察体核 init DONE/四 hart 停驻后同一组 pin/backing/write 许可仍保留，不能据此断言设备 DMA 静止 |
-| `just acceptance-device-controller-fault` | 同一正式debug装配中使实际xHCI PID在真实trap入口fault，核原ProcessTask DONE与Managed受信主控故障、外层唯一终局；拒绝ColdReboot后核实际非空exposed DMA集合跨init DONE/四hart停驻保留，不以CPU完成补静止或Retire |
-| `just acceptance-device-unknown Claim/Prepare/ProvisionGet/GetResource/Activate/QueryUse/Master` | 同一debug core装配，GDB仅令一份真实成功回复的运输Send期限At0，核真实Once/context、DeadlineExpired及原请求Sent错误。Claim走唯一故障终局；Prepare核首次Preparing/Prepared接纳回复；GetResource要求暴露位保持true、PCI未开始ECAM访问、原Use报告后安全释放；QueryUse核激活接纳后的首次权限核验失败，须无资源暴露/硬件访问并退原轮。其余核原轮停止或Master原context/绝对期限恢复及完整core收尾。不声称回复入队后丢失 |
-| `just acceptance-device-function-session` | 显式仅自动PCI的debug core装配；init缩权Claim真实xHCI两轮并复用libusb完成Run/停止/DMA DONE，旧function跨新Prepared核Permission、实际Stop传播后核Closed；只读GDB观察真实认证context与ECAM BME，不新增产品操作 |
-| `just acceptance-irq-retirement` | 同一真实Controller两轮QMP插入/Take，保留旧token跨原provider Revoke；只读核complete先于disable、旧use Closed、新代已taken时旧token拒绝且原新token恰一次complete，随后完整core收束 |
-| `just acceptance-irq-idle` | 上述真实消费者增量：插入前必须取得同一四hart idle/队列/maintenance/remote/期限快照，暂停时QMP真实插入，恢复后核同源claim/Take；记录timer共现，不把全停或Waiting日志当idle证据 |
-| `just acceptance-irq-exit` | 原init/test_target取得实际IrqUse：直接变体核实际Waiting/Line来源，集合变体持续持有Set并用Receive复检候选，核真实Set/Line成员后Kill（不要求集合宿主同时Waiting）；保留母本核摘链/loan归还、原Pool零/Revoke/DONE及完整core |
-| `just investigate-clock` | 原IRQ退出消费者/4hart/无icount的一次时钟首因调查；THROTTLE100、冷启动-S，只有正常时钟read的两错误路径只读点，核实际STATE/self与写前failed、局部样本/几何/当前高水位和原栈后让原终局执行。正常结束无命中仅记未复现，不验证IRQ来源/公平门，不自动重复 |
-| `just acceptance-mmio-publication` | 同一core的原test_target/Map/Revoke消费者，外部vCont分别卡最终许可前/成功后且VM锁前；父Revoke真实返回后放行，核ObjectBusy/后续新Map Closed或原Map成功、活VM全部原范围PTE失效、scope DONE及独立Pool最终退款 |
-| `just acceptance-mmio-forced` | 同一test_target两次32页Map，核非空FIFO/已提交Publishing的原Work在父Revoke成功及Kill/Frozen后继续或交整VM退休；栈上Execution与实际VM/原mapping关联，最后scope DONE、Killed/Control关闭及独立Pool零 |
-| `just acceptance-device-retry-race` | 原device-reuse的C已安全Released/Detach后，两独立Caller用同Control授权发显式Retry；GDB只读核实际两begin同settled记录、一次重置及另一次迟到commit。仅旧记录已移除的观察不代表新Rc/原Rc新epoch保护；无窗口即记未覆盖 |
-| `just acceptance-dma-races` | 同一core的原test_target/Pin/Read/Retire消费者，外部vCont核Pin写许可前后Seal、非空准备退出、reader持有时Retire等待；分别核许可/域DONE、父对象关闭及独立子Pool最终退款 |
-| `just acceptance-dma-shared` | 同一MemoryObject的两份实际Pin共享完整Backing/SG，逐份DONE/关闭、写许可2→1→0与子metadata归还；父root仍在不退物理页，最后父对象/CPU/Control关闭后核独立Pool零和原父RAM退款 |
-| `just acceptance-dma-quota` | 原test_target以真实Notification owner耗尽独立Pool metadata，核原Pin明确Quota、释放压力后同Use恢复及最终原账零；不代表精确失败前缀或allocator OOM |
-| `just acceptance-dma-install-failure` | 原test_target的Pin完整取得use/write并ReadyUnexposed后，外部GDB在最终句柄安装的releases Buffer真实allocator入口注入一次null；核实际OutOfMemory、无handle/地址暴露、原Work收束及独立Pool最终零。指定分配失败不代表真实堆耗尽 |
-| `just virt-platform-funding` | 复用原boot失败设施，分别在首MMIO根Node构造、DMA未发布空根retained条目和全批Building cap表预约的真实未执行分配入口指定失败；DMA模式核出生前后原账相同且不排正常Root Work，其余模式按实际owner区别局部退款与稳定清理接管；均核无能力逃逸、真实boot错误及四hart Gate Failed停驻 |
-| `just acceptance-sifive_u [mode]` | 128MiB、非零 boot hart 等板级差异的 core 自动验收；默认 release |
-| `just virt-nofd [mode]` | 无 F/D、无兼容浮点域的完整 core；默认 release，可指定 debug |
-| `just virt-hetero [mode]` | 异构调度域及完整 core；默认 release，可指定 debug，涉及调度域时额外运行 |
-| `just virt-boot-failure` | 外部 GDB 对正式 debug binary 注入 Ready 前 panic/alloc/fatal，确认所有 hart 在 Failed 后停驻 |
-| `just virt-ipi-failure` | 外部GDB跳过真实已发布责任的一次SBI IPI并返回FAILED；核无timer WFI目标在后续真实广播唤醒后先停驻，确认稳定停止事实 |
-| `just virt-vm-fault` | debug memory：复用 stress 中的线程/映射消费者，旁观真实 Map 发布窗口 fault→RetryFault；detach 后核目标 Dead/Completed、Job 收束、辅助能力关闭与显式 reset |
-| `just virt-vm-repair` | 外部GDB保留真实PTE与用户现场，分别注入R/W/X入口故障及重复故障；核实际SFENCE/FENCE.I、原寄存器与pc重试、无进展终止界 |
-| `just virt-dma-retention` | 完整 debug core 的真实 DMA pin；GDB 拒绝最终 SBI reset，核 init DONE 前后及四 hart 停驻后仍持原页/写许可，mapping Work 为 Idle |
-| `just virt-dma-ipi-retention` | 同一严格core保留观察，额外让真实InitialWatch DONE后第一次request广播中的一个非发送者WFI目标IPI返回FAILED；核实际返回/后续原广播和同组mapping跨四hart停驻保留，不排除timer/其他唤醒 |
-| `just acceptance-core` | 常规跨机制回归：clippy、无调试器 debug stress、release core |
-| `just acceptance-platforms` | 平台组合：release sifive_u core、release nofd core |
-| `just acceptance-faults` | 特权失败与发布窗口：boot-failure、IPI failure、VM fault、VM repair、DMA retention |
-| `just acceptance` | 完整收尾：依次执行上述三组，各路线仅一次 |
+| memory | 普通映射、进程付款、双维 Pool；stress 只运行既有线程/映射 storm，fault 另观察真实 RetryFault，repair 注入受限 VM 修复故障 |
+| ipc | Sender、Mailbox、Notification、WaitSet、Once；stress 加控制面重复压力 |
+| process | 出生、Job/派生、Kill、已提交调用者退出；stress 加非空 WaitSet 自动退休和 16/16 竞态矩阵 |
+| transport | RPC 拒绝/取消、Tunnel 几何/失败 owner、真实 pm 流与背压；stress 加 Tunnel 生命周期重复组合 |
+| time | 公共 Deadline 与时间行为 |
+| resources | MMIO、IRQ、DMA 各自授权/退出/收束；缺所选平台根明确失败。publication、forced、races、install-failure、irq-exit 是外部观察专项；shared/quota 只观察既有客体自检；retention 拒绝 reset 后核保留责任，IPI 组合另核失败唤醒 |
+| services | System 三宿主 Ready 后运行 startup task，其完成触发反序停止、来源撤销与正常收集；没有 FS/设备业务验收 task，不宣称键盘热插或 Copy/Watch 客户端覆盖 |
+| platform | boot 只运行出生/收集 task，fp 只运行浮点 task；nofd 运行 Base64 出生/收集 task 并核域声明，不再声称测试了 FP 启动拒绝；hetero 核域声明和浮点消费者；sifive_u 运行出生/收集 task 观察启动与终局，不携带全套业务。boot/IPI/funding 是显式故障诊断；clock 仅在历史异常复发或用户要求时运行 |
 
-演示与自动验收是独立入口：`virt`、`virt-release`、`sifive_u` 直接运行 QEMU，不执行验收锚点判定，也不自动收割终态。日常自动验证优先受影响 host 测试及 `acceptance-virt`；需要 debug 验收用 `acceptance-virt debug`，涉及竞争与退休用 `virt-stress`。常规跨机制回归用 `acceptance-core`；平台、DT、hart 启动/能力、资源布局变化补 `acceptance-platforms`，调度域变化再加 hetero；启动失败、IPI/停驻、VM 发布/修复、uaccess 变化补相关故障路线。完整收尾保留 `acceptance`，聚合只调用测试入口，不调用演示入口。
+`all` 顺序执行 memory/ipc/process/transport/time、三项 resources、services、platform fp。任一失败即停止。它不包含 host 单测或 clippy，不重复已经显式执行的静态检查，也不隐含压力、GDB 或平台矩阵。普通与 stress 的退款断言并不完全相同，stress 不代替普通组。
 
-core/stress 及携带 core 的平台路线同时要求实际 srv_device 就绪、init 私有装配认证、来源封口与正常退出，以及设备枚举/OAL/Watch 初次观察和撤销终态的日志锚点；memory 聚焦路线不启动该服务。这些锚点只覆盖管理宿主装配，不证明平台 Provision、真实驱动或硬件停止已接通。
+有限服务部署要求存在 task；services 使用既有 test_kernel 的 startup 分支，在三宿主 Ready 后仅采用出生输入、收集自身 Job 并正常退出，不运行其他领域检查。每个 guest 领域只装配自己的 task 和必需辅助映像；仅资源组收平台根。资源退出不经过通用 Job 业务。RPC/Tunnel 使用原 pm 组合消费者，因此 transport 组仍覆盖其必需 IPC/Job 接缝。suite 与 mode 来自 `libprocess::birth` settings，错误组合在运行前拒绝。init 只解释正式组态，不知道测试领域。
 
-施工中路线结果只作为开发证据。机制闭包收尾按实际影响执行 `just check`、`just clippy` 与必要路线；已由聚合覆盖的检查不另行重复。平台完整业务保留，不用“板级差异”理由删去可能暴露资源/调度交错的真实消费者。文档等不改变执行行为的工作按影响核验，不运行无关的代码验收。
+## 判定、日志与清理
 
-## 节流、超时与判定
+[runner](../tools/qemu-acceptance.py) 要求所选 suite/mode 身份、该组完成、init task 完成、全部实例收集及 Requested Shutdown；services 还要求三宿主分别 Ready/Stopped，FP 要求浮点结果。panic、系统失败终局、意外 reboot、非零退出、缺锚点或清理失败均失败。分组完成日志出现在 guest 检查与 Job 收束之后，不能以子集的中途锚点冒充成功。
 
-演示经 `tools/qemu-throttle.sh` 直接运行；自动验收再由 `tools/qemu-acceptance.sh` 或专项诊断器判定。默认 `THROTTLE=50`，stress 和自动 GDB 路线同样节流，不作为全速性能基准；需要全速的专项诊断显式设 `THROTTLE=100`。节流限制宿主执行占空比，不能由 50% 推导整条路线耗时恰好翻倍。演示没有验收超时，运行到系统退出或用户中断；非交互环境需要防挂死时由调用者显式使用 `timeout`。
+正常 virt 要求命令成功退出。sifive_u 没有 shutdown 后端：只有全部成功锚点已出现、明确 reset 失败才允许主动收割，超时仍失败。诊断型故障工具拥有各自预期故障判据，不能把故意故障视作普通组通过。
 
-各路线有独立超时，可用 `VIRT_TIMEOUT`、`VIRT_STRESS_TIMEOUT`、`VIRT_RELEASE_TIMEOUT`、`VIRT_DEVICE_TIMEOUT`、`VIRT_HETERO_TIMEOUT`、`VIRT_NOFD_TIMEOUT`、`SIFIVE_U_TIMEOUT`、`VIRT_BOOT_FAILURE_TIMEOUT`、`VIRT_IPI_FAILURE_TIMEOUT`、`VIRT_VM_FAULT_TIMEOUT` 覆盖。默认值只在 Justfile 维护；virt stress 为竞态矩阵和文件资源/退出组合预留较长预算。VM fault 的 memory 负载有独立预算，旁观与 detach 后收束共用总期限；聚焦负载后仍保留原预算，不把提速当作收紧防挂死期限的依据。平台路线预算同时允许显式 debug，异构域的 Base64 系统负载固定在单 hart。超时从 QEMU 运行阶段计，不含冷编译；聚合命令不另设跨路线总时限。
+自动检查始终只显示摘要；完整构建/工具输出写 `artifacts/run/`，check/clippy/host 写 `artifacts/checks/`。每次验收在 `artifacts/acceptance/` 保存 guest 日志与 result.json，包括选择、命令、提交、ELF/boot package hash、退出与耗时；成功日志也保留，便于判断重复工作和比较运行耗时。专项观察证据保存在各自目录。
 
-路线超时是可扩大的运行预算，采用**撞限翻倍**政策：实际触及路线期限时，将该路线在 Justfile 中的默认值翻倍，并重跑核对完整业务收束与 reset；不为保留旧期限删减正式场景。默认数值只由 Justfile 拥有，手册和验收脚本不另设副本。超时从 QEMU 运行阶段计，不是性能目标；panic或明确错误触发的主动收割不算撞限，不能仅凭退出码误调期限。挂起或失败的具体原因仍按调查手册定位，翻倍不替代业务锚点与正确性验证。
+runner 用独立进程组启动命令，finally 收本轮组；外部观察器同样清理自己独立创建的 QEMU/GDB 组。共享 `qemu_gdb.stop_group` 先 CONT/TERM，有限等待并核 PID/PGID，必要时 KILL 后复核组消散。leader 退出或信号发出不等于清理完成；清理错误保留，不能覆盖为成功。
 
-判定依据 workload 身份、该 workload 的完整收束和显式 reset 锚点，不能用矩阵中途超时宣称内核失败。`virt-boot-failure` 同样节流，由 `tools/check-boot-failure.py` 独立判定预期故障、限制 GDB 时间并回收进程组，完整日志在 `artifacts/boot-failure/`。
+默认 THROTTLE=50；精确资源观察和 DMA 保留/时钟调查显式 100，GDB 停顿与节流结果均不作性能/WCET 证据。超时只防挂死，默认值集中在 Justfile，可用同名环境变量覆盖；不含编译，聚合没有额外总期限。确认仍在有界推进而撞限时翻倍对应预算并重跑；panic、主动收割和工具失败不算撞限，也不通过删场景掩盖。
 
-GDB专项路线在各自artifacts目录下使用时间戳与进程号创建独立日志，保留ELF hash、注入位置和原始观察。共同工具[qemu_gdb.py](../tools/qemu_gdb.py)按ELF PT_LOAD换算物理地址，并用QEMU的物理内存远程包读取跨hart全局事实，读取后恢复原模式；不依赖所选hart当前satp。VM repair中的异常原因/地址由诊断器注入，证明修复分支及现场合同，不宣称复现真实硬件TLB缓存陈旧；VM fault则要求正式消费者产生真实发布窗口故障。GDB停顿不作为计时、WCET或调度公平性证据。
+## 演示、清理与调查
 
-DMA retention 使用原 init/test_target 的实际角色和 pin，不向设备提交地址。脚本在最终真实 SBI reset ecall 返回 NotSupported；通过正式运行期各页表共享的内核高半区读取稳定 owner，并在 init DONE/全 hart 停驻处复核同一组 backing 区间和写许可、无 runnable mapping 退休债务。`VIRT_DMA_RETENTION_TIMEOUT` 由 Justfile 拥有，路线固定 THROTTLE=100 以避免调试器被周期冻结；它不作为性能证据，也不证明硬件 DMA 已静止。每次运行的 QEMU/GDB 由脚本 finally 收束。
+`just virt [mode]` 直接运行选定组态，默认 debug System；`just system [mode]` 明确选 System，默认 release；`just sifive_u [mode]` 默认 release System。它们不判定验收，也不因空闲关机。所有路线生成对应 DTB；`ERHINO_DTB` 可选直接演示的 DTB，验收入口使用明确的平台变体。
 
-DMA＋IPI 组合在原 InitialWatch DONE 的 request 入口暂用 GDB `scheduler-locking on` 只推进原请求者，使其他 hart 不会在选择失败目标前先提交 STOPPED；一次注入失败被原调用方消费后立即恢复 `off`，后续原停止广播和四 hart 停驻均在恢复调度后观察。若 request 结束仍没有合格目标，恢复调度并明确失败，不写 guest 停止标志或目标 PC 来制造资格。WFI/无 quantum、同 call 的原始返回与 Result 消费、同目标后续广播和同组 DMA 保留判据保持独立；不排除 timer/其他唤醒，不证明全部 IPI 永久失败下的停机活性。返回结果的栈地址按当前 ELF 的布局常量与 `StackWindowLayout` 的正式栈映射换算，仅接受原 sender 的正式栈；栈窗口 NOLOAD 的 ELF p_paddr 和内核直映射偏移都不能代替真实栈物理布局。物理模式内完成原 Result 的 DWARF 解码并保存字节，退出后只保留标量。
+演示在 TTY 显示实时输出，非 TTY 写 `artifacts/run/`；`ERHINO_OUTPUT=live|summary` 可覆盖，自动验收不受其影响。临时演示由启动者负责退出与清理。
 
-M累计栈工具从固定ELF重建CFI与动态目标，源码语义前提须人工核实后由[固定证书](../tools/maintenance-stack-certificate.json)绑定；没有证书、未知site/CFI/业务环或源码变化均不签发上界。本轮推导、命令和拒签负向证据由[对象链修复档案](archived/review-2026-10-07-object-chain.md#新elf累计栈与拒签证据)拥有；证书不是对未来构建的自动许可。
+`just clean-preview` 显示 [clean-build.py](../tools/clean-build.py) 的构建产物清单，`just clean` 执行；运行日志与证据不删除。清理时不能有其他任务使用产物。tar 使用 ustar 并关闭 AppleDouble，避免 macOS 的 `._` 文件进入 initfs。
 
-验收脚本只要求当前实际消费者与仍在调用的自检锚点；已删除机制的自检、日志与容量路线同步删除，不保留兼容锚点或为使旧门通过重建机制。路线通过证明该 workload 的当前可观察行为；内部交错、失败退款和付款保证的验证缺口由所属工作记录承载，不以旧锚点缺失代替风险判断。
+sifive_u 对应 HiFive Unleashed：hart 0 无 MMU，可运行 hart 1–4，DRAM 128MiB、timebase 1MHz，boot hart 不固定。继续运行时探测现代 SBI，不恢复旧 ABI 或专用内核政策。
 
-所有路线通过、失败、中断或超时后，都要确认本次启动的进程已清理。手动启动 QEMU/GDB 也由启动者负责清理，不干扰其他任务的进程。
+GDB 物理地址转换与共享内存读取见 [qemu_gdb.py](../tools/qemu_gdb.py)，不依赖当前 hart 的 satp。DMA retention 不向硬件提交地址，不证明 DMA 静止。维护栈证书仍只约束固定 ELF/源码，不自动许可未来构建。
 
-共享`qemu_gdb.stop_group`只收启动者以`start_new_session`创建的专有组：先CONT/TERM，有限核实际PID/PGID集合，必要KILL后再次核空；leader退出或发出信号均不替代组消散。设备操作者的短清理段避免重复终止打断，独立VM/调试器/QMP/临时文件均须收尾；清理异常单独留存，保留原验收失败事实。
-
-## sifive_u 平台边界
-
-该模型对应 HiFive Unleashed：hart 0 无 MMU，可运行 hart 为 1–4，DRAM 128MiB，timebase 1MHz，boot hart 不固定。内核继续运行时探测现代 SBI，不因板型历史调用 v0.1 核心 ABI，也不引入专用内核政策。
-
-该模型没有可用 shutdown 后端。`just sifive_u` 是演示，系统报告 reset 失败后仍保留现场，由用户 Ctrl-C 退出。`just acceptance-sifive_u` 遇到明确 reset 失败或 panic 终态时主动收割，再检查完整 core 锚点；收割本身不代表验收通过。
-
-## 日志与调查
-
-演示入口 `virt`、`virt-release`、`sifive_u` 在 Justfile 中按 stdout 是否 TTY 选择输出：终端直接显示编译、DTS 诊断和 QEMU 内核/用户态输出；非 TTY 将整次输出保存到 `artifacts/run/`，只显示开始、完成或失败及日志路径。演示完成仅表示运行结束，不表示自动验收通过。实时演示不额外捕获日志，需要留存时由调用者重定向或使用 `tee`。
-
-`ERHINO_OUTPUT=live just virt` 强制实时演示，`ERHINO_OUTPUT=summary just virt` 强制概要；通过管道或 `tee` 查看实时输出时需显式选择 live。该开关仅控制演示，不影响验收与测试。
-
-自动验收和测试始终隐藏内部输出，包括构建警告和 QEMU 输出；终端只报告结果、退出码和日志位置，失败详情查日志，不自动回放日志末尾。Justfile 将构建及诊断器输出保存在 `artifacts/run/`；`qemu-acceptance.sh` 独立保留失败 QEMU 日志及元数据，`QEMU_ACCEPTANCE_KEEP_LOG=1` 可额外保留成功现场。clippy 同样只报告各分面结果和日志位置。底层 `build_kernel`、`build_user`、`make_dtb`、`run_qemu` 命令保留原始输出，便于直接诊断。
-
-通过规定检查后停止；只有新改动、失败或具体未解决风险触发补测。挂起与损坏按 [DEBUG-PLAYBOOK](DEBUG-PLAYBOOK.md) 调查，工具、GDB 和汇编细节见 [TOOLING-PITFALLS](TOOLING-PITFALLS.md)。
+挂起、损坏或非确定性故障按 [DEBUG-PLAYBOOK](DEBUG-PLAYBOOK.md) 调查，工具问题按 [TOOLING-PITFALLS](TOOLING-PITFALLS.md)。历史偶发项只按 [KNOWN_ISSUES](../KNOWN_ISSUES.md) 的复发条件接续。

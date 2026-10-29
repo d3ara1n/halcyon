@@ -151,7 +151,7 @@ Owner 唯一消费角色不等于只有一个执行线程可以调用它。provi
 | N7 邻接语义 | Lifetime authority/use 双零、Reply Sent/Abandoned、Mailbox sender peer/queue 状态、Process/Thread DONE、Endpoint 与 MemoryObject 等待不因名称/typed 迁移改变 | 现有公共 IPC、监督、Tunnel/内存路线与类型检查；不为每个旧函数添加镜像单测 |
 | N8 正式 Watch 接入 | fs/service 真正交付 Observer，Query/重读/Ack 后清就绪，旧 Ack 保留后续事件，终态/退出/控制寿命闭合 | 主计划拥有场景与日志；本案引用证据，不重复认领领域验收 |
 
-开发阶段先编译受影响 shared/kernel/user 与既有 host 测试（host 显式 `aarch64-apple-darwin`）；编译暂时失败不能成为搭兼容 adapter 的理由。实现闭合后执行 `just check`、`just clippy`；按上述风险复用 `just virt`、`just virt-stress` 及必要路线，跨机制组合收口按构建手册执行 `just acceptance`。同一基线通过的检查不重复；与主计划共用组合运行时明确哪些日志覆盖本案。
+按[构建与验证手册](BUILD-AND-TEST.md)选择受影响 shared/kernel/user package 的静态检查和 host 测试；运行期按上述风险选择 ipc/process/transport 等领域及必要压力场景，不把旧聚合路线作为固定门。编译暂时失败不能成为搭兼容 adapter 的理由。同一基线通过的检查不重复；与主计划共用组合运行时明确哪些日志覆盖本案。
 
 持续就绪活性、并发安装和所有失败窗口不能仅由一次 QEMU 通过推定。无法通过现有设施运行的内部窗口记录精确 owner、审计证据和未覆盖部分；不得将“设计上应当成立”列为执行通过。
 

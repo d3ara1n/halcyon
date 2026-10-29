@@ -296,7 +296,7 @@ srv_init 约 17.3k 行，直接依赖 `srv_fs`、`test_fs`、`libdevice`、`libd
 
 ### 收口
 
-`just check`、`just clippy`、受影响 crate 的 host 测试与全部验收路线（路线选择见 [BUILD-AND-TEST](BUILD-AND-TEST.md)）。按 [REVIEW](REVIEW.md) 做交付前结构检查并写回本篇。回填 `notes/impls`（服务、init、device 相关篇），更新 KNOWN_ISSUES 矫正区与 COMPASS。
+按 [BUILD-AND-TEST](BUILD-AND-TEST.md) 选择受影响 package/分面的 check、clippy、host 测试及必要的组态/服务验收；不以全部历史路线为固定门。按 [REVIEW](REVIEW.md) 做交付前结构检查并写回本篇。回填 `notes/impls`（服务、init、device 相关篇），更新 KNOWN_ISSUES 矫正区与 COMPASS。
 
 ## 删除清单（切面 B 完成时）
 
@@ -340,13 +340,13 @@ srv_init 约 17.3k 行，直接依赖 `srv_fs`、`test_fs`、`libdevice`、`libd
 - **test_kernel**：经 `Birth` 采用命名输入，部署模式来自设定 `mode`；保留子进程角色经设定 `role` 传递；私有 `lib.rs` 出生帧删除。
 - **组态与构建**：`user/formations/` 下 `system`、`acceptance`、`fp`、`stress`、`memory` 与各 `mode-*` 源；Justfile 以 `ERHINO_FORMATION` 选组态，`make_initfs` 编译组态并只装入其引用映像，根目录为 `formation` 与 `image/<组件>`。
 
-失去的覆盖（按 AGENTS 过渡设施口径删除，不登记债务）：`test_fs`、`test_device` 与 init 内服务级验收（fs/registry/copy/secondary 生命周期、device/driver 自检、function-session、reuse/candidates/retry-race、manager/controller fault、reset-rejection、fs-stop-order）；init 根监督的 failure-isolation、dispatcher funding、startup capture、idle ownership 自检；test_kernel 的 SystemReset 负路径与 held Pool 跨进程报告比对。`tools/` 中依赖已删路径的观察器与 `qemu-acceptance.sh` 的锚点未更新，等待用户清理验收设施时一并处理。
+失去的覆盖（按 AGENTS 过渡设施口径删除，不登记债务）：`test_fs`、`test_device` 与 init 内服务级验收（fs/registry/copy/secondary 生命周期、device/driver 自检、function-session、reuse/candidates/retry-race、manager/controller fault、reset-rejection、fs-stop-order）；init 根监督的 failure-isolation、dispatcher funding、startup capture、idle ownership 自检；test_kernel 的 SystemReset 负路径与 held Pool 跨进程报告比对。失效宿主观察器、旧锚点和分组重建由[验收清理](todo-2026-10-29-acceptance-groups.md)统一承接；本篇不再要求恢复已删除消费者。
 
-未闭合：运行期正确性未验证；`irq-retirement` 等引用已删 recipe 的工具脚本残留；完成门 1–5 均待运行期证据。
+未闭合：运行期正确性未验证，完成门 1–5 的运行期部分仍待证据。验收工具的当前入口与删除范围见[验收清理](todo-2026-10-29-acceptance-groups.md)；后续按影响选择 services/平台/领域组，不重跑历史路线清单。
 
 ### 接线与责任
 
-- **init 侧**：`AcceptanceImages` 在任何子进程出生前一次核完验收归档（缺失或重复即拒绝）。[`kernel_acceptance`](../user/services/srv_init/src/kernel_acceptance.rs) 的 `KernelAcceptance::run` 用原 Preparation/spawn 与 root 账本启动 `test_kernel`，并由 init 原短任务路径启动 `test_fp`；两者均须 Dead/Completed/NONE。`finish` 以二者为输入执行 RootSupervisor 失败隔离自检（原 QuotaExceeded 首因、恰好一个健康成员、InvalidPolicy 后同一 Collector 恢复及隔离 Job 收集判据不变），再核主 Pool 页与 metadata 的 allocated/reserved/delegated 全零并关闭，核 held Pool 自报告后逐字不变；此后才准入 srv_device，平台根别名与设备使用由此串行。
+- **init 侧**：`AcceptanceImages` 在任何子进程出生前一次核完验收归档（缺失或重复即拒绝）。切面 A 的 `kernel_acceptance::KernelAcceptance::run`（源码见当时提交 `413f384`；该模块在切面 B 已删） 用原 Preparation/spawn 与 root 账本启动 `test_kernel`，并由 init 原短任务路径启动 `test_fp`；两者均须 Dead/Completed/NONE。`finish` 以二者为输入执行 RootSupervisor 失败隔离自检（原 QuotaExceeded 首因、恰好一个健康成员、InvalidPolicy 后同一 Collector 恢复及隔离 Job 收集判据不变），再核主 Pool 页与 metadata 的 allocated/reserved/delegated 全零并关闭，核 held Pool 自报告后逐字不变；此后才准入 srv_device，平台根别名与设备使用由此串行。
 - **nofd 降级**：判据集中在 `run_companion`，严格为 test_fp spawn `System(NotSupported)`、grants `Retained` 且 `cleanup_error == None`；此时以单进程 Collector 收集 test_kernel 并输出自检不适用原因。FP 映像仍必需，其余出生错误或非 Completed 均失败。memory 不运行 test_fp 与该自检。
 - **test_kernel 侧**：按领域分模块（见[切面 A 第 1 步](#切面-a内核级验收移出独立先行)），`main` 只负责启动子进程与编排顺序，`startup` 负责出生采用与保留模式子进程，[`harness`](../user/tests/test_kernel/src/harness.rs) 持能力与子进程 owner。它只持 services 下独立验收 Job 的子树，不持根 Job；根拓扑遍历、startup capture、idle ownership、Dispatcher funding 与 RootSupervisor 自检留 init。pm 收到 `libprocess::DERIVED_CONTROL_RIGHTS` 的委托域 JobControl。辅助均在测试包内，不新增公共库 API。
 - **held Pool**：RootSupervisor 持有通用 held Pool 集合（`hold_pool`），从根 Pool 派生并持有至系统结束，不随实例收集关闭；对应组态的 `[pool.<名>]`。retention Pool 是其唯一当前使用者。

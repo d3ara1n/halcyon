@@ -1,0 +1,6 @@
+# transport 领域的输入与选择。
+[instance.kernel]
+settings.suite = "transport"
+settings.mode = []
+inputs."kernel.image.test_target" = "init/image.test_target"
+inputs."kernel.image.srv_pm" = "init/image.srv_pm"

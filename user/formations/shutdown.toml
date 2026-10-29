@@ -1,0 +1,2 @@
+# 有限部署：task 完成后按正式反拓扑与撤销门停止 resident。
+finish = "shutdown"

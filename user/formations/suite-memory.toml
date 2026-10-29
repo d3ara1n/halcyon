@@ -1,0 +1,4 @@
+# memory 领域的输入与选择。
+[instance.kernel]
+settings.suite = "memory"
+settings.mode = []

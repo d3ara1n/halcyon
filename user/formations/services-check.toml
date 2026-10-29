@@ -1,0 +1,3 @@
+# 三宿主 Ready 后才运行有限 task；其正常完成驱动正式停止链。
+[instance.kernel]
+after = ["device", "driver", "fs"]

@@ -197,20 +197,6 @@ pub(super) fn test_job_management(
     seal_before_start(job);
     seal_before_create(job);
     enumerate_convergence(job);
-    let ecam = startup::ecam_handle();
-    if let Some(ecam) = ecam {
-        mmio_checks::process_retirement(ecam, job, image)?;
-    }
-    if mode().has(Mode::IRQ_EXIT) {
-        let irq = startup::irq_handle();
-        if let Some(irq) = irq {
-            irq_checks::process_retirement(irq, job, image)?;
-        }
-    }
-    let dma = startup::dma_handle();
-    if let Some(dma) = dma {
-        dma_checks::process_retirement(dma, job, image)?;
-    }
     if mode().stress() {
         test_automatic_retirement(job, image)?;
     }
