@@ -18,20 +18,131 @@
 
 ## 命名
 
-| 对象 | 名称 | 说明 |
-|---|---|---|
-| initfs 根的组态文件 | `formation` | 二进制；init 读取的唯一入口 |
-| initfs 映像目录 | `image/<组件名>` | 由现有 `bin/` 改名，与 `libprocess::image`、`StartupImage` 的用词一致 |
-| 组态 schema crate | `shared/formation` | no_std 编解码与静态校验；`host` feature 下的同名 bin 为编译器 |
-| 服务设定 crate | `shared/settings` | 类型化值树的编码与只读访问 |
-| 组态源文件 | `user/formations/<部署名>.toml` | 如 `system.toml`、`core.toml`；按部署而非平台命名 |
-| 出生输入 | `libprocess::birth` 模块，类型 `Birth` | |
-| 实例契约 | `libservice::instance` 模块 | 不复用 libservice 现有目录“服务描述”类型 |
-| 生命周期保留输入 | `report`、`stop` | 由 `libservice::instance` 定义的常量 |
-| 实例生命周期种类 | `resident`、`task` | |
-| 全部 task 完成后的动作 | `finish = stay \| shutdown \| reboot` | |
+本节为定稿，实施中不再另议；新增名字按本节语法派生。
 
-源格式用 TOML 的理由：编译器只在 host 运行，需要注释、表与数组，Rust 生态有成熟解析器；init 内不出现文本解析器。依赖版本按全局规则固定。组件命名按 [user/README](../user/README.md) 命名章节落地，新 crate 名在实施前于该篇登记。
+### 术语
+
+| 中文 | 代码 | 含义 |
+|---|---|---|
+| 组态 | `formation` | 一份完整的初始系统组成：实例、资源、路由与结束动作 |
+| 部署 | 组态源文件名 | System 或某一验收形态；一个部署对应一份组态 |
+| 实例 | `instance` | 组态中的一个进程；同一映像可有多个实例 |
+| 种类 | `resident` / `task` | 常驻（须 Ready、须正常停止）/ 任务（以 Completed 结束即成功） |
+| 出生 | `birth` | 进程启动时收到的命名输入与设定 |
+| 输入 / 导出 | `input` / `export` | 实例收到的命名能力 / 实例交出的命名能力 |
+| 路由 | `route` | 把来源接到某实例的某输入 |
+| 撤销 | `revoke` | 停止或终局时收回某条路由派生的全部使用 |
+| 设定 | `settings` | 实例私有的类型化配置值，由服务自己解释 |
+
+### 名字语法
+
+- 实例名、输入名、导出名、job 名统一语法：小写 ASCII 段 `[a-z][a-z0-9_]*`，段间用 `.`，总长不超过 32 字节。
+- 首段是名字语义的所属领域：`instance.*` 属 `libservice::instance`；`platform.*` 属 `erhino_shared::platform`；`memory.*` 属内核内存对象；`device.*` 属 libdevice；`driver.*` 属 libdriver；`file.*` 属 libfs；`service.*` 属 libservice 目录。新领域按其库名取首段。
+- 列表：末段为十进制序号，从 0 连续无空洞，如 `platform.root.0`。`Birth::take_all("platform.root")` 按序取全部；组态中把列表前缀接到列表前缀即整表路由，序号保持。
+- 撤销管理端的名字为被管导出名加 `.admin`，如 `device.source.driver.admin`。
+- 组态内引用来源写作 `<实例名>/<导出名>`。保留实例名 `init`（init 内建来源）与 `self`（引用方实例自身），不得作为实例名。
+- 组态源中的种类、对象类型与权限取值用 snake_case：`mailbox_sender`、`notification_owner`、`memory_object`、`job`；权限 `read`、`write`、`wait`、`signal`、`manage`、`create`、`duplicate`、`transit`、`grant`。
+
+### 文件、组件与构建
+
+| 对象 | 名称 |
+|---|---|
+| initfs 组态文件 | 根目录 `formation`（二进制，魔数 `ERFORMTN` + u32 版本 1） |
+| initfs 映像 | `image/<组件名>`，由现有 `bin/` 改名，与 `libprocess::image`、`StartupImage` 用词一致 |
+| 出生帧 | payload 魔数 `ERBIRTH\0` + u32 版本 1 |
+| 组态 crate | `shared/formation`：no_std 库；`host` feature 下同名 bin `formation` 为编译器 |
+| 设定 crate | `shared/settings` |
+| 出生模块 | `libprocess::birth`，类型 `Birth` |
+| 实例契约模块 | `libservice::instance`（不复用 libservice 现有目录“服务描述”类型） |
+| 内核级验收 task | `test_kernel` |
+| 组态源 | `user/formations/<部署名>.toml` |
+| 部署名 | 沿用现有 workload：`system`、`core`、`stress`、`memory`、`device`、`device-reuse`；原 feature 覆写各自成为部署：`device-retry-race`、`device-candidates`、`device-function-session`、`irq-retirement`、`irq-exit`、`mmio-publication`、`mmio-forced`、`dma-races`、`dma-shared`、`dma-quota`、`dma-install-failure`。部署名不是 Rust 组件，保留连字符 |
+| Justfile | 变量 `FORMATION`（环境 `ERHINO_FORMATION`，默认 `core`）取代 `ERHINO_ACCEPTANCE_WORKLOAD` 与 `INIT_FEATURES`；`make_formation` 编译组态，`make_initfs` 按组态引用的映像组装 |
+
+新增名字均为完整英文领域词，符合 [user/README](../user/README.md) 命名章节，无需登记缩写。源格式用 TOML：编译器只在 host 运行，需要注释、表与数组，Rust 生态有成熟解析器；init 内没有文本解析器。依赖版本按全局规则固定。
+
+### 保留名与内建来源
+
+| 类别 | 名字 |
+|---|---|
+| 生命周期输入 | `instance.report`（mailbox_sender，write\|wait\|transit）、`instance.stop`（notification_owner，read\|wait） |
+| 报告消息 | `Export`、`Ready`、`Stopped` |
+| 撤销协议 | `Revoke`、`QueryRevoked` → `Open` \| `Revoking` \| `Closed` |
+| init 内建来源 | `init/platform.description`、`init/platform.root`（列表）、`init/image.<组件名>`（只读 MemoryObject）、`init/job.services`、`init/job.<名>`（组态 `[job.<名>]` 声明） |
+| 自身来源 | `self/memory.pool`（本实例 Pool 的 CREATE 别名） |
+| 全局结束动作 | `finish = "stay" \| "shutdown" \| "reboot"` |
+
+`SystemReset` 不是来源，不可路由。
+
+### 领域输入与导出名
+
+| 宿主 | 输入 | 导出 |
+|---|---|---|
+| srv_device | `instance.*`、`memory.pool`、`platform.description`、`platform.root` | `device.root`、`device.root.admin`；设定 `sources` 表每项 `<名>` 产生 `device.source.<名>` 与 `device.source.<名>.admin` |
+| srv_driver | `instance.*`、`memory.pool`、`device.source`、`driver.workers`（worker Job）、`driver.image.<组件名>` | `driver.control`、`driver.observer` |
+| srv_fs | `instance.*`、`memory.pool`；不承载 registry 时加 `service.authority` | 每入口 N：`file.root.N`、`file.management.N`；承载 registry 时加 `service.directory.N`、`service.authority.N` |
+
+驱动实现键即映像组件名：删除声明中独立的 `key` 字段，设定条目以 `implementation = "drv_usb_hid"` 指定实现，srv_driver 据此取输入 `driver.image.drv_usb_hid`。实现键、映像路径与输入名由同一个组件名派生，不再有三份名字。
+
+### System 组态源示例
+
+数值按现有常量换算，示例只定结构与名字：
+
+```toml
+finish = "stay"
+
+[job.drivers]
+parent = "services"
+pool = "driver"            # 由 driver 实例的 Pool 付款
+
+[instance.device]
+image = "srv_device"
+kind = "resident"
+pool = { work_pages = 0, metadata_bytes = 0 }   # 按现值换算
+start_timeout_ms = 5000
+stop_timeout_ms = 40000
+inputs."memory.pool" = "self/memory.pool"
+inputs."platform.description" = "init/platform.description"
+inputs."platform.root" = "init/platform.root"
+exports."device.root" = { kind = "mailbox_sender", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+exports."device.root.admin" = { kind = "mailbox_sender", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+exports."device.source.driver" = { kind = "mailbox_sender", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+exports."device.source.driver.admin" = { kind = "mailbox_sender", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+settings.sources = [{ name = "driver", scope = "root", access = ["observe", "claim", "child_register", "report_stopped"] }]
+
+[instance.driver]
+image = "srv_driver"
+kind = "resident"
+pool = { work_pages = 0, metadata_bytes = 0 }   # 含 worker 工作集
+stop_timeout_ms = 40000
+inputs."memory.pool" = "self/memory.pool"
+inputs."device.source" = { from = "device/device.source.driver", revoke = "device/device.source.driver.admin" }
+inputs."driver.workers" = "init/job.drivers"
+inputs."driver.image.drv_pci_generic" = "init/image.drv_pci_generic"
+inputs."driver.image.drv_usb_xhci" = "init/image.drv_usb_xhci"
+inputs."driver.image.drv_usb_hid" = "init/image.drv_usb_hid"
+exports."driver.control" = { kind = "mailbox_sender", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+exports."driver.observer" = { kind = "mailbox_sender", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+settings.declarations = [
+  { implementation = "drv_pci_generic", identity = "<PCI host identity 字节>", priority = 1, capacity = 1, reusable = false, child_registrar = true, trusted_physical = true },
+  { implementation = "drv_usb_xhci", identity = "<xHCI identity 字节>", priority = 1, capacity = 1, reusable = false, child_registrar = true, trusted_physical = true },
+  { implementation = "drv_usb_hid", identity = "<boot keyboard identity 字节>", priority = 1, capacity = 2, reusable = true, child_registrar = false, trusted_physical = false },
+]
+
+[instance.fs]
+image = "srv_fs"
+kind = "resident"
+pool = { work_pages = 4096, metadata_bytes = 1048576 }
+start_timeout_ms = 10000
+stop_timeout_ms = 10000
+inputs."memory.pool" = "self/memory.pool"
+exports."file.root.0" = { kind = "mailbox_sender", rights = ["write", "wait", "transit", "duplicate", "grant"] }
+# file.management.0、service.directory.0、service.authority.0 同上
+settings.registry = true
+settings.entries = [{ watches = 24, sessions = 16 }]
+```
+
+`instance.report`、`instance.stop` 由 init 为每个 resident 自动供给，不写进组态。identity 字节的书写形式（十六进制字符串）由 `formation` 编译器的设定编码规则定义；领域常量（如 `libpci::host::HOST_IDENTITY`）在 host 单测中与 System 组态逐字节比对，不在两处各写一份真值后不核对。
 
 ## 现状（代码盘点，2026-10-28）
 
@@ -79,60 +190,59 @@ srv_init 约 17.3k 行，直接依赖 `srv_fs`、`test_fs`、`libdevice`、`libd
 
 ## 契约一：出生
 
-- payload 帧：magic、version、输入表（名字 → 槽号）、设定段（`settings` 字节）。名字为 ASCII，上限 32 字节，表内唯一。对象类型与权限以 `adopt` 时内核 query 的实际结果为准，表中不记录。
-- `Birth::adopt(StartupContext)` 提供：`take(name, kind, min_rights)`；`take_all(prefix)` 取多值输入（如 `platform.root[0..n]`）；`settings()`；`finish()`。`finish()` 拒绝未取用的输入，使组态与实现不一致在出生时失败。
-- `report`：MailboxSender，WRITE|WAIT|TRANSIT。`stop`：NotificationOwner，READ|WAIT。其余输入（Pool CREATE 别名、Job、映像、平台根）均为普通命名输入。
+- payload 帧：魔数 `ERBIRTH\0`、version、输入表（名字 → 槽号）、设定段（`settings` 字节）。名字按[名字语法](#名字语法)，表内唯一。对象类型与权限以 `adopt` 时内核 query 的实际结果为准，表中不记录。
+- `Birth::adopt(StartupContext)` 提供：`take(name, kind, min_rights)`；`take_all(prefix)` 取列表输入（如 `platform.root`）；`settings()`；`finish()`。`finish()` 拒绝未取用的输入，使组态与实现不一致在出生时失败。
+- `instance.report` 与 `instance.stop` 的类型与权限见[保留名](#保留名与内建来源)。其余输入（`memory.pool`、Job、映像、平台根）均为普通命名输入。
 - 不需要生命周期的 task（如 `test_fp`）可空 payload、不使用 `Birth`。
 - 不采用 ELF note 携带契约：输入/导出不一致在出生与就绪时被捕获，note 需要额外构建步骤并依赖 strip 保留，收益仅是提前到构建期发现。
 
 ## 契约二：就绪与导出
 
-- 子进程在 `report` 上依次发若干 `Export { name }`（每条恰一个句柄），最后发 `Ready { export_count, summary }`。一导出一能力，例如 device 的根入口与管理端是 `root` 与 `root.admin`。`summary` 为可选领域字节，init 不解释、可转交消费者。
-- init 通用校验：sender pid 与 `report` 通道 context；导出名属于组态为该实例声明的集合且不重复；实际 kind 与 rights 不低于声明；Ready 时计数相符、声明导出全部到齐、进程仍 Running 且未 DONE。
+- 子进程在 `instance.report` 上依次发若干 `Export { name }`（每条恰一个句柄），最后发 `Ready { export_count, summary }`。一导出一能力，例如 device 的根入口与管理端是 `device.root` 与 `device.root.admin`。`summary` 为可选领域字节，init 不解释、可转交消费者。
+- init 通用校验：sender pid 与 `instance.report` 通道 context；导出名属于组态为该实例声明的集合且不重复；实际 kind 与 rights 不低于声明；Ready 时计数相符、声明导出全部到齐、进程仍 Running 且未 DONE。
 - 删除 KOID/incarnation 交叉核对与位掩码（仅 init 消费，见已核实事实）。
-- 就绪等待并入监督轮询，每轮有界领取；init 持续排空 `report`（容量 16）。子进程按启动期限 `try_send`，超期即启动失败。
+- 就绪等待并入监督轮询，每轮有界领取；init 持续排空 `instance.report`（容量 16）。子进程按启动期限 `try_send`，超期即启动失败。
 
 ## 契约三：停止
 
-- init 对 `stop` 发 signal；`stop` 关闭（init 消失）同样视为停止请求。服务自行收尾，发 `Stopped`，以 Completed 退出。init 要求 Stopped 与正常 DONE 两项事实，期限取组态 `stop_timeout`，超期进系统终局。
+- init 对 `instance.stop` 发 signal；`instance.stop` 关闭（init 消失）同样视为停止请求。服务自行收尾，发 `Stopped`，以 Completed 退出。init 要求 Stopped 与正常 DONE 两项事实，期限取组态 `stop_timeout_ms`，超期进系统终局。
 - srv_fs：现有停止通知与 `PROVIDER_STOPPED` 改用统一消息。
-- srv_driver：删除 Stop RPC op1，改为响应 `stop`；在 Binding Released、worker 收集之后发 Stopped。`test_device` 的 op1 权限负探针随之删除。
-- srv_device：收到 `stop` 后封自身根来源、等根来源退休、发 Stopped。原由 init 执行的封源、Watch 终止确认与 `QuerySourceStop` 轮询移入服务内部。
+- srv_driver：删除 Stop RPC op1，改为响应 `instance.stop`；在 Binding Released、worker 收集之后发 Stopped。`test_device` 的 op1 权限负探针随之删除。
+- srv_device：收到 `instance.stop` 后封自身根来源、等根来源退休、发 Stopped。原由 init 执行的封源、Watch 终止确认与 `QuerySourceStop` 轮询移入服务内部。
 
 ## 契约四：可撤销导出
 
-- 组态可在一条路由上声明 `revoke = "<提供方导出名>"`。该导出必须是实现撤销协议的管理端，只有两个操作：`Revoke`（幂等）与 `QueryRevoked → Open | Revoking | Closed`。
+- 组态可在一条路由上声明 `revoke = "<实例名>/<导出名>.admin"`。该导出必须是实现撤销协议的管理端，只有两个操作：`Revoke`（幂等）与 `QueryRevoked → Open | Revoking | Closed`。
 - 语义：`Closed` 表示提供方账本中经该来源派生的活跃使用为空。“活跃使用”及其与硬件静止的关系由领域拥有。libdevice 的实现即现有 SealSource 与 QuerySourceStop；依已核实事实，正常停止路径下 Closed 蕴含已暴露资源均已由执行者报告静止，可作为放行门。
 - init 的两处使用：
-  - 正常停止：消费者 Stopped + DONE 之后撤销其收到的可撤销路由，轮询至 Closed，再停止提供方。Revoking 超过 `stop_timeout` 进系统终局。
+  - 正常停止：消费者 Stopped + DONE 之后撤销其收到的可撤销路由，轮询至 Closed，再停止提供方。Revoking 超过提供方 `stop_timeout_ms` 进系统终局。
   - 系统终局：对已收到的全部撤销管理端发 `Revoke`，替代 `Terminal::run` 中的 libdevice `SealSource`。终局不等待 Closed，仍按现行封 `services`、有界收集、冷重启。
-- 签发方式：需要给其他实例的受限来源，由提供方按自身设定在 Ready 前签发为预限定命名导出。driver 的 ClaimSource 由 srv_device 按设定签发为 `claim.driver` 与 `claim.driver.admin`（scope 与 access 写在 device 设定）。init 只路由，不再运行期调用 `IssueSource`；原“签发 Unknown 时封原根”分支随之删除，签发失败即 device 未就绪，走启动失败终局。
+- 签发方式：需要给其他实例的受限来源，由提供方按自身设定在 Ready 前签发为预限定命名导出。srv_device 按设定 `sources` 表签发 `device.source.<名>` 与 `device.source.<名>.admin`（scope 与 access 写在该表项）；System 中 driver 使用 `device.source.driver`。init 只路由，不再运行期调用 `IssueSource`；原“签发 Unknown 时封原根”分支随之删除，签发失败即 device 未就绪，走启动失败终局。
 
 ## 组态文件
 
-### 实例字段
+### 字段
 
-| 字段 | 含义 |
-|---|---|
-| `name` | 实例名，唯一 |
-| `image` | initfs 路径 |
-| `kind` | `resident` 或 `task` |
-| `job` | 新建（可指定父 Job）或使用具名 Job |
-| `pool` | 映像页由 ELF load runs 推导；组态声明工作集页与 metadata 字节，可附额外委托额度 |
-| `inputs` | 输入名 ← 来源；可声明 rights 衰减与 `revoke` |
-| `exports` | 名字、kind、最小 rights |
-| `settings` | 内联表，编译时编码进组态文件 |
-| `start_timeout`、`stop_timeout` | 期限 |
-| `after` | 无数据依赖时的顺序约束 |
+| 位置 | 字段 | 含义 |
+|---|---|---|
+| 顶层 | `finish` | 全部 task 正常完成后的动作 |
+| `[job.<名>]` | `parent`、`pool` | 父 Job（`services` 或另一具名 job）；付款 Pool 所属实例 |
+| `[instance.<名>]` | `image` | initfs 内 `image/<组件名>` 的组件名 |
+| | `kind` | `resident` 或 `task` |
+| | `job` | 可选，具名 job；缺省时 init 在 `services` 下为该实例新建 Job |
+| | `pool` | `{ work_pages, metadata_bytes }`；映像页由 ELF load runs 推导后另加 |
+| | `inputs."<输入名>"` | 来源字符串，或 `{ from, rights, revoke }`（`rights` 只衰减） |
+| | `exports."<导出名>"` | `{ kind, rights }`，为最小要求 |
+| | `settings.*` | 内联设定，编译时编码进 `formation` |
+| | `start_timeout_ms`、`stop_timeout_ms` | 期限，单位毫秒 |
+| | `after` | 无数据依赖时的顺序约束，列出实例名 |
 
-### 来源种类
+来源只有[保留名与内建来源](#保留名与内建来源)所列的 `init/*`、`self/*` 与 `<实例名>/<导出名>` 三种。
 
-`init:platform.description`；`init:platform.root[*]`；`initfs:<path>`（封存为只读 MemoryObject）；`job:<name>`、`pool:<name>`（init 按组态建立的具名对象及 rights）；`self.pool`（本实例 Pool 的 CREATE 别名）；`<instance>.<export>`。`SystemReset` 不可路由。
+### 结束与 initfs 布局
 
-### 全局与 initfs 布局
-
-- 全局 `finish`：全部 task 正常完成后的动作。task 失败与 resident 意外退出一律进系统终局。
-- initfs 只含 `formation` 与 `image/*`。服务设定内联进 `formation`，不另设设定文件目录。
+- 全部 task 正常完成后执行 `finish`。task 失败与 resident 意外退出一律进系统终局。
+- initfs 只含 `formation` 与 `image/*`。设定内联进 `formation`，不另设设定文件目录。
 
 ### 静态校验（任何副作用之前）
 
@@ -141,15 +251,15 @@ srv_init 约 17.3k 行，直接依赖 `srv_fs`、`test_fs`、`libdevice`、`libd
 ### 执行
 
 - 按依赖拓扑序启动，组态顺序作为确定性 tie-break。resident 的导出在其 Ready 之后才可路由给后继。
-- 停止按反拓扑序，每步为“消费者 stop → Stopped + DONE → 撤销其可撤销路由至 Closed → 下一个”，替代 `deployment.rs` 固定的 Consumers/Files/Devices/Root 阶段。停止总预算为各实例 `stop_timeout` 之和加根预算。
+- 停止按反拓扑序，每步为“消费者 stop → Stopped + DONE → 撤销其可撤销路由至 Closed → 下一个”，替代 `deployment.rs` 固定的 Consumers/Files/Devices/Root 阶段。停止总预算为各实例 `stop_timeout_ms` 之和加根预算。
 - Supervisor 运行体、记录与来源数由组态在执行前计算并一次准入，替代 `Instance` 枚举、`deployment::instances()` 与 `file_hosts()`。
 - 组态解码结果与 initfs 映像在 init 生命周期内持有。
 
 ## 领域迁移
 
-- **srv_fs**：删除 `Profile`。设定给出入口列表（每入口 watches/sessions 份额）与是否承载 registry，`Capacity` 由设定计算。管理与登记 receiver 改由 fs 自建（未找到须由 init 预建的理由）。四种根改为命名导出：`file.root[i]`、`directory[i]`、`management[i]`、`registry.authority[i]`。secondary 的 publication authority 改为命名出生输入，删除 Start 前投递与 parent pid 核对。
-- **srv_driver**：声明表进入设定（key、identity、priority、capacity、reusable、child_registrar、trusted_physical），映像为命名输入 `image.<key>`，`image_bytes` 由 sealed 对象有效长度得出。worker Job 为输入 `job.workers`。worker Pool 额度写在组态，由部署决定；srv_driver 启动时校验额度覆盖声明，不足即启动失败。init 不再识别 ECAM。
-- **srv_device**：平台描述与根为命名输入；导出 `root.admin` 与设定声明的预限定来源。init 不再持有 root 入口、observer 与 Watch。
+- **srv_fs**：删除 `Profile`。设定 `registry`（布尔）与 `entries`（每入口 watches/sessions 份额）决定形态，`Capacity` 由设定计算。管理与登记 receiver 改由 fs 自建（未找到须由 init 预建的理由）。四种根改为[领域导出名](#领域输入与导出名)所列命名导出。secondary（`registry = false`）的 publication authority 改为输入 `service.authority`，路由自 primary 的 `service.authority.N`，删除 Start 前投递与 parent pid 核对。
+- **srv_driver**：声明表进入设定 `declarations`（implementation、identity、priority、capacity、reusable、child_registrar、trusted_physical），映像为输入 `driver.image.<组件名>`，`image_bytes` 由 sealed 对象有效长度得出。worker Job 为输入 `driver.workers`。worker 工作集计入 driver 实例 `pool.work_pages`，由部署决定；srv_driver 启动时校验额度覆盖声明，不足即启动失败。init 不再识别 ECAM。
+- **srv_device**：输入 `platform.description` 与列表 `platform.root`；导出 `device.root`、`device.root.admin` 与设定 `sources` 声明的预限定来源。init 不再持有 root 入口、observer 与 Watch。
 - **init 平台输入**：平台描述头经 `erhino_shared::platform` 解析，按 `resource_count` 与 `handle_index` 取根。终局按实际 object kind 封 MMIO/IRQ/DMA 根，只需 libkernel。删除 libpci 依赖。
 
 ## 验收迁移
@@ -157,7 +267,7 @@ srv_init 约 17.3k 行，直接依赖 `srv_fs`、`test_fs`、`libdevice`、`libd
 - 内核级检查（IPC、内存映射、时间、Job/Pool、tunnel、Once、race、MMIO/IRQ/DMA 根、Building/Job 管理）移入新 task `test_kernel`，接收派生 Pool/Job、所需映像与平台根别名，由它启动 `test_target`、`test_hammer` 与 `srv_pm`。断言 sender PID 等于 `init_pid` 的检查改为对照自身 pid。平台根别名只出现在验收组态，用 `after` 保证与 srv_device 使用串行。
 - 服务级检查由已有 `test_device`、`test_fs` 承接：device/driver 自检（权限拒绝、Watch、枚举、OAL）移入 `test_device`；fs/registry/copy/secondary 生命周期移入 `test_fs`，secondary 由 `test_fs` 用 `libservice::instance` launcher 启动。正式装配路径不再包含探针。
 - 留在 init 的是自身不变量：startup capture、idle ownership、dispatcher funding、终局与 reset。reset 负路径检查删除：attenuated rights 拒绝属于内核契约，由 `test_kernel` 持衰减别名验证。
-- 删除全部 init feature；Justfile 的 workload 只选择 `user/formations/<部署名>.toml` 与映像集合。
+- 删除全部 init feature；Justfile 由 `FORMATION` 选择 `user/formations/<部署名>.toml`，initfs 映像集合由该组态引用的 `image` 与 `init/image.*` 决定，不再手列。
 
 ## 实施顺序
 
