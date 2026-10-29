@@ -7,7 +7,7 @@
 //!
 //! pm 只持委托域的 JobControl（MANAGE|READ|WAIT，经 StartupBlock grants
 //! 交付），域外无任何进程管理 authority；递归收束是本服务组合内核原语
-//! 的用户态政策，init 保留直接收束权作兜底。
+//! 的用户态政策，test_kernel 保留直接收束权作兜底。
 
 #![no_std]
 
@@ -44,7 +44,7 @@ use libprocess::{DEFAULT_SUPERVISION_POLICY, JobCollector};
 use librunnel::blocking;
 
 const STREAM_LEN: usize = 65536;
-/// 与 init 约定的流控验证消息号（见 init 的 WRITABLE_WAKE_* 常量）。
+/// 与 test_kernel 约定的流控验证消息号（见 test_kernel 的 WRITABLE_WAKE_* 常量）。
 const WRITABLE_WAKE_REQUEST: u64 = 640;
 const WRITABLE_WAKE_FILL: u64 = 641;
 const WRITABLE_WAKE_TAIL: u64 = 642;
@@ -660,7 +660,7 @@ impl Task<PmWorld> for FlowTask {
             Ok(()) => {
                 debug!("writable wake passed");
                 // 流控完成后进入委托域收束：保持原脚本顺序，避免与
-                // init 装载域成员并发（域封口过早会拒绝后续 spawn）。
+                // test_kernel 装载域成员并发（域封口过早会拒绝后续 spawn）。
                 if let Err(task) = requests.spawn(libexecution::TaskSubmission::new(
                     PmTask::Domain(DomainTask::new(DEFAULT_SUPERVISION_POLICY)),
                     2,
@@ -722,7 +722,7 @@ impl Task<PmWorld> for FlowTask {
     }
 }
 
-/// 委托域仅用正式 Job 机器收束；pm 的异常升级由进程退出交 init 监督。
+/// 委托域仅用正式 Job 机器收束；pm 的异常升级由进程退出交 test_kernel 监督。
 struct DomainTask {
     policy: libprocess::SupervisionPolicy,
     driver: Option<JobDriver>,
@@ -885,7 +885,7 @@ fn main() {
         .take(0)
         .map(libkernel::ipc::capability::Capability::into_raw)
         .expect("pm: mailbox owner grant is missing");
-    // StartupBlock Handle[1] = init 授出的 pm_domain JobControl。
+    // StartupBlock Handle[1] = test_kernel 授出的 pm_domain JobControl。
     let domain = grants
         .take(1)
         .map(libkernel::ipc::capability::Capability::into_raw)

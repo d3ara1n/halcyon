@@ -226,7 +226,7 @@ Line 内嵌 WaitQueue，其电平、订阅链与 Service 同受 PLIC 锁保护�
 
 [`libkernel::irq`](../../user/libraries/libkernel/src/irq.rs) 提供 typed control/use。Query 的 use generation 固定，Take 只经 a1 返回 sequence，封装组合为 IrqToken；不在消费后向用户缓冲写结果。Ack 通过寄存器交完整 token。READ 用于 Query，Take 要求 READ|WRITE，Ack 要求 WRITE，WAIT 观察，CREATE 派生，MANAGE 停止。内核 IRQ 停止不证明设备或 DMA 静止，驱动的协作停止仍由设备协议负责。
 
-[`irq_checks`](../../user/services/srv_init/src/irq_checks.rs)的显式退出消费者把真实use的READ|WAIT别名与就绪信号交给原test_target；直接变体等待Line，集合变体挂一个真实Line成员后在持续观察作用域中持有WaitSet，以Receive复检候选，空提示后等待再复检。注册产生的初始候选不等同真实Line就绪；本消费者不预期硬件事件，非空记录、意外集合状态及API错误均失败。父方保留use母本，按原ProcessKill/终因/DONE关闭唯一Control，等目标实际Pool全部归还后才再Query原use、显式Revoke并等来源DONE；不以目标CPU完成或最后use Close代替观察loan的退休。就绪信号只交接阶段：直接变体另核实际Waiting/Line来源，集合变体另核真实子cap所持Set与Line成员，宿主恰好Waiting时再核两层来源；不新增产品线程查询接口。
+[`irq_checks`](../../user/tests/test_kernel/src/irq_checks.rs)的显式退出消费者把真实use的READ|WAIT别名与就绪信号交给原test_target；直接变体等待Line，集合变体挂一个真实Line成员后在持续观察作用域中持有WaitSet，以Receive复检候选，空提示后等待再复检。注册产生的初始候选不等同真实Line就绪；本消费者不预期硬件事件，非空记录、意外集合状态及API错误均失败。父方保留use母本，按原ProcessKill/终因/DONE关闭唯一Control，等目标实际Pool全部归还后才再Query原use、显式Revoke并等来源DONE；不以目标CPU完成或最后use Close代替观察loan的退休。就绪信号只交接阶段：直接变体另核实际Waiting/Line来源，集合变体另核真实子cap所持Set与Line成员，宿主恰好Waiting时再核两层来源；不新增产品线程查询接口。
 
 ## DMA 稳定 pin 与地址交付
 
@@ -248,7 +248,7 @@ Retire 接受创建该 mapping 的原 DmaUse 或同根真实上级 control 的 M
 
 Retire 先封新 reader，既有 Exposure 退出后原 mapping Work 才释放。取消时把未完成 acquisition 收束成实际前缀；退休时按 coherent 平台合同排序，再归还原 MemoryObject 写许可、逐段推进 BackingRelease。全部实物责任归还后同门移除成员/回执、摘稳定保留条目，最后发布 DONE。独立 CPU/DMA use 可继续保有同页，不要求整份 backing 归零；观察壳仍按自身存储寿命付款。
 
-[`dma_checks`](../../user/services/srv_init/src/dma_checks.rs)与[`test_target`](../../user/tests/test_target/src/main.rs)的显式竞争消费者复用上述Pin/Seal/Read/Retire/退出路径。子进程只读View为同一Backing保留第一页切界，Pin可取得非空未完成前缀；读取变体用原线程库的第二线程持真实Exposure，主线程Retire后沿原Query/许可/DONE观察再交接读取完成。地址只被测试读取，不交硬件。各目标使用独立Pool，父方继续拥有原MemoryObject；CPU完成后仍存在的原Control/Backing切界存储按真实寿命付款，父对象及相关能力关闭后才要求子账归零。
+[`dma_checks`](../../user/tests/test_kernel/src/dma_checks.rs)与[`test_target`](../../user/tests/test_target/src/main.rs)的显式竞争消费者复用上述Pin/Seal/Read/Retire/退出路径。子进程只读View为同一Backing保留第一页切界，Pin可取得非空未完成前缀；读取变体用原线程库的第二线程持真实Exposure，主线程Retire后沿原Query/许可/DONE观察再交接读取完成。地址只被测试读取，不交硬件。各目标使用独立Pool，父方继续拥有原MemoryObject；CPU完成后仍存在的原Control/Backing切界存储按真实寿命付款，父对象及相关能力关闭后才要求子账归零。
 
 共享变体对同一MemoryObject取得两份独立mapping，核完整SG相同后逐份Retire、等待DONE并关闭角色；原Notification只交接有限观察阶段。第一份完成时第二份仍持地址与写许可，父MemoryObject的root use继续持物理页。父/子Pool分别观察RAM来源和新增mapping/切界元数据，最后原父对象关闭才释放其实际物理份额。额度变体仅把目标实际付款Pool的READ观察角色交给目标；目标持真实Notification角色制造Quota，再释放压力沿同一DmaUse重新Pin/取消。原成员/write及最终账务仍由同一资源机制决定，不以测试余额替代安全状态，不新增资金或资源账本。
 

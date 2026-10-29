@@ -180,9 +180,9 @@ pub(super) fn process_retirement(
         object::duplicate(root, full).map_err(|_| "MMIO retirement root duplicate failed")?;
     // SAFETY: 已核验 root 的新副本，由本作用域唯一关闭。
     let root = unsafe { MmioControl::from_handle(handle) };
-    let modes: &[&str] = if cfg!(feature = "acceptance-mmio-forced") {
+    let modes: &[&str] = if crate::mode().has(crate::Mode::MMIO_FORCED) {
         &["mmio-forced-queued", "mmio-forced-publishing"]
-    } else if cfg!(feature = "acceptance-mmio-publication") {
+    } else if crate::mode().has(crate::Mode::MMIO_PUBLICATION) {
         &["mmio-close", "mmio-live", "mmio-before", "mmio-after"]
     } else {
         &["mmio-close", "mmio-live"]
@@ -194,7 +194,7 @@ pub(super) fn process_retirement(
         let pool = if publication || forced {
             Some(
                 libkernel::memory_pool::derive(
-                    super::root_memory_pool(),
+                    super::memory_pool(),
                     libdriver::boot::WORKER_POOL,
                     Rights::READ | Rights::CREATE,
                 )
@@ -240,8 +240,8 @@ pub(super) fn process_retirement(
         let launched = spawn(SpawnRequest {
             memory_pool: pool
                 .as_ref()
-                .map_or(super::root_memory_pool(), |pool| pool.as_handle()),
-            parent: super::init_process_info(),
+                .map_or(super::memory_pool(), |pool| pool.as_handle()),
+            parent: super::current_process(),
             job,
             image,
             payload: mode.as_bytes(),

@@ -126,7 +126,7 @@ def response_snapshot(frame, pc):
 '''
 
 
-def start(kernel, port, target_file):
+def start(kernel, port, target_file, controller_pid):
     header = kernel.read_bytes()[:20]
     if header[4:6] != b"\x02\x01" or int.from_bytes(header[18:20], "little") != 243:
         raise RuntimeError("response diagnostics require the actual little-endian RV64 ELF")
@@ -226,6 +226,7 @@ def start(kernel, port, target_file):
     evidence = logs / "evidence.json"
     evidence.write_text(json.dumps({
         "kernel_sha256": hashlib.sha256(kernel.read_bytes()).hexdigest(),
+        "controller_pid": controller_pid,
         "boot_package_sha256": hashlib.sha256(Path(os.environ["ERHINO_BOOT_PACKAGE"]).read_bytes()).hexdigest(),
         "scope": "real two Map/Revoke/Kill; no product state/result/PC/clock writes; no timing claim",
         "code": {"queued":hex(queued), "publishing":hex(post), "advance_call":hex(call),
@@ -437,7 +438,7 @@ try:
             original=caller('kernel::resource::mmio::object::revoke')
             if original is None or not TARGET.exists():continue
             thread=int(original.read_var('thread'))
-            if pid(thread,'Revoke.thread',describe_frame(original))!=1:continue
+            if pid(thread,'Revoke.thread',describe_frame(original))!={controller_pid}:continue
             target=json.loads(TARGET.read_text())
             if target['mode'] in [r['mode'] for r in facts['windows']]:continue
             native_frame=thread+thread_offsets['frame']
@@ -475,7 +476,7 @@ try:
             shell=arc(frame.read_var('self'))
             if int(shell['pid'])!=record['pid']:continue
             thread=int(original.read_var('caller'))
-            require(pid(thread,'Kill.caller',describe_frame(original))==1,'Kill is not from the original init consumer')
+            require(pid(thread,'Kill.caller',describe_frame(original))=={controller_pid},'Kill is not from the original kernel acceptance consumer')
             require(record.get('revoke_returned'),'parent Kill preceded the observed Revoke success')
             parent=gdb.selected_thread();parent_held=True
             record['kill_frame']=thread+thread_offsets['frame']

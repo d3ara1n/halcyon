@@ -168,7 +168,6 @@ pub(super) fn run(root: Handle) -> Result<(), &'static str> {
     Ok(())
 }
 
-#[cfg(feature = "acceptance-irq-exit")]
 pub(super) fn process_retirement(
     root: Handle,
     job: Handle,
@@ -194,7 +193,7 @@ pub(super) fn process_retirement(
         // 整个消费者的防挂死预算，不作为IRQ完成或性能期限。
         let end = time::timeout_millis(60_000).map_err(|_| "IRQ exit deadline failed")?;
         let pool: MemoryPool = memory_pool::derive(
-            super::root_memory_pool(),
+            super::memory_pool(),
             libdriver::boot::WORKER_POOL,
             Rights::READ | Rights::CREATE,
         )
@@ -234,7 +233,7 @@ pub(super) fn process_retirement(
                 .map_err(|_| "IRQ exit readiness admission failed")?;
         let result = spawn(SpawnRequest {
             job,
-            parent: super::init_process_info(),
+            parent: super::current_process(),
             memory_pool: pool.as_handle(),
             image,
             payload: mode,

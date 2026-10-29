@@ -141,33 +141,6 @@ struct ReadDuty {
     complete: bool,
 }
 
-struct Cleanup<T> {
-    owner: Option<T>,
-    disposition: Disposition,
-}
-impl<T> Cleanup<T> {
-    fn empty() -> Self {
-        Self {
-            owner: None,
-            disposition: Disposition::default(),
-        }
-    }
-    fn step(&mut self, now: u64, close: impl FnOnce(T) -> Result<(), (T, SystemCallError)>) {
-        if !self.disposition.ready(now) {
-            return;
-        }
-        if let Some(owner) = self.owner.take()
-            && let Err((owner, error)) = close(owner)
-        {
-            self.owner = Some(owner);
-            self.disposition.fail(error, now);
-        }
-    }
-    fn runnable(&self) -> bool {
-        self.owner.is_some() && !self.disposition.held && self.disposition.retry.is_none()
-    }
-}
-
 enum RootCapability {
     Plain(Capability),
     Sender(MailboxSender),
@@ -224,6 +197,8 @@ struct CapabilityEntry {
 }
 
 pub(super) struct RootSupervisor {
+    /// init 持有至系统结束的具名 Pool；承载寿命超出任一实例的计费，从不在收集时关闭。
+    held_pools: Vec<libkernel::memory_pool::MemoryPool>,
     pub(super) drivers: Option<super::driver::Manager>,
     pub(super) devices: Option<super::device::Manager>,
     pub(super) instances: Option<super::supervision::Supervisor>,
@@ -233,9 +208,6 @@ pub(super) struct RootSupervisor {
     caller: Option<librpc::Caller>,
     capabilities: Vec<CapabilityEntry>,
     capability_cursor: usize,
-    endpoint_cleanup: Cleanup<librunnel::MappedEndpoint>,
-    endpoint_create_cleanup: Cleanup<libkernel::ipc::tunnel::Endpoint>,
-    capability_cleanup: Cleanup<Capability>,
     services: Option<Handle>,
     jobs: [Option<JobDuty>; ROOT_JOB_SLOTS],
     batches: [Option<BatchDuty>; 2],
@@ -370,6 +342,7 @@ impl RootSupervisor {
         })?;
         let waiting = waiting::WaitDuty::new(&assembly)?;
         Ok(Self {
+            held_pools: Vec::new(),
             drivers: None,
             devices: None,
             instances: None,
@@ -379,9 +352,6 @@ impl RootSupervisor {
             caller: Some(librpc::Caller::new()),
             capabilities: Vec::new(),
             capability_cursor: 0,
-            endpoint_cleanup: Cleanup::empty(),
-            endpoint_create_cleanup: Cleanup::empty(),
-            capability_cleanup: Cleanup::empty(),
             services: None,
             jobs: [None, None],
             batches: [None, None],
@@ -840,40 +810,6 @@ impl RootSupervisor {
         Ok(())
     }
 
-    pub(super) fn retain_capability(&mut self, capability: Capability) {
-        assert!(
-            self.capability_cleanup.owner.is_none(),
-            "stream setup has one in-flight capability"
-        );
-        self.capability_cleanup.owner = Some(capability);
-    }
-    pub(super) fn retain_transport(
-        &mut self,
-        endpoint: librunnel::MappedEndpoint,
-        invitation: libkernel::ipc::invitation::Invitation,
-    ) {
-        assert!(
-            self.endpoint_cleanup.owner.is_none(),
-            "stream setup has one endpoint"
-        );
-        self.endpoint_cleanup.owner = Some(endpoint);
-        self.retain_capability(invitation.into_capability());
-    }
-    pub(super) fn retain_failed_create(
-        &mut self,
-        endpoint: Option<libkernel::ipc::tunnel::Endpoint>,
-        invitation: Option<libkernel::ipc::invitation::Invitation>,
-    ) {
-        assert!(
-            self.endpoint_cleanup.owner.is_none() && self.endpoint_create_cleanup.owner.is_none(),
-            "stream setup has one endpoint"
-        );
-        self.endpoint_create_cleanup.owner = endpoint;
-        if let Some(invitation) = invitation {
-            self.retain_capability(invitation.into_capability());
-        }
-    }
-
     fn begin_batch(&mut self, incoming: Vec<Supervised>, one: Option<Supervised>) -> usize {
         let index = self
             .batches
@@ -944,10 +880,6 @@ impl RootSupervisor {
             }
         }
     }
-    pub(super) fn collect_targets(&mut self, targets: Vec<Supervised>) -> Result<(), &'static str> {
-        let index = self.begin_batch(targets, None);
-        self.await_batch(index)
-    }
     pub(super) fn root_stop_budget() -> Result<u64, &'static str> {
         DEFAULT_SUPERVISION_POLICY
             .wait_timeout_ms
@@ -976,6 +908,21 @@ impl RootSupervisor {
         let incoming = core::mem::take(&mut self.processes);
         let index = self.begin_batch(incoming, None);
         self.await_batch(index)
+    }
+    /// 从根 Pool 派生一个 init 持有至系统结束的 Pool，返回其 handle 供签发别名。
+    pub(super) fn hold_pool(
+        &mut self,
+        budget: libkernel::shared::memory_pool::MemoryPoolBudget,
+        rights: Rights,
+    ) -> Result<Handle, &'static str> {
+        self.held_pools
+            .try_reserve(1)
+            .map_err(|_| "held Pool record storage failed")?;
+        let pool = libkernel::memory_pool::derive(super::root_memory_pool(), budget, rights)
+            .map_err(|_| "held Pool admission failed")?;
+        let handle = pool.as_handle();
+        self.held_pools.push(pool);
+        Ok(handle)
     }
     pub(super) fn collect_process(&mut self, pid: u64) -> Result<(), &'static str> {
         let index = self
@@ -1147,33 +1094,6 @@ impl RootSupervisor {
         Ok(())
     }
 
-    /// 先进入根槽，再尝试建立执行存储；任何失败仍由根持有 tunnel 与 buffer。
-    pub(super) fn start_read(&mut self, tunnel: blocking::Consumer, buffer: Vec<u8>) {
-        assert!(self.read.is_none(), "read duty must not be overwritten");
-        self.read = Some(ReadDuty {
-            funding: None,
-            pending: alloc::vec![InitTask::StreamRead(StreamReadTask {
-                source: None,
-                arm_failed: None,
-                stopping: false,
-                removing: false,
-            })],
-            client_count: 1,
-            client_sources: 2,
-            rpc_sources: 0,
-            runtime: None,
-            world: ReadWorld {
-                tunnel: Some(tunnel),
-                buffer,
-                filled: 0,
-                failed: false,
-                ..ReadWorld::default()
-            },
-            disposition: Disposition::default(),
-            error: None,
-            complete: false,
-        });
-    }
     fn start_client(
         &mut self,
         pending: InitTask,
@@ -1524,14 +1444,6 @@ impl RootSupervisor {
     }
     pub(super) fn close_read(&mut self) -> Result<(), &'static str> {
         let duty = self.read.as_mut().expect("read duty remains owned");
-        if let Some(tunnel) = duty.world.tunnel.take()
-            && let Err((tunnel, error)) = tunnel.close()
-        {
-            duty.world.tunnel = Some(tunnel);
-            duty.error = Some(SystemCallError::InternalError);
-            debug!("root stream close failed: {:?}", error);
-            return Err("stream close failed");
-        }
         close_runtime(&mut duty.runtime).map_err(|_| "stream runtime close failed")?;
         self.read = None;
         Ok(())
@@ -1709,13 +1621,6 @@ impl RootSupervisor {
             duty.complete = true;
             return Ok(());
         }
-        if duty.world.rpc.is_none() && duty.world.buffer.is_empty() && !stopping {
-            duty.world
-                .buffer
-                .try_reserve_exact(STREAM_LEN + 1)
-                .map_err(|_| SystemCallError::OutOfMemory)?;
-            duty.world.buffer.resize(STREAM_LEN + 1, 0);
-        }
         if duty.world.client_tasks.capacity() < duty.client_count {
             duty.world
                 .client_tasks
@@ -1871,11 +1776,6 @@ impl RootSupervisor {
                 }
             }
         }
-        self.endpoint_cleanup
-            .step(now, librunnel::MappedEndpoint::close);
-        self.endpoint_create_cleanup
-            .step(now, libkernel::ipc::tunnel::Endpoint::close);
-        self.capability_cleanup.step(now, Capability::close);
         if !self.capabilities.is_empty() {
             let index = self.capability_cursor % self.capabilities.len();
             self.capability_cursor = (index + 1) % self.capabilities.len();
@@ -1917,10 +1817,7 @@ impl RootSupervisor {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        let mut runnable = waiting_runnable
-            || self.endpoint_cleanup.runnable()
-            || self.endpoint_create_cleanup.runnable()
-            || self.capability_cleanup.runnable();
+        let mut runnable = waiting_runnable;
         if let Some(managers) = &self.instances {
             match managers.state() {
                 DriveState::Runnable => runnable = true,
@@ -1931,16 +1828,6 @@ impl RootSupervisor {
                 }
                 DriveState::Drained => {}
             }
-        }
-        for at in [
-            self.endpoint_cleanup.disposition.retry,
-            self.endpoint_create_cleanup.disposition.retry,
-            self.capability_cleanup.disposition.retry,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            deadline = Some(deadline.map_or(at, |old: u64| old.min(at)));
         }
         for entry in &self.capabilities {
             if !entry.closing || entry.owner.is_none() {

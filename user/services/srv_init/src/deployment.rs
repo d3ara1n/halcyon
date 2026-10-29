@@ -2,16 +2,22 @@
 use super::*;
 use supervision::Instance;
 
+/// 本部署声明的基础实例；停止与监督容量都以该集合为唯一真值。
+/// memory 部署只运行内核验收 task，不启动基础宿主。
 pub(super) fn instances() -> &'static [Instance] {
-    if cfg!(feature = "system") {
-        &[Instance::Device, Instance::Driver, Instance::Filesystem]
+    const SYSTEM: &[Instance] = &[Instance::Device, Instance::Driver, Instance::Filesystem];
+    const ACCEPTANCE: &[Instance] = &[
+        Instance::Device,
+        Instance::Driver,
+        Instance::Filesystem,
+        Instance::Secondary,
+    ];
+    if cfg!(feature = "acceptance-memory") {
+        &[]
+    } else if cfg!(feature = "system") {
+        SYSTEM
     } else {
-        &[
-            Instance::Device,
-            Instance::Driver,
-            Instance::Filesystem,
-            Instance::Secondary,
-        ]
+        ACCEPTANCE
     }
 }
 pub(super) fn file_hosts() -> usize {
@@ -183,11 +189,24 @@ impl RootSupervisor {
         self.stop.as_mut().expect("stop intent remains owned").phase = StopPhase::Files;
         self.stop_filesystems()?;
         self.stop.as_mut().expect("stop intent remains owned").phase = StopPhase::Devices;
-        self.stop_drivers()?;
-        self.stop_devices()?;
+        self.stop_providers()?;
         self.stop.as_mut().expect("stop intent remains owned").phase = StopPhase::Root;
         debug!("SYSTEM providers stopped: file completion and device safety retained separately");
         Ok(StopPhase::Root)
+    }
+    /// 按声明集合停止设备侧提供者：驱动先于设备，声明了但缺记录即报原错误。
+    /// 实例监督运行体只要建立过就在提供者停止后退休；从未建立的部署不进入退休。
+    fn stop_providers(&mut self) -> Result<(), &'static str> {
+        if instances().contains(&Instance::Driver) {
+            self.stop_drivers()?;
+        }
+        if instances().contains(&Instance::Device) {
+            self.stop_devices()?;
+        }
+        if self.instances.is_some() {
+            self.finish_supervision()?;
+        }
+        Ok(())
     }
     pub(super) fn finish_stop(&mut self, services: Handle) -> Result<(), &'static str> {
         if self.stop.is_none() {

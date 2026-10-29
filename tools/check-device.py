@@ -625,9 +625,10 @@ def main():
                     raw, pending = pending.split(b"\n", 1)
                     line = raw.decode("utf-8", errors="replace")
                     print(line, flush=True)
+                    prepared_kernel = re.search(r"kernel acceptance prepared before Start: pid=(\d+)", line)
                     if args.irq_exit:
-                        if "instance observer admitted before Start: role=Device," in line:
-                            irq_exit_debugger = irq_exit_probe.start(kernel, gdb_port, irq_exit_target)
+                        if prepared_kernel:
+                            irq_exit_debugger = irq_exit_probe.start(kernel, gdb_port, irq_exit_target, int(prepared_kernel[1]))
                         admitted = re.search(r"IRQ exit target admitted: mode=(\S+), pid=(\d+), source=(\d+), generation=(\d+)", line)
                         if admitted:
                             mode, pid, source, generation = admitted.groups()
@@ -653,8 +654,8 @@ def main():
                             stage = 41
                         continue
                     if args.dma_races or args.dma_shared or args.dma_quota or args.dma_install_failure:
-                        if (args.dma_races or args.dma_install_failure) and "instance observer admitted before Start: role=Device," in line:
-                            dma_debugger = (dma_install_probe if args.dma_install_failure else dma_probe).start(kernel, gdb_port, dma_target)
+                        if (args.dma_races or args.dma_install_failure) and prepared_kernel:
+                            dma_debugger = (dma_install_probe if args.dma_install_failure else dma_probe).start(kernel, gdb_port, dma_target, int(prepared_kernel[1]))
                         admitted = re.search(r"DMA race target admitted: mode=(\S+), pid=(\d+), scope=(\d+), memory=(\d+), identity=(\d+)", line)
                         if admitted:
                             mode, pid, scope, memory, identity = admitted.groups()
@@ -709,8 +710,8 @@ def main():
                             stage = 41
                         continue
                     if args.mmio_publication or args.mmio_forced:
-                        if "instance observer admitted before Start: role=Device," in line:
-                            mmio_debugger = (mmio_forced_probe if args.mmio_forced else mmio_probe).start(kernel, gdb_port, mmio_target)
+                        if prepared_kernel:
+                            mmio_debugger = (mmio_forced_probe if args.mmio_forced else mmio_probe).start(kernel, gdb_port, mmio_target, int(prepared_kernel[1]))
                         admitted = re.search(r"MMIO publication target admitted: mode=(mmio-before|mmio-after|mmio-forced-queued|mmio-forced-publishing), pid=(\d+), scope=(\d+)", line)
                         if admitted:
                             mode, pid, scope = admitted.groups()

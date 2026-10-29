@@ -12,11 +12,11 @@ import qemu_gdb as debug
 MODES = {"irq-wait-exit", "irq-set-exit"}
 
 
-def start(kernel, port, target_file):
+def start(kernel, port, target_file, controller_pid):
     logs = debug.fresh_logs(Path("artifacts/irq-exit"))
-    init = Path("artifacts/build/srv_init").resolve()
+    consumer = Path("artifacts/build/test_kernel").resolve()
     symbols = debug.symbols(kernel)
-    entry = debug.symbols(init)["srv_init::irq_checks::process_retirement"]
+    entry = debug.symbols(consumer)["test_kernel::irq_checks::process_retirement"]
     command = ["riscv64-elf-gdb", "-q", "-nx", "--batch", str(kernel)]
     for path, line in (("process.rs", 364), ("resource/irq/object.rs", 220)):
         command += ["-ex", f"info line kernel/src/task/{path}:{line}"] if path == "process.rs" else ["-ex", f"info line kernel/src/{path}:{line}"]
@@ -31,13 +31,14 @@ def start(kernel, port, target_file):
             raise RuntimeError("IRQ exit checkpoint is outside its actual native function")
     evidence = logs / "evidence.json"
     facts = {"kernel_sha256": hashlib.sha256(kernel.read_bytes()).hexdigest(),
-             "init_sha256": hashlib.sha256(init.read_bytes()).hexdigest(),
+             "consumer_sha256": hashlib.sha256(consumer.read_bytes()).hexdigest(),
+             "controller_pid": controller_pid,
              "boot_package_sha256": hashlib.sha256(Path(os.environ["ERHINO_BOOT_PACKAGE"]).read_bytes()).hexdigest(),
              "scope": "original ProcessKill, WaitOne Waiting/source or child-held WaitSet/Line member, retained parent IrqUse and caller Pool; read-only, no timing claim",
              "points": points, "sources": {}, "targets": {}}
     evidence.write_text(json.dumps(facts, indent=2) + "\n")
     script = SCRIPT
-    substitutions = {"KERNEL": json.dumps(str(kernel.resolve())), "INIT": json.dumps(str(init)),
+    substitutions = {"KERNEL": json.dumps(str(kernel.resolve())), "INIT": json.dumps(str(consumer)), "CONTROLLER": str(controller_pid),
                      "PORT": str(port), "TARGET": json.dumps(str(target_file.resolve())),
                      "EVIDENCE": json.dumps(str(evidence.resolve())), "ENTRY": hex(entry),
                      "KILL": hex(points[364]), "QUERY": hex(points[220]),
@@ -232,7 +233,7 @@ class Entry(gdb.Breakpoint):
             current=word(anchor+hart_offsets['current_thread'])
             if not current:return False
             shell=word(current+process_offset+ptr_offset+pointer_offset)
-            if word(shell+data_offset+pid_offset)!=1:return False
+            if word(shell+data_offset+pid_offset)!=__CONTROLLER__:return False
             self.enabled=False
             query.enabled=True
             killing.enabled=True
@@ -245,7 +246,7 @@ class Query(gdb.Breakpoint):
         global failure,complete
         try:
             frame=gdb.newest_frame()
-            if pid(frame.read_var('thread').dereference())!=1:return False
+            if pid(frame.read_var('thread').dereference())!=__CONTROLLER__:return False
             node=arc(frame.read_var('node'))
             line_arc=optional(node['line'])
             if line_arc is None:return False
@@ -278,7 +279,7 @@ class Killing(gdb.Breakpoint):
         global failure
         try:
             frame=gdb.newest_frame()
-            if pid(frame.read_var('caller').dereference())!=1:return False
+            if pid(frame.read_var('caller').dereference())!=__CONTROLLER__:return False
             shell=arc(frame.read_var('shell'))
             target_pid=int(shell['pid'])
             facts['kill_read']={'pid':target_pid,'shell':int(shell.address),'stage':'admission metadata/body'};save()

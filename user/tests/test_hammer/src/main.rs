@@ -1,5 +1,5 @@
 //! hammer：生命周期多核竞态矩阵的执行器与竞态靶（协议见
-//! `libprocess::race`，剧本与断言归 init）。
+//! `libprocess::race`，剧本与断言归 test_kernel）。
 //!
 //! HAMMER 模式是受编排的 syscall 执行器：指令与 handle 经 Mailbox 运行
 //! 投递，等发令枪 READABLE 后立即执行单条指令并回执——窗口密度即本
@@ -130,7 +130,7 @@ fn hammer_mode(startup: &mut libruntime::startup::InitialGrants) {
         await_gun(&gun);
         // 时序变体：aux > 0 时醒后先延迟再打，把窗口让给对侧先行
         // （线协议见 race::Cmd::aux）。延迟失败不判定——窗口密度本就是
-        // 尽力而为，断言全在 init。
+        // 尽力而为，断言全在 test_kernel。
         if cmd.aux != 0 {
             // SAFETY: 值参数；纯延迟，无副作用依赖。
             let _ = unsafe { sys_sleep(cmd.aux) };

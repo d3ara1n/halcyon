@@ -2,14 +2,14 @@
 //
 // 双锤（test_hammer HAMMER 模式）常驻 acceptance 域：指令与 handle 经
 // Mailbox 投递，发令枪（notification READABLE 电平）连发后双锤/靶在
-// 各自 hart 上同刻开打，锤真跨核竞态窗口。剧本与断言全在 init：每轮
+// 各自 hart 上同刻开打，锤真跨核竞态窗口。剧本与断言全在 test_kernel：每轮
 // 以「终因组合合法 + Dead 收束 + 无泄漏」为强断言，终因胜负分布只作
 // 观察报告（证明锤进了窗口，不作通过条件）。
 
 use core::{cell::Cell, sync::atomic::Ordering};
 
 use crate::{
-    JOB_FULL_RIGHTS, RootSupervisor, SUPERVISOR_RIGHTS, Supervised, building::build_spin_building,
+    Harness, JOB_FULL_RIGHTS, SUPERVISOR_RIGHTS, Supervised, building::build_spin_building,
 };
 use libkernel::ipc::message::{create, send_raw, wait_message};
 use libkernel::ipc::object::{close, duplicate};
@@ -101,8 +101,8 @@ impl RaceHammers {
             let payload = race::encode_payload(&[race::MODE_HAMMER]);
             let spawned = spawn(SpawnRequest {
                 job,
-                memory_pool: crate::root_memory_pool(),
-                parent: crate::init_process_info(),
+                memory_pool: crate::memory_pool(),
+                parent: crate::current_process(),
                 image,
                 payload: &payload,
                 grants: &grants,
@@ -130,8 +130,7 @@ impl RaceHammers {
             if moves.len() != 1 {
                 return false;
             }
-            let Ok(pool) = duplicate(crate::root_memory_pool(), Rights::CREATE | Rights::TRANSIT)
-            else {
+            let Ok(pool) = duplicate(crate::memory_pool(), Rights::CREATE | Rights::TRANSIT) else {
                 return false;
             };
             let funding = HandleMove {
@@ -221,7 +220,7 @@ impl RaceHammers {
         self.report(hammer)
     }
 
-    /// 退场指令 + 锤侧自有 handle 由进程退出收束；init 端点随后清理。
+    /// 退场指令 + 锤侧自有 handle 由进程退出收束；test_kernel 端点随后清理。
     fn shutdown(&self) {
         for i in 0..2 {
             let exit = Cmd {
@@ -288,7 +287,7 @@ fn spawn_race_target(
     }];
     let pool_grant = if subrole == race::TARGET_THREAD_SUITE {
         let pool = duplicate(
-            crate::root_memory_pool(),
+            crate::memory_pool(),
             Rights::CREATE | Rights::READ | Rights::GRANT,
         )?;
         grants.push(HandleGrant {
@@ -301,8 +300,8 @@ fn spawn_race_target(
     };
     let spawned = spawn(SpawnRequest {
         job,
-        memory_pool: crate::root_memory_pool(),
-        parent: crate::init_process_info(),
+        memory_pool: crate::memory_pool(),
+        parent: crate::current_process(),
         image,
         payload: &payload,
         grants: &grants,
@@ -355,8 +354,8 @@ fn spawn_tunnel_exit_target(
     ]);
     match spawn(SpawnRequest {
         job,
-        memory_pool: crate::root_memory_pool(),
-        parent: crate::init_process_info(),
+        memory_pool: crate::memory_pool(),
+        parent: crate::current_process(),
         image,
         payload: &payload,
         grants: &grants,
@@ -454,7 +453,7 @@ fn race_kill_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
             }
         };
         let codes = [0x100 + round as i64, 0x200 + round as i64];
-        // control 双 dup，原件留 init 收束断言。
+        // control 双 dup，原件留 test_kernel 收束断言。
         let moves = [
             HandleMove {
                 handle: duplicate(target.control, Rights::MANAGE | Rights::TRANSIT)
@@ -1007,7 +1006,7 @@ fn race_memory_kill(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
 }
 
 /// guard fault 必须只冻结目标进程为 Fault/LoadAccess；其 guarded mapping 由
-/// 自动退休 收束，init 与内核继续运行。
+/// 自动退休 收束，test_kernel 与内核继续运行。
 fn guard_fault_is_process_local(job: Handle, image: &[u8]) -> bool {
     let (target, gun) = match spawn_race_target(job, image, race::TARGET_GUARD_FAULT, 0) {
         Ok(pair) => pair,
@@ -1061,10 +1060,7 @@ fn tunnel_exit_stress(job: Handle, image: &[u8]) -> bool {
     let mut ok = true;
     for round in 0..RACE_TUNNEL_ROUNDS {
         let (endpoint_owner, invitation_owner, bytes) =
-            match libkernel::ipc::invitation::Invitation::create(
-                crate::root_memory_pool(),
-                3 * 4096,
-            ) {
+            match libkernel::ipc::invitation::Invitation::create(crate::memory_pool(), 3 * 4096) {
                 Ok(created) => created,
                 Err(error) => {
                     debug!("Tunnel exit stress create failed: {:?}", error);
@@ -1365,8 +1361,8 @@ fn race_create_enumerate(h: &RaceHammers, job: Handle) -> bool {
 /// seal vs 并发 Create：锤 seal 与锤 Create 同刻。Seal 线性化一次后
 /// 创建口永久关闭——首轮 create 与 seal 竞争（任意结果），后续轮必
 /// ObjectClosed；残留 Building 由 job_kill 收束，child 完成 Dead。
-fn race_seal_create(root: &mut RootSupervisor, h: &RaceHammers, job: Handle) -> bool {
-    let child = match root.create_job(job, crate::root_memory_pool(), JOB_FULL_RIGHTS) {
+fn race_seal_create(harness: &mut Harness, h: &RaceHammers, job: Handle) -> bool {
+    let child = match harness.create_job(job, crate::memory_pool(), JOB_FULL_RIGHTS) {
         Ok(handle) => handle,
         Err(error) => {
             debug!("race seal-vs-create: child job failed: {:?}", error);
@@ -1374,7 +1370,7 @@ fn race_seal_create(root: &mut RootSupervisor, h: &RaceHammers, job: Handle) -> 
         }
     };
     let closed = SystemCallError::ObjectClosed as i64;
-    let seal_control = match root.duplicate(child, Rights::MANAGE | Rights::TRANSIT) {
+    let seal_control = match harness.duplicate(child, Rights::MANAGE | Rights::TRANSIT) {
         Ok(handle) => handle,
         Err(error) => {
             debug!("race seal-vs-create: seal control failed: {:?}", error);
@@ -1387,13 +1383,13 @@ fn race_seal_create(root: &mut RootSupervisor, h: &RaceHammers, job: Handle) -> 
     }];
     let mut ok = h.send_cmd(0, &race_cmd(race::ACTION_SEAL, 0), &seal_moves);
     if ok {
-        root.transferred(seal_control);
+        harness.transferred(seal_control);
     } else {
         return false;
     }
     let mut first_gated: Option<bool> = None;
     for round in 0..4u64 {
-        let job_b = match root.duplicate(child, Rights::CREATE | Rights::TRANSIT) {
+        let job_b = match harness.duplicate(child, Rights::CREATE | Rights::TRANSIT) {
             Ok(handle) => handle,
             Err(error) => {
                 debug!("race seal-vs-create: create control failed: {:?}", error);
@@ -1410,7 +1406,7 @@ fn race_seal_create(root: &mut RootSupervisor, h: &RaceHammers, job: Handle) -> 
             }],
         );
         if sent {
-            root.transferred(job_b);
+            harness.transferred(job_b);
         } else {
             return false;
         }
@@ -1465,7 +1461,7 @@ fn race_seal_create(root: &mut RootSupervisor, h: &RaceHammers, job: Handle) -> 
         }
     }
     let mut close_child = false;
-    match root.collect_job(child) {
+    match harness.collect_job(child) {
         Ok(()) => match process::query_job(child) {
             Ok(snapshot) if snapshot.state == JobState::Dead as u32 => {
                 close_child = true;
@@ -1491,7 +1487,7 @@ fn race_seal_create(root: &mut RootSupervisor, h: &RaceHammers, job: Handle) -> 
             ok = false;
         }
     }
-    if close_child && root.close_control(child).is_err() {
+    if close_child && harness.close_control(child).is_err() {
         return false;
     }
     ok
@@ -1503,8 +1499,8 @@ fn race_drain_drain(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
     for round in 0..2u64 {
         let target = match spawn(SpawnRequest {
             job,
-            memory_pool: crate::root_memory_pool(),
-            parent: crate::init_process_info(),
+            memory_pool: crate::memory_pool(),
+            parent: crate::current_process(),
             image,
             payload: &[],
             grants: &[],
@@ -1587,8 +1583,8 @@ fn race_last_control(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
     for round in 0..2u64 {
         let target = match spawn(SpawnRequest {
             job,
-            memory_pool: crate::root_memory_pool(),
-            parent: crate::init_process_info(),
+            memory_pool: crate::memory_pool(),
+            parent: crate::current_process(),
             image,
             payload: &[],
             grants: &[],
@@ -1630,7 +1626,7 @@ fn race_last_control(h: &RaceHammers, job: Handle, image: &[u8]) -> bool {
 /// 竞态矩阵入口：双锤编队 → 16 场景 → 退场收束 → 汇总。失败场景逐个
 /// 点名，汇总行是全矩阵的 grep 锚点。
 pub(crate) fn race_matrix(
-    root: &mut RootSupervisor,
+    harness: &mut Harness,
     acceptance: Handle,
     target_image: &[u8],
     hammer_image: &[u8],
@@ -1733,7 +1729,7 @@ pub(crate) fn race_matrix(
         ),
         (
             "seal-vs-create",
-            scenario!("seal-vs-create", race_seal_create(root, &h, acceptance)),
+            scenario!("seal-vs-create", race_seal_create(harness, &h, acceptance)),
         ),
         (
             "drain-vs-drain",
@@ -1761,7 +1757,7 @@ pub(crate) fn race_matrix(
             control: h.controls[1],
         },
     ]);
-    let hammer_supervision = root.collect_targets(hammer_targets);
+    let hammer_supervision = harness.collect_targets(hammer_targets);
     let supervision_ok = hammer_supervision.is_ok();
     if !supervision_ok {
         debug!("race matrix acceptance failed: hammer supervision degraded");

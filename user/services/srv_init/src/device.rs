@@ -637,10 +637,7 @@ impl RootSupervisor {
             .take()
             .ok_or("device assembly record missing")?;
         match device.stop(self) {
-            Ok(()) => {
-                self.finish_supervision()?;
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(error) => {
                 self.devices = Some(device);
                 Err(error)

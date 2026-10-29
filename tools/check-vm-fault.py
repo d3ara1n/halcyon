@@ -69,28 +69,54 @@ quit 0
         deadline = time.monotonic() + args.timeout
         process = subprocess.Popen(command + ['-S', '-gdb', f'tcp:127.0.0.1:{port}'],
             stdout=qlog, stderr=subprocess.STDOUT, start_new_session=True)
-        try:
-            completed = subprocess.run(['riscv64-elf-gdb', '-q', '-nx', '--batch', '-x', str(gdb_file)],
-                stdout=glog, stderr=subprocess.STDOUT, timeout=args.timeout)
-            if completed.returncode:
-                raise RuntimeError(f'GDB observer failed with {completed.returncode}: {gdb_log}')
+        debugger = None
+        with qemu_log.open('rb') as guest_stream:
+            pending = b''
+            def check_guest_failure():
+                nonlocal pending
+                pending += guest_stream.read()
+                lines = pending.split(b'\n')
+                pending = lines.pop()
+                for raw in lines:
+                    line = raw.decode('utf-8', errors='replace')
+                    if 'panicking' in line.lower() or 'system reset accepted: action Reboot,' in line:
+                        raise RuntimeError(f'Guest reported failure; stopping this boot: {line}')
+
+            def wait_for(child, stage):
+                while child.poll() is None:
+                    check_guest_failure()
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(f'{stage} exceeded the route deadline: {qemu_log}')
+                    time.sleep(.05)
+                check_guest_failure()
+                return child.returncode
+
             try:
-                # 已取得唯一所需观察就detach，原线程/映射消费者在无断点下收束。
-                status = process.wait(timeout=max(0, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired as error:
-                raise RuntimeError(f'guest did not finish after observer detached: {qemu_log}') from error
-            if status:
-                raise RuntimeError(f'QEMU exited with {status}: {qemu_log}')
-        finally:
-            boot.stop_group(process)
-            # 既有qemu-acceptance wrapper拥有全profile锚点判定；同时保存原始日志。
-            sys.stdout.write(qemu_log.read_text(errors='replace'))
+                debugger = subprocess.Popen(['riscv64-elf-gdb', '-q', '-nx', '--batch', '-x', str(gdb_file)],
+                    stdout=glog, stderr=subprocess.STDOUT, start_new_session=True)
+                gdb_status = wait_for(debugger, 'GDB observer')
+                if gdb_status:
+                    raise RuntimeError(f'GDB observer failed with {gdb_status}: {gdb_log}')
+                # 已取得唯一所需观察就detach，原消费者继续；明确失败时不等待下一轮boot。
+                status = wait_for(process, 'Guest after observer detached')
+                if status:
+                    raise RuntimeError(f'QEMU exited with {status}: {qemu_log}')
+            finally:
+                try:
+                    if debugger is not None:
+                        boot.stop_group(debugger)
+                finally:
+                    try:
+                        boot.stop_group(process)
+                    finally:
+                        # 原wrapper继续拥有完整profile判据，失败也保存第一轮原始输出。
+                        sys.stdout.write(qemu_log.read_text(errors='replace'))
     output, guest = gdb_log.read_text(), qemu_log.read_text(errors='replace')
     if 'VM_FAULT_PASSED' not in output or 'committed mapping access passed: cookie before return=true' not in guest:
         raise RuntimeError(f'publishing window was not exercised: {gdb_log}, {qemu_log}')
     evidence = {
         'kernel_sha256': hashlib.sha256(args.kernel.read_bytes()).hexdigest(),
-        'retry_fault': hex(retry), 'gdb_exit': completed.returncode,
+        'retry_fault': hex(retry), 'gdb_exit': gdb_status,
         'observations': [line for line in output.splitlines() if 'FAULT_WAIT ' in line or 'VM_FAULT_PASSED' in line],
         'scope': 'formal test_hammer/thread suite, release cookie then tail-page read/write before Map returns; no injected exception or kernel test switch',
         'observer': 'detach after first RetryFault; acceptance wrapper checks thread completion, job collection, auxiliary capability cleanup and reset',

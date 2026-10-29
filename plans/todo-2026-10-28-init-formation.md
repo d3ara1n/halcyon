@@ -1,6 +1,6 @@
 # init 组态与统一服务契约
 
-状态：**目标设计已定稿，待实施；尚未修改产品代码**。本篇是本任务唯一工作记录，拥有目标设计、实施顺序、验证门、债务与接力。上游职责边界（init 根监督、`srv_service` 分工）由[服务装配计划](todo-2026-10-07-service-assembly.md#已确认的-init-与服务管理职责)拥有；系统停止政策由[关机编排](todo-2026-09-system-shutdown-orchestration.md)拥有；设备安全事实由[设备计划](todo-2026-09-device-system-design.md)拥有。
+状态：**切面 A（内核级验收移出 init）已完成，提交前整体整理后在冻结点 A-F4 全部路线重跑通过；retry-race 为既有观察器缺陷，已移交设备计划，不计通过；切面 B 未开始**。证据与最终表见[当前接力](#当前接力)。本篇是本任务唯一工作记录，拥有目标设计、实施顺序、验证门、债务与接力。上游职责边界（init 根监督、`srv_service` 分工）由[服务装配计划](todo-2026-10-07-service-assembly.md#已确认的-init-与服务管理职责)拥有；系统停止政策由[关机编排](todo-2026-09-system-shutdown-orchestration.md)拥有；设备安全事实由[设备计划](todo-2026-09-device-system-design.md)拥有。
 
 ## 目标与非目标
 
@@ -68,7 +68,7 @@
 | 生命周期输入 | `instance.report`（mailbox_sender，write\|wait\|transit）、`instance.stop`（notification_owner，read\|wait） |
 | 报告消息 | `Export`、`Ready`、`Stopped` |
 | 撤销协议 | `Revoke`、`QueryRevoked` → `Open` \| `Revoking` \| `Closed` |
-| init 内建来源 | `init/platform.description`、`init/platform.root`（列表）、`init/image.<组件名>`（只读 MemoryObject）、`init/job.services`、`init/job.<名>`（组态 `[job.<名>]` 声明） |
+| init 内建来源 | `init/platform.description`、`init/platform.root`（列表）、`init/image.<组件名>`（只读 MemoryObject）、`init/job.services`、`init/job.<名>`（组态 `[job.<名>]` 声明）、`init/pool.<名>`（组态 `[pool.<名>]` 声明，CREATE 别名） |
 | 自身来源 | `self/memory.pool`（本实例 Pool 的 CREATE 别名） |
 | 全局结束动作 | `finish = "stay" \| "shutdown" \| "reboot"` |
 
@@ -172,6 +172,7 @@ srv_init 约 17.3k 行，直接依赖 `srv_fs`、`test_fs`、`libdevice`、`libd
 | driver Stop op1 | 除 init 外，`test_device` 只把它发给 observer 端作为权限负探针 | `test_device/src/drivers.rs:62` |
 | 平台描述 | 格式属于 `erhino_shared::platform`：头含 `resource_count`，资源记录含 kind、DT 节点偏移与初始槽号；不含 ECAM 标志。ECAM 识别需要 libpci 解析 DTB | `erhino_shared/src/platform.rs`、`libpci/src/platform.rs:250` |
 | worker Job | manager Job 与 worker Job 是 `services` 下的兄弟；manager 死亡不封、不杀 worker。系统终局封 `services` 并由 JobCollector 有界收集全部后代 | `srv_init/src/driver.rs:285`、`supervision.rs:125` |
+| Pool 委托寿命 | 派生 Pool 的整份委托只在其全部计费退休后才回到父 Pool。`MemoryObject::create`、`DmaDomainControl::create_control/create_use` 隐式向调用进程绑定的 Pool 计费，无显式付款参数。故意跨 reset 保留的 DMA 映射会使创建者所在 Pool 的整份委托一直保活 | `libkernel/src/memory_object.rs:37`、`os/kernel/src/resource/dma/object.rs:195,304`；切面 A 开发 core 日志 `artifacts/failed-acceptance-20261029-082357-44659.log` |
 
 ## 分层与知识归属
 
@@ -227,6 +228,7 @@ srv_init 约 17.3k 行，直接依赖 `srv_fs`、`test_fs`、`libdevice`、`libd
 |---|---|---|
 | 顶层 | `finish` | 全部 task 正常完成后的动作 |
 | `[job.<名>]` | `parent`、`pool` | 父 Job（`services` 或另一具名 job）；付款 Pool 所属实例 |
+| `[pool.<名>]` | `work_pages`、`metadata_bytes` | init 从根 Pool 派生并持有至系统结束的具名 Pool，不随任何实例收集而关闭；用于寿命超出单个实例的计费（如故意跨 reset 保留的计费）。额度取其承载进程的部署工作集：能从公共契约推导的按推导，否则沿用项目已有的单进程部署工作集常量并在债务登记，不另拟数值 |
 | `[instance.<名>]` | `image` | initfs 内 `image/<组件名>` 的组件名 |
 | | `kind` | `resident` 或 `task` |
 | | `job` | 可选，具名 job；缺省时 init 在 `services` 下为该实例新建 Job |
@@ -265,6 +267,7 @@ srv_init 约 17.3k 行，直接依赖 `srv_fs`、`test_fs`、`libdevice`、`libd
 ## 验收迁移
 
 - 内核级检查（IPC、内存映射、时间、Job/Pool、tunnel、Once、race、MMIO/IRQ/DMA 根、Building/Job 管理）移入新 task `test_kernel`，接收派生 Pool/Job、所需映像与平台根别名，由它启动 `test_target`、`test_hammer` 与 `srv_pm`。断言 sender PID 等于 `init_pid` 的检查改为对照自身 pid。平台根别名只出现在验收组态，用 `after` 保证与 srv_device 使用串行。
+- 寿命到 reset 的计费不得进入可回收 Pool。`test_kernel` 另收输入 `memory.pool.retention`（路由自 `init/pool.retention`）。DMA `process_retirement` 中故意跨 reset 保留的模式（exposed、output-fault）由 `test_kernel` 以保留模式自启动的子进程执行：子进程出生时绑定 retention Pool，原 fixture 的 scope/use/MemoryObject 创建、目标启动与核验整体在子进程内运行，判据不变。验收断言：该子进程收集后，`test_kernel` 主 Pool 在其自身收集后双维归零；retention Pool 的残留恰为被保留映射的计费。其余 fixture 若存在跨收集保留的计费，按同一规则归入保留域。
 - 服务级检查由已有 `test_device`、`test_fs` 承接：device/driver 自检（权限拒绝、Watch、枚举、OAL）移入 `test_device`；fs/registry/copy/secondary 生命周期移入 `test_fs`，secondary 由 `test_fs` 用 `libservice::instance` launcher 启动。正式装配路径不再包含探针。
 - 留在 init 的是自身不变量：startup capture、idle ownership、dispatcher funding、终局与 reset。reset 负路径检查删除：attenuated rights 拒绝属于内核契约，由 `test_kernel` 持衰减别名验证。
 - 删除全部 init feature；Justfile 由 `FORMATION` 选择 `user/formations/<部署名>.toml`，initfs 映像集合由该组态引用的 `image` 与 `init/image.*` 决定，不再手列。
@@ -273,7 +276,7 @@ srv_init 约 17.3k 行，直接依赖 `srv_fs`、`test_fs`、`libdevice`、`libd
 
 ### 切面 A：内核级验收移出（独立先行）
 
-1. 新建 `test_kernel`，搬入内核级检查及其辅助（`once_checks`、`time_checks`、`public_ipc`、`mmio/irq/dma_checks`、`race`、`building` 与 `main.rs` 中对应函数）。
+1. 新建 `test_kernel`，搬入内核级检查：按领域分为 `ipc_checks`、`ipc_thread_checks`、`memory_checks`、`job_checks`、`tunnel_checks`、`rpc_checks`、`time_checks`、`once_checks`、`race_checks` 与 MMIO/IRQ/DMA 资源检查，测试本地 owner 为 `harness`，出生采用与保留模式子进程在 `startup`。
 2. 现有 init 以现有 spawn 启动 `test_kernel`，按 feature 传模式字节。
 3. 验证：`just check`、`just clippy`，现有 core/stress/memory/device 路线结果与切面前一致。
 
@@ -310,7 +313,8 @@ srv_init 约 17.3k 行，直接依赖 `srv_fs`、`test_fs`、`libdevice`、`libd
 
 | 项 | 现状 | 目标 | 触发与删除条件 |
 |---|---|---|---|
-| `test_kernel` 按 feature 传模式 | 切面 A 后 init 仍按 feature 编码模式字节 | 模式写在验收组态的 `settings` | 切面 B 步骤 6 接通时删除 init 侧编码与对应 feature |
+| `test_kernel` 按 feature 传模式 | 切面 A 使用 `test_kernel::birth` 私有出生帧：56 字节，依次为小端 u32 部署模式位、u8 进程角色（主验收进程或两种保留模式子进程，与部署模式不共用位空间）、12 个输入槽号（主 Pool/Job/reset/pm/target/hammer/MMIO/IRQ/DMA/retention Pool/self 映像/私有报告 sender，255 表示缺省）、保留零字节与 pm/target/hammer/self 四个小端 u64 映像长度；`test_kernel::report` 拥有 104 字节 held Pool 快照报告。能力实际种类/权限在采用时核验。init 按 feature 编码模式；`srv_init` 因共享 birth/report 格式而在 Cargo 中反向依赖测试 crate `test_kernel`。retention Pool 是 RootSupervisor 通用 held Pool 集合的一员，以 `memory.pool.retention` 签发给 test_kernel | 输入改用 `libprocess::birth`，模式写在验收组态的 `settings`，系统服务不再依赖测试 crate；held Pool 集合由组态 `[pool.<名>]` 声明 | 切面 B 步骤 6 接通时删除私有帧、init 侧编码、对应 feature 及 `srv_init → test_kernel` Cargo 依赖 |
+| 单进程工作集无公共推导 | retention Pool 与 `test_kernel` 主 Pool 的额度沿用 `libdriver::boot::WORKER_POOL`（每进程一份）这一已有部署工作集，未从页表预取峰值、VM planner 缓冲、堆碎片等内部布局闭合精确上界；`test_kernel` 因此依赖 libdriver 的该常量。WORKER_POOL 描述普通进程，不含按线程数扩展的成本：memory 部署的 raw thread storm（`PROCESS_MAX_THREADS` 个线程成员并存，要求 ReachLimit 先于 Quota）改用 stress 的 5 份组合，依据是 memory 在 storm 期间的同时存活集合是 stress 的子集，而 stress 在 5 份下已通过同一 storm；这是组合证据，不是逐线程成本推导 | 内存领域提供单进程工作集的公共推导，含每线程成员的 metadata 与栈成本；fs/device/driver/test_kernel 的同类常量收敛为一个真值 | 触发：出现须精确核定单进程工作集的需求（不可信创建域、紧凑部署或额度不足的实证）。由[内存重构](todo-2026-10-01-memory-redesign.md)或[内核内存预算](todo-2026-09-14-kernel-memory-budget.md)承接；接通后删除对 WORKER_POOL 的借用与 memory 借用 stress 组合 |
 
 ## 完成门
 
@@ -324,4 +328,106 @@ srv_init 约 17.3k 行，直接依赖 `srv_fs`、`test_fs`、`libdevice`、`libd
 
 ## 当前接力
 
-设计已定稿，尚未开始施工。实施者从切面 A 开始；进入切面 B 前通读本篇与[服务装配计划](todo-2026-10-07-service-assembly.md)的常驻基座设计，理解现有 Start 前监督、Running 门、DONE 判定与终局责任链，这些机制保留，只把领域特化换成通用契约。施工中发现本篇前提不成立时，先在本篇记录并修订设计，再继续。
+切面 A（内核级验收移出 init）已完成并经提交前整体整理，在冻结点 A-F4 全部路线重跑，结果见[最终验证](#a-f4-最终验证)；切面 B 未开始，从[切面 B](#切面-b统一契约与组态一次耦合迁移) 接手。retry-race 为既有观察器缺陷，已[移交设备计划](todo-2026-09-device-system-design.md#retry-观察器缺陷2026-10-29)，不计通过。
+
+### 接线与责任
+
+- **init 侧**：`AcceptanceImages` 在任何子进程出生前一次核完验收归档（缺失或重复即拒绝）。[`kernel_acceptance`](../user/services/srv_init/src/kernel_acceptance.rs) 的 `KernelAcceptance::run` 用原 Preparation/spawn 与 root 账本启动 `test_kernel`，并由 init 原短任务路径启动 `test_fp`；两者均须 Dead/Completed/NONE。`finish` 以二者为输入执行 RootSupervisor 失败隔离自检（原 QuotaExceeded 首因、恰好一个健康成员、InvalidPolicy 后同一 Collector 恢复及隔离 Job 收集判据不变），再核主 Pool 页与 metadata 的 allocated/reserved/delegated 全零并关闭，核 held Pool 自报告后逐字不变；此后才准入 srv_device，平台根别名与设备使用由此串行。
+- **nofd 降级**：判据集中在 `run_companion`，严格为 test_fp spawn `System(NotSupported)`、grants `Retained` 且 `cleanup_error == None`；此时以单进程 Collector 收集 test_kernel 并输出自检不适用原因。FP 映像仍必需，其余出生错误或非 Completed 均失败。memory 不运行 test_fp 与该自检。
+- **test_kernel 侧**：按领域分模块（见[切面 A 第 1 步](#切面-a内核级验收移出独立先行)），`main` 只负责启动子进程与编排顺序，`startup` 负责出生采用与保留模式子进程，[`harness`](../user/tests/test_kernel/src/harness.rs) 持能力与子进程 owner。它只持 services 下独立验收 Job 的子树，不持根 Job；根拓扑遍历、startup capture、idle ownership、Dispatcher funding 与 RootSupervisor 自检留 init。pm 收到 `libprocess::DERIVED_CONTROL_RIGHTS` 的委托域 JobControl。辅助均在测试包内，不新增公共库 API。
+- **held Pool**：RootSupervisor 持有通用 held Pool 集合（`hold_pool`），从根 Pool 派生并持有至系统结束，不随实例收集关闭；对应组态的 `[pool.<名>]`。retention Pool 是其唯一当前使用者。
+- **保留 fixture**：DMA exposed/output-fault 的父 fixture 与目标全部在 test_kernel 以保留角色自启动的子进程中执行，出生绑定 retention Pool。test_kernel 在最后一个保留子进程收集后核残留页数恰为 `RETAINED_PAGES_PER_FIXTURE` 之和，再经私有 sender 报告 104 字节全快照；init 只持通用判据，不认识 fixture 细节。metadata 残留记实测，不设任意上界。
+- **memory 停止**：`deployment::instances()` 对 memory 为空集合，`stop_providers` 只停止声明集合中的 Driver/Device，声明了却缺记录报原错误；实例监督运行体建立过才退休。该声明集合在切面 B 由组态替换，不另登记债务。此修正针对 `bfb4fdd` 起即存在的缺陷。
+
+### 工作集来源与每部署份数
+
+每份为原 [`libdriver::boot::WORKER_POOL`](../user/libraries/libdriver/src/boot.rs) 的 4096 页与 1 MiB metadata；份数按场景同时存活峰值取 max，不全部累加，由 `kernel_acceptance::kernel_pool_budget` / `held_pool_budget` 唯一计算。无公共单进程工作集推导的限制由[债务](#债务)承接。主域并存依据：[`main::launch_children`/`run`](../user/tests/test_kernel/src/main.rs)、[`once_checks::run`](../user/tests/test_kernel/src/once_checks.rs)、[`race_checks::race_matrix`](../user/tests/test_kernel/src/race_checks.rs) 及资源检查的 `process_retirement`；MMIO/IRQ/DMA 目标子域付款在 `mmio_checks.rs:198`、`irq_checks.rs:197`、`dma_checks.rs:292`。
+
+| 部署/recipe 形态 | 主 Pool 份数 | 同时存活场景/依据 | retention |
+|---|---:|---|---|
+| core / acceptance-virt、virt-nofd | 4 | 普通阶段主+pm+目标为 3；Once 阶段主+pm+独立 2 MiB metadata 域为 4，取 max | 2 份，两项各保留 2 页 |
+| device / device-reuse | 4 | 内核检查同 core；设备消费者在主域收集后才准入，不与主测试域共存 | 同 core |
+| stress / virt-stress | 5 | 主+pm+两 hammer+1 并发目标；Once 仍 4，取 max | 同 core |
+| memory / virt-vm-fault | 5 | 借用 stress 组合：主+1 hammer 是 stress 并存集合的子集，执行同一 raw storm（1023 个 raw 线程并存、第 1025 次准入 ReachLimit，见 test_hammer:737–764、proc.rs:71）；按进程计两份漏掉线程成本 | 无 |
+| mmio-publication / mmio-forced | 4 | 同 core；退出专项逐个派生一份 WORKER_POOL 给目标，不与 Once 域并存 | 同 core |
+| dma-races / dma-shared / dma-quota | 4 | 同 core；目标逐个派生一份 WORKER_POOL，只有当前目标子域并存 | 同 core |
+| dma-install-failure | 4 | 同 core；单一安装失败目标一份 WORKER_POOL，无保留模式 | 无 |
+| irq-exit | 4 | 同 core；两个变体顺序执行，各派生一份 WORKER_POOL | 同 core |
+| irq-retirement | 4 | 内核检查同 core；真实 function/IRQ 场景留 init 服务阶段 | 同 core |
+
+主 Pool 除 READ/CREATE/DUPLICATE/GRANT 外需 TRANSIT：race 的 ACTION_CREATE 经消息把付款授权交给 hammer。held Pool 别名不含 TRANSIT。工作集不足一律报告为模型错误，不自动扩额。
+
+### Pool 断言迁移口径
+
+| 检查 | 迁移后的基线与判据 |
+|---|---|
+| test_process_funding | 原本派生独立 16 页/1 MiB Pool，现以测试 Pool 为父；WrongObjectType、缺 CREATE 拒绝、Map 后 allocated>baseline、abandon 后等于 baseline 均保留 |
+| test_pool_budget | 双维回滚、无隐式 quota、父关闭、完整退款与活 View 付款链保留；起点 depth 多 1，链短 1，但仍到同一 MAX_DEPTH 并核 ReachLimit |
+| memory mapping | 非 stress 对照测试 Pool 的 allocated 前后相等；stress 不查询的原条件保留 |
+| ipc_thread_checks committed_kill | 对照测试 Pool 前后页数相等，原条件不变 |
+| tunnel close | 非 stress 核关闭后 allocated 下降且退款 >0；stress 不查询 |
+
+没有必须限定 depth 1 根 Pool 才成立的原断言，没有删除退款/拒绝检查。两处 sender PID 自检对照 test_kernel 自身 pid，子进程 SpawnRequest.parent 为其真实直接启动者。
+
+### fixture 收集后寿命核查
+
+| fixture | 主域外仍活计费/依据 |
+|---|---|
+| DMA exposed / output-fault | 明确保留，位于 retention；Mapping、Backing/MemoryObjectCore、WritePermit、域节点与保留表，合计 4 页 |
+| DMA unexposed | 最后 Close 取消、scope DONE、writer 0/Executable，主 Pool 最终双维零 |
+| dma-races / shared / quota / install-failure | 每个目标 Pool 在 CPU/Control/父对象关闭后全零；shared 另核父 RAM 精确退款 |
+| mmio-publication / forced | 逐目标核范围失效、scope DONE、Control 关闭及独立 Pool 零；MMIO 映射不占 RAM backing |
+| irq-exit | 目标 Control 关闭、独立 Pool 零、use/Line 贷款与来源退休后 DONE |
+| irq-retirement | function_checks 仍在 init 服务域，不持主测试 Pool 计费 |
+| race / memory suite | 目标/hammer 与 Job 退出后收集；主 Pool 双维零作为组合门 |
+
+### A-F4 最终验证
+
+冻结点 A-F4：541 个产品/工具输入（`user/`、`os/`、`shared/`、`tools/`、Justfile、rust-toolchain），SHA-256 `3815d17e48bcf484a2ba2df13ff487a9e546e271e950c012f7aeea1e649bc07a`；每条 recipe 前后核对，全部相等。`just check`、十一分面 `just clippy` 与 rustfmt 检查均返回 0。结果与运行时刻见 `artifacts/init-formation-a/final-F4/results.json`，下列链接为各 recipe 的完整构建/验收日志。
+
+| just recipe | workload / 构建 | srv_init feature | rc | 日志 | 说明 |
+|---|---|---|---:|---|---|
+| acceptance-virt | core / release | — | 0 | [日志](../artifacts/init-formation-a/final-F4/acceptance-virt.log) |  |
+| virt-stress | stress / debug | acceptance-stress | 0 | [日志](../artifacts/init-formation-a/final-F4/virt-stress.log) |  |
+| virt-vm-fault | memory / debug | acceptance-memory → acceptance-stress | 0 | [日志](../artifacts/init-formation-a/final-F4/virt-vm-fault.log) |  |
+| acceptance-device | device / release | acceptance-device | 0 | [日志](../artifacts/init-formation-a/final-F4/acceptance-device.log) |  |
+| acceptance-device-reuse | device-reuse / debug | acceptance-device-reuse | 0 | [日志](../artifacts/init-formation-a/final-F4/acceptance-device-reuse.log) |  |
+| acceptance-device-candidates | device-reuse / debug | acceptance-device-candidates | 0 | [日志](../artifacts/init-formation-a/final-F4/acceptance-device-candidates.log) |  |
+| acceptance-device-function-session | core / debug | acceptance-device-function-session | 0 | [日志](../artifacts/init-formation-a/final-F4/acceptance-device-function-session.log) |  |
+| acceptance-fs-stop-order | core / debug | — | 0 | [日志](../artifacts/init-formation-a/final-F4/acceptance-fs-stop-order.log) |  |
+| acceptance-mmio-publication | core / debug | acceptance-mmio-publication | 0 | [日志](../artifacts/init-formation-a/final-F4/acceptance-mmio-publication.log) |  |
+| acceptance-mmio-forced | core / debug | acceptance-mmio-forced | 0 | [日志](../artifacts/init-formation-a/final-F4/acceptance-mmio-forced.log) |  |
+| acceptance-dma-races | core / debug | acceptance-dma-races | 0 | [日志](../artifacts/init-formation-a/final-F4/acceptance-dma-races.log) |  |
+| acceptance-dma-shared | core / debug | acceptance-dma-shared | 0 | [日志](../artifacts/init-formation-a/final-F4/acceptance-dma-shared.log) |  |
+| acceptance-dma-quota | core / debug | acceptance-dma-quota | 0 | [日志](../artifacts/init-formation-a/final-F4/acceptance-dma-quota.log) |  |
+| acceptance-dma-install-failure | core / debug | acceptance-dma-install-failure | 0 | [日志](../artifacts/init-formation-a/final-F4/acceptance-dma-install-failure.log) |  |
+| acceptance-irq-exit | core / debug | acceptance-irq-exit | 0 | [日志](../artifacts/init-formation-a/final-F4/acceptance-irq-exit.log) |  |
+| acceptance-irq-retirement | core / debug | acceptance-irq-retirement → acceptance-device-function-session | 0 | [日志](../artifacts/init-formation-a/final-F4/acceptance-irq-retirement.log) |  |
+| virt-nofd | core / release，无 D64 域 | — | 0 | [日志](../artifacts/init-formation-a/final-F4/virt-nofd.log) |  |
+| system-observe | system / debug | system | 0 | [日志](../artifacts/init-formation-a/final-F4/system-observe.log) |  |
+| acceptance-device-retry-race | device-reuse / debug | acceptance-device-retry-race | 124 | [日志](../artifacts/init-formation-a/final-F4/acceptance-device-retry-race.log) | 既有观察器缺陷，已[移交设备计划](todo-2026-09-device-system-design.md#retry-观察器缺陷2026-10-29)，不计通过；同样失败于 retry.log:12 读取 `self`，外层 617 行 `Retry late-query window not established` |
+
+通过路线的判据由 Guest 内硬失败保证：主 Pool 未归零、held Pool 报告后变化或保留页数不符，均使 test_kernel panic 或 init 进系统终局，wrapper 据此判失败；wrapper 在成功时删除原始 Guest 输出，因此 A-F4 不保留逐路线采样值，A-F3 的采样（保留域 4 页/884 槽）保存在 `final-F3/`。stress 16/16 矩阵、memory 1024 成员 raw storm 与真实 RetryFault、nofd 不适用锚点、System 三宿主常驻等待均由各自 wrapper 锚点核验。
+
+### 交付前结构检查
+
+按 [REVIEW](REVIEW.md) 核对最终结构，没有待修 finding：
+
+- **责任/授权**：真实 sender/parent 身份、独立验收 Job、root 账本与终局对失败/取消的接管保持；test_kernel 收集与主 Pool 关闭先于 srv_device 准入；held Pool 由 root 持有至系统结束，未以遗漏退款保活主域。
+- **知识归属**：init 不认识 DMA fixture 细节，只持通用判据；fixture 期望页数由 test_kernel 自核。部署模式与保留子进程角色分为两个字段，不共用位空间。pm 委托域权利引用 `libprocess::DERIVED_CONTROL_RIGHTS`，不复制。`SUPERVISOR_RIGHTS`/`JOB_FULL_RIGHTS` 在公共库中没有同用途常量，两侧各自定义；pm 与 test_kernel 的 `WRITABLE_WAKE_*` 是切面前即有的双端约定，srv_pm 不应为此依赖测试 crate，保持现状。
+- **收口/简化**：srv_init 的八个旧模块、`kernel_checks`、`LaunchedServices`、`RunFailure`、验收专用 `retention_pool` 字段已删除；test_kernel 去掉 init 时代命名（`Checks`、`root`、`root_pool_allocated`、`kill_and_supervise`、`RunFailure`）与纯转发方法。init 的 ReadWorld/ReadDuty 经核没有只服务已删路径的字段。
+- **安全/并发**：新增 unsafe 的采用/移交及只读映像存活依据成立；保留子进程 spawn 前释放 Context 锁；不新增跨进程锁或内核临界区；未改共享 ABI 或硬件协议。
+- **工具**：GDB 观察器按 test_kernel 真实 PID 与 `test_kernel::irq_checks::process_retirement` 符号附着；`check-vm-fault` 在 Guest 明确 panic/reboot 后停止；nofd 脚本期望不适用锚点。业务判据未改。
+
+未做硬件或性能/WCET 验收；sifive_u、hetero、Boot/IPI/VM-repair/独立 DMA-retention 等未列路线未运行。私有出生帧与 WORKER_POOL 借用由[债务](#债务)两行承接。
+
+### 施工过程索引
+
+过程证据保留在 `artifacts/init-formation-a/`，均不计交验：
+
+- **付款寿命**：首轮 core 暴露保留 DMA 把主池整份委托保活，test_fs QuotaExceeded（`artifacts/failed-acceptance-20261029-082357-44659.log`）；据此建立 held/retention Pool 与保留子进程，设计修订见[已核实事实](#已核实事实)「Pool 委托寿命」。
+- **工作集口径**：撤回逐项证明内存内部布局与单 64 KiB arena 的要求，额度改为 WORKER_POOL 组合；memory 两份在 raw storm 前 QuotaExceeded（`artifacts/vm-fault/20261029T005457.159966Z-78248/fault-qemu.log:352`），改借 stress 五份。
+- **memory 停止缺陷**：A-F2 暴露 `driver assembly record missing`（`artifacts/failed-acceptance-20261029-090925-95909.log`），按声明集合修复。
+- **工具定稿**：运行中修改 wrapper 导致一次 stress 外层 rc2，此后规定冻结期间不改 tools/Justfile/产品代码；同期平台时钟异常复发按 [KNOWN_ISSUES](../KNOWN_ISSUES.md#历史偶发异常仅观察) 记入原设备记录。
+- **A-F3**：整理前的功能冻结点，19 条路线结论与 A-F4 一致，证据在 `final-F3/`；随提交前整理作废，由 A-F4 取代。
+- **Retry 归因**：00274bf 干净基线同样在观察器读取无 `self` 的 `commit_retry` 帧时失败，ELF 差异来自 ignored lockfile 重新解析与路径等环境差异；证据在 `retry-attribution/`，已[移交设备计划](todo-2026-09-device-system-design.md#retry-观察器缺陷2026-10-29)。

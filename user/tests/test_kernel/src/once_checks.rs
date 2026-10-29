@@ -10,15 +10,11 @@ use libkernel::{
     shared::memory_pool::{METADATA_SLOT_BYTES, MemoryPoolBudget},
 };
 
-pub(super) fn run(
-    root: &mut RootSupervisor,
-    job: Handle,
-    image: &[u8],
-) -> Result<(), &'static str> {
+pub(super) fn run(harness: &mut Harness, job: Handle, image: &[u8]) -> Result<(), &'static str> {
     let rights = Rights::READ | Rights::CREATE | Rights::DUPLICATE;
-    let pool = root
+    let pool = harness
         .derive_pool(
-            root_memory_pool(),
+            memory_pool(),
             MemoryPoolBudget {
                 pages: 16 * 1024 * 1024 / 4096,
                 metadata: 2 * 1024 * 1024 / METADATA_SLOT_BYTES,
@@ -33,7 +29,7 @@ pub(super) fn run(
     let source = inbox
         .mint(0, transport)
         .map_err(|_| "Once fixture sender failed")?;
-    let grant = root
+    let grant = harness
         .duplicate(source.sender.as_handle(), transport)
         .map_err(|_| "Once issuer grant failed")?;
     let ready = libkernel::ipc::notification::create(
@@ -41,14 +37,15 @@ pub(super) fn run(
         Rights::SIGNAL | Rights::GRANT | Rights::DUPLICATE,
     )
     .map_err(|_| "Once ready source failed")?;
-    let ready_grant = root
+    let ready_grant = harness
         .duplicate(ready.peer.as_handle(), Rights::SIGNAL | Rights::GRANT)
         .map_err(|_| "Once ready grant failed")?;
-    root.reserve_process()
+    harness
+        .reserve_process()
         .map_err(|_| "Once issuer supervision failed")?;
-    let started = root.spawn_process(SpawnRequest {
+    let started = spawn(SpawnRequest {
         memory_pool: pool,
-        parent: init_process_info(),
+        parent: current_process(),
         job,
         image,
         payload: b"once-payer",
@@ -67,19 +64,19 @@ pub(super) fn run(
     if started.is_ok()
         || matches!(&started, Err(f) if f.grants == libprocess::GrantOutcome::Consumed)
     {
-        root.transferred(grant);
-        root.transferred(ready_grant);
+        harness.transferred(grant);
+        harness.transferred(ready_grant);
     }
     let started = started.map_err(|_| "Once issuer spawn failed")?;
-    root.track_process(Supervised {
+    harness.track_process(Supervised {
         pid: started.pid,
         control: started.control,
     });
     let deadline =
         libkernel::time::timeout_millis(30_000).map_err(|_| "Once test deadline failed")?;
-    root.wait_until(ready.owner.as_handle(), ObjectSignals::READABLE, deadline)
+    wait_until(ready.owner.as_handle(), ObjectSignals::READABLE, deadline)
         .map_err(|_| "Once issuer did not finish handoff")?;
-    let mut message = root
+    let mut message = harness
         .receive_until(inbox.as_handle(), deadline)
         .map_err(|_| "Once issuer handoff failed")?;
     assert_eq!(message.header.kind, u64::from_le_bytes(*b"ONCEPAY1"));
@@ -98,7 +95,7 @@ pub(super) fn run(
         );
     }
     drop(message);
-    // A(init)创建目标Mailbox与Sender并执行Send，B(test_target)发行Once；原payer必须是B。
+    // A(test_kernel)创建目标Mailbox与Sender并执行Send，B(test_target)发行Once；原payer必须是B。
     let before = memory_pool::query(pool).map_err(|_| "Once initial Pool query failed")?;
     let ballast = memory_pool::derive(
         pool,
@@ -174,7 +171,7 @@ pub(super) fn run(
     );
     // 发行者CPU与Body先实际收集，排队责任仍须独立保留原付款。
     libkernel::process::kill(started.control).map_err(|_| "Once issuer stop failed")?;
-    root.collect_process(started.pid)?;
+    harness.collect_process(started.pid)?;
     let orphaned = memory_pool::query(pool).map_err(|_| "Once dead issuer Pool query failed")?;
     assert_eq!(
         orphaned.allocated, 0,
@@ -249,12 +246,12 @@ pub(super) fn run(
         if libkernel::time::expired(deadline).map_err(|_| "Once refund clock failed")? {
             return Err("Once issuer charge remained after actual retirement");
         }
-        root.sleep_until(
+        libkernel::time::sleep_until(
             libkernel::time::timeout_millis(1).map_err(|_| "Once refund timer failed")?,
         )
         .map_err(|_| "Once refund wait failed")?;
     }
-    root.close_control(pool)?;
+    harness.close_control(pool)?;
     debug!("Once cross-Pool issuer quota, unread replies, Delivery tail and final refund passed");
     Ok(())
 }

@@ -1,0 +1,17 @@
+[package]
+name = "test_kernel"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libkernel = { path = "../../libraries/libkernel" }
+erhino_shared = { path = "../../../shared/erhino_shared" }
+libruntime = { path = "../../libraries/libruntime" }
+libthread = { path = "../../libraries/libthread" }
+libprocess = { path = "../../libraries/libprocess", features = ["management"] }
+libexecution = { path = "../../libraries/libexecution" }
+libbudget = { path = "../../libraries/libbudget" }
+librpc = { path = "../../libraries/librpc" }
+librunnel = { path = "../../libraries/librunnel" }
+lock_api = "0.4"
+libdriver = { path = "../../libraries/libdriver" }

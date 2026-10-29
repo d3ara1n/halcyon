@@ -18,7 +18,7 @@ pub(crate) fn build_spin_building(
     job: Handle,
     control_rights: Rights,
 ) -> Result<ProcessCreateResult, SystemCallError> {
-    let created = process::create(job, crate::root_memory_pool(), control_rights)?;
+    let created = process::create(job, crate::memory_pool(), control_rights)?;
     let built = (|| {
         process::map(
             created.builder,

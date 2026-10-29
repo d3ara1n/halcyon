@@ -716,6 +716,11 @@ QEMU 固定源码核定（本机版本 11.1.2；本地参考仓库 tag 对象 `c
 
 以下仅作复发后的取证参考，不是待执行任务：当前缺口是首次失败分支和原样本，再次出现终局时先保存原 prior/raw/geometry、写前 failed、hart/调用栈及环境，再区分 QEMU time_delta/宿主时钟异常与内核状态写入。确需恢复调试交错时，在同一 GDB 保留两个首因点并记录用户 Entry 的地址/PID过滤命中，保持 THROTTLE100；节流对照须单独确定，不能同时改变多个变量后单项归因。增量探针和脱离调试器的一次性首因记录均未实施，不改变失败政策、不钳制严重回退，也不在持锁采样路径临时增加日志。
 
+**2026-10-29 复发记录（继续仅观察）。** init 切面 A 的 `virt-vm-fault` memory 路线在已明确发生用户态 panic 与系统故障 Reboot 后，原 wrapper 仍等待正常退出，因而跨多轮 boot。首轮已确认的失败为 `test_hammer::raw_thread_storm` 在成员上限前返回 `QuotaExceeded`，并非时钟故障；其后各轮重复同一首因。最后一轮在 bootstrap 的根 metadata 准备、设备树归还之后记录 `Runtime stopped: platform clock failed; doorbell failure mask 0x0`。原始客体日志为 `artifacts/vm-fault/20261029T005457.159966Z-78248/fault-qemu.log:3828`，原 GDB 输出为同目录 `fault-gdb.log`，外层入口 `artifacts/init-formation-a/virt-vm-fault.log`；基线 HEAD `00274bf` 加未提交切面 A，产品/工具冻结指纹在 `artifacts/init-formation-a/frozen-inputs.json`，实际kernel指纹由 `artifacts/failed-acceptance-20261029-085457-78237.meta` 保存，完整外层日志为 `artifacts/run/20261029-085452-77836-virt-vm-fault.log`，完整原文件保留。
+
+该轮保留了完整串口、GDB真实RetryFault及detach记录，以及最后一次boot前后的停止情境；未装时钟首因探针，**首个失败分支、写前failed、prior/raw/geometry与当时hart/调用栈缺失**，不能恢复或归因。停止observer由操作者发送SIGTERM，finally清空QEMU/GDB，outer rc143，不是有界进展触限。不将此复发覆盖或改写memory Quota首因；不安排专门复现、不改时钟、不作“已修复”结论。后续切面 A 只修其明确Guest失败后的wrapper收割，避免跨boot等待；这不构成时钟修复或验证。
+
+
 ## 本轮修复设计（2026-10-28）
 
 整体报告 G1–G5 与 C1 已实施，修复与复核事实由该报告保存。本轮沿用 actor 单一所有权，不新增内核锁、硬件能力或通用运行体。
@@ -742,6 +747,19 @@ Managed 从 Claim 至功能安装采用一次绝对 40s 部署准备窗口：本
 | G4：SetConfig/Configure 两个无 TD 间隙拔出 | libusb xHCI 维护者；不再从描述符推导 dci，候选取消及实际热插通过 | 原 slot/DMA/CPU 映射退休，主控及另一连接保持活跃；两个窗口分别有实际阶段证据 |
 | G5：CPU Unmap 提交前分配失败 | libusb Page/Engine 维护者；错误保留 Page，显式退休未完成不发布 Closed，真实正常退出通过 | 真实失败保持原映射 owner，重试完成或明确进程终局承担原账；不能以 DMA DONE 代替 CPU 完成 |
 | C1：Grant 前后、DONE 安装中和运行后的取消交错 | libprocess 与 srv_driver ProcessTask 维护者；类型与提交点检查、拥有输入 host、真实候选取消与公共 root loading 故障路线 | 活跃 Binding 的 DONE/Stop 在另一 worker 装载期间仍推进；各窗口只有一个 Control/Collector owner，来源注销先于最终关闭，原 Pool 退款。root loading 路线不替代拥有输入逐窗取消 |
+
+### Retry 观察器缺陷（2026-10-29）
+
+**状态与归属：已确认的既有观察器缺陷，与 init 组态切面 A 无关，未修；owner 为本设备计划。** `acceptance-device-retry-race` 因该缺陷不能建立迟到窗口，不计通过。触发条件为下次需要 retry-race 证据时；须在复用该证据前修复观察器并补证，不在切面 A 修复或为归因继续重跑。
+
+[`qemu_driver_retry_gdb.py`](../tools/qemu_driver_retry_gdb.py) 第193、215行执行 `frame.read_var('self')`；本轮第193行的检查点按control.rs:176落在 `Request::commit_retry`。该函数是关联函数，签名为 `fn commit_retry(retry: &Retry, reply: &librpc::Reply, world: &mut World<'_>) -> Result<(), Error>`，没有self（[`control.rs:176–180`](../user/services/srv_driver/src/server/control.rs)）。两棵树的readelf均显示入口只有retry/reply/world，位置分别为DW_OP_fbreg +936/+944/+952，没有入口self的DW_AT_location。观察器与函数签名不匹配是确定首因，ELF是否逐字相同不影响这一事实；不能据此认定产品Retry合同失败。
+
+- **A-F3现场**：[完整路线日志](../artifacts/run/20261029-100301-86206-acceptance-device-retry-race.log)、[Guest/观察器原始输出](../artifacts/failed-acceptance-20261029-100306-86607.log)、[retry.log](../artifacts/device-retry/20261029T020500.501401Z-86618/retry.log)第12行 `ValueError: Variable 'self' not found.`；[生成retry.gdb](../artifacts/device-retry/20261029T020500.501401Z-86618/retry.gdb)第242行退出并detach。实际函数为commit_retry、PC=0x1529a、sequence=3，[evidence](../artifacts/device-retry/20261029T020500.501401Z-86618/evidence.json)中begins/commits/responses均为空、verified=false。
+- **干净00274bf基线**：[完整路线日志](../artifacts/init-formation-a/retry-attribution/baseline-artifacts/run/20261029-101333-91710-acceptance-device-retry-race.log)、[Guest/观察器原始输出](../artifacts/init-formation-a/retry-attribution/baseline-artifacts/failed-acceptance-20261029-101407-93801.log)、[retry.log](../artifacts/init-formation-a/retry-attribution/baseline-artifacts/device-retry/20261029T021557.735923Z-93826/retry.log)同样在第12行读self失败；[生成retry.gdb](../artifacts/init-formation-a/retry-attribution/baseline-artifacts/device-retry/20261029T021557.735923Z-93826/retry.gdb)同样在第242行退出并detach。实际函数仍为commit_retry、PC=0xd65e、sequence=3，[evidence](../artifacts/init-formation-a/retry-attribution/baseline-artifacts/device-retry/20261029T021557.735923Z-93826/evidence.json)同样没有建立迟到窗口。
+
+两份观察器实际加载的srv_driver ELF已保留并分别与evidence核同：A-F3 SHA-256为 `4120d31b3eb7bb4d0849615d9e365b717c052312dabbc6ecf6d5e547f97bf6b7`，基线为 `2045f9f2e6ba1ba1771f1a0169f935e7eb7197abfe8aecacff3b2bf2e32559f8`。哈希与地址差异的来源为构建环境：`user/Cargo.lock`由`.gitignore:14`忽略，干净基线重新解析到syn3.0.9、talc5.1.1、unicode-ident1.0.27，A-F3既有lock为3.0.3、5.0.4、1.0.24；工作目录路径和crate disambiguator也不同。srv_driver、libdriver及观察器脚本逐文件字节相同，编译器/features/profile/target/rustflags等设置相同。[比较JSON](../artifacts/init-formation-a/retry-attribution/elf-comparison.json)、[lockfile差异](../artifacts/init-formation-a/retry-attribution/Cargo.lock.diff)、[源码一致性](../artifacts/init-formation-a/retry-attribution/source-identity.json)、[A-F3函数DWARF](../artifacts/init-formation-a/retry-attribution/A-F3-commit_retry.readelf.txt)与[基线函数DWARF](../artifacts/init-formation-a/retry-attribution/baseline-commit_retry.readelf.txt)保存证据。SunnyCedar据此撤回“ELF逐字一致”作为既有缺陷归因的必要条件，按观察器与函数签名不匹配的源码事实判定归属。
+
+**关闭条件**：观察器检查点和变量读取须符合真实函数签名及原请求身份，在既有真实Control Retry消费者上建立两次begin、一次成功和另一请求的迟到commit/拒绝证据，并保留Caller退休与原账收束判据；原始日志完整、recipe通过后才关闭本项。不得通过放宽业务判据、把缺失窗口记为覆盖、替换产品合同或另造测试专用服务收口。此前两份rc1与未覆盖事实保持原样，切面A仅链接本条完成移交。
 
 ### 候选出生异常（仅观察）
 

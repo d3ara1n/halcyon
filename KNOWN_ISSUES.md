@@ -16,7 +16,7 @@
 
 | 异常 | 已知事实与证据边界 | 复发时保留的信息 / 原记录 |
 |---|---|---|
-| 平台时钟失败 | 2026-10-26 一次 `platform clock failed` 终局；首次失败分支和读数未保存，后续两次首因路线均未复现。不能判断是旧缺陷已间接消失、潜在缺陷还是环境异常 | 失败分支、写前 failed、原 prior/raw、geometry、hart/调用栈与运行环境；[时钟复查](plans/todo-2026-09-device-system-design.md#独立时钟异常复查2026-10-27) |
+| 平台时钟失败 | 2026-10-26 一次 `platform clock failed` 终局；首次失败分支和读数未保存，后续两次首因路线均未复现。2026-10-29 在 memory Guest 已明确 panic/reboot、wrapper 继续跨 boot 等待期间复发一次，现场与缺口已追加到[原时钟复查记录](plans/todo-2026-09-device-system-design.md#独立时钟异常复查2026-10-27)。不能判断是潜在缺陷还是环境异常，不影响该轮已确认的 Quota 首因 | 失败分支、写前 failed、原 prior/raw、geometry、hart/调用栈与运行环境；[时钟复查](plans/todo-2026-09-device-system-design.md#独立时钟异常复查2026-10-27) |
 | W05-04：Watch 准入未知错误 | 2026-10-10 secondary Watch 饱和循环出现一次非 Quota 错误，未保存具体 Err/count/clock；后续未复现。共用整体期限的候选结构已删除，但无法证明它是原根因 | 具体 Err、成功 count、last_ns/deadline、来源与控制 Lifetime 退休/费用顺序；[Watch 原记录](plans/todo-2026-10-07-fal-service-redesign.md#历史问题重新核定2026-10-11) |
 | 候选路线 HID 出生 Unavailable | 2026-10-28 一次出生未记录 Start 即停止，PID 16 收集与原 Pool 两维退款完成；原现场缺少具体失败分支/阶段/期限。补诊断后同一路线完整通过，未改变 10s 出生期限，不能宣告原异常已定位或修复 | 准备阶段与 GrantOutcome、首个 Start/超时错误、now/end、process/PID、原 Pool 及同轮 Binding/供应状态；[候选出生观察](plans/todo-2026-09-device-system-design.md#候选出生异常仅观察) |
 

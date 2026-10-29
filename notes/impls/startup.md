@@ -147,7 +147,7 @@ System 与 Primary 同时运行文件与 registry，分别发行一组、A/B 两
 
 ### 停止与收集
 
-内部 `request_stop` 单调保存动作、StopPhase 与冻结总期限，Seal services 并封本地 Start/交付；重复同一动作返回原阶段，不能刷新期限或换动作。其责任集合来自原记录，包含尚未 Ready/Start 的实例，不由调用者传入可遗漏的 Host 清单。阶段为 Consumers→Files→Devices→Root→Completed。root 的客户端和普通受管进程先沿原 owner 收束，正式自持根随后释放；文件按 secondary 在 primary 前的顺序，之后交原设备安全链。总期限进入 root 的最早等待与到期升级，覆盖来源注销、取消、Collector 和 services Job 收集。
+内部 `request_stop` 单调保存动作、StopPhase 与冻结总期限，Seal services 并封本地 Start/交付；重复同一动作返回原阶段，不能刷新期限或换动作。其责任集合来自原记录，包含尚未 Ready/Start 的实例，不由调用者传入可遗漏的 Host 清单。阶段为 Consumers→Files→Devices→Root→Completed。memory的部署声明为空，不执行Driver/Device停止；其它部署声明的管理者缺失仍失败。已经建立的实例观察运行体在领域停止之后统一由停止聚合退休，从未建立的运行体不调用退休接口。root 的客户端和普通受管进程先沿原 owner 收束，正式自持根随后释放；文件按 secondary 在 primary 前的顺序，之后交原设备安全链。总期限进入 root 的最早等待与到期升级，覆盖来源注销、取消、Collector 和 services Job 收集。
 
 fs 由 `begin_filesystem_stop` 从原记录取得停止接点，先记 Stopping/绝对期限再 signal release。宿主封普通准入，原流、Copy、映射、注册、Watch 和来源继续退休，Runtime/Assembly 与领域账户收空后发 Stopped，再正常退出。root 保存认证 Stopped 和真实 Dead/Completed/NONE DONE 两项事实；顺序任意，缺项到期失败，异常 DONE 不被 Stopped 掩盖。DONE 先到仍保留原 receiver；到期逐条排空已有有限报文后才裁决缺报告。停止中迟到根核验后立即释放，迟到 Ready 不重新开放交付。
 
@@ -157,13 +157,19 @@ fs 由 `begin_filesystem_stop` 从原记录取得停止接点，先记 Stopping/
 
 ### 验收装配
 
-默认 core、stress、memory、device 仍为独立编译期验收选择，与 system feature 互斥。普通 pm/Tunnel/Job/进程创建 ABI 自检在基础宿主出生前完成，避免全局 Seal 后继续创建目标。core/stress 后半段通过同一 Host::launch 和设备装配运行真实消费者；secondary 保留非空 Copy/Watch 停止，primary 保持运行至全局 request_stop，随后接原 Driver/Device 停止链。
+默认 core、stress、memory、device 仍为编译期部署选择，与 system feature 互斥。init 先以 `AcceptanceImages` 一次核完验收归档的映像集合（缺失或重复即拒绝），再由 [`kernel_acceptance`](../../user/services/srv_init/src/kernel_acceptance.rs) 的 `KernelAcceptance::run` 用原 Preparation/spawn 与 root 账本启动 `test_kernel`，等其实际 Dead/Completed/NONE。`finish` 以它为输入执行根监督自检、核主 Pool 双维归零并关闭、核 held Pool 自报告后不变；此后才准入 srv_device。`test_fp` 由 init 启动，必须存在映像并正常 Completed；唯一降级为 spawn 明确 NotSupported、grants Retained 且取消无错误，表示无兼容 D64 域，此时以单进程 Collector 收集 test_kernel 并报告二成员失败隔离自检在该平台不适用。memory 不启动 FP 和基础宿主，声明实例集合为空，停止只推进声明集合中的提供者。
 
-pm 是 services 的普通短任务，出生 grants 为 mailbox receiver 与不含 CREATE 的 pm_domain JobControl，按正式 JobDriver 收束委托域。它与验收进程不进入根必需集合。[`filesystem::acceptance`](../../user/services/srv_init/src/filesystem/acceptance.rs) 拥有局部批次交接与退款验收：`track_stopped_host` 先预留接管容量，再取得已完成 Stopped/DONE 且来源实退的唯一 Control，立即纳入原批次后才关闭报告接点。`collect_pool_after_batch` 以完成的 pm 和该 secondary 覆盖 partial-admission/独立失败隔离，批次收集后从原 Bootstrap 取 Pool 核双维退款并关闭。正式宿主不组织这些验收步骤，验收也不另持一份长期监督账本。
+[`test_kernel`](../../user/tests/test_kernel/src/main.rs) 按领域分模块承载验收：`ipc_checks`、`ipc_thread_checks`、`memory_checks`、`job_checks`、`tunnel_checks`、`rpc_checks`、`time_checks`、`once_checks`、`race_checks` 及 MMIO/IRQ/DMA 资源检查；`main` 只负责启动子进程与编排顺序，`startup` 负责出生采用与保留模式子进程。它以自身 StartupContext 的 PID 核发送者，以自身 CurrentProcessInfo 启动 srv_pm/test_target/test_hammer，只持 services 下独立验收 Job 的子树授权，不持根 Job。pm 的 mailbox 与 `DERIVED_CONTROL_RIGHTS` 的 pm_domain JobControl 由 test_kernel 交付，委托域由同一正式 JobDriver 收束。测试本地 [`Harness`](../../user/tests/test_kernel/src/harness.rs) 保存能力和子进程 owner，复用 libprocess Collector 与 libexecution 的流读取运行体；测试失败使 test_kernel 失败，init 的原 services 终局负责整树收集。startup capture、idle ownership、Dispatcher funding 及 RootSupervisor 自身失败隔离仍由 init 验证；失败隔离使用正常完成的 test_kernel 与 test_fp，原部分准入、InvalidPolicy 和同一 Collector 恢复判据不变。
 
-reset capability 的对象类型/权限负测由 `check_acceptance_reset_authority` 在验收收尾执行；`submit_shutdown` 消费已完成停止意图中的动作与原 reset authority，提交最终系统动作。
+[`test_kernel::birth`](../../user/tests/test_kernel/src/lib.rs) 是当前验收私有出生格式：56 字节，依次为小端 u32 部署模式位、u8 进程角色、12 个输入槽号、保留零字节与四个小端 u64 映像有效长度。部署模式由 init 按 feature 设置；进程角色区分 init 启动的主验收进程与主进程为跨 reset 保留 fixture 自启动的两种子进程，二者不共用位空间。输入为主 Pool、验收 Job、衰减 reset、pm/target/hammer 映像、MMIO/IRQ/DMA 根、retention Pool、自身映像及私有报告 sender，缺省时槽号为 255。接收侧按输入核真实 kind/rights，并拒绝缺失、重复与多余能力；映像通过现有 sealed Image/ImageView 采用。`test_kernel::report` 拥有 held Pool 快照的 104 字节报告格式。
 
-test_fp 按 execution domain 可选，stress 另要求 hammer 映像；memory 仅复用线程/映射消费者，不启动基础宿主。构建只向 System initfs 放实际必需映像，验收保留正式消费者，strip 只操作归档副本。所有模式继续由同一 BootPackage/启动 ABI 装载，运行记录不写入本实现篇。
+主付款域按同时存活场景组合既有 `libdriver::boot::WORKER_POOL`：core/device 及资源专项四份，stress 与 memory 五份。Once 的独立两份 metadata 域与主进程、pm 共存；stress 的主进程、pm、两 hammer 与并发目标取五份。memory 的主进程与一个 hammer 虽为其子集，同样执行1024个线程成员并存的raw storm，借用已验证的stress五份组合，普通单进程工作集不覆盖该线程数相关成本。它们是已有部署工作集的组合，不是从内核内部布局闭合的精确峰值。缺少公共工作集推导的限制由[组态计划债务](../../plans/todo-2026-10-28-init-formation.md#债务)承接。
+
+DMA exposed/output-fault 故意跨 reset 保留的计费独立使用两份 WORKER_POOL 的 retention Pool。它是 RootSupervisor 通用 held Pool 集合的一员：init 从根 Pool 派生并持有至系统结束，不随任何实例收集而关闭。主测试通过自身 sealed 映像各启动一次保留模式子进程，其出生、scope/use/MemoryObject 创建、目标出生与原 Seal/退出核验全部在 retention Pool 内进行；unexposed 与 race 等可回收 fixture 仍使用主付款域。test_kernel 在最后一个保留子进程收集后核残留页数恰为每 fixture 保留页数之和，再经私有 sender 报告全快照；init 核实际 sender PID、kind、固定长度和零能力，主进程收集后与同一 held Pool 再次逐字段比对。init 只持通用判据（主 Pool 归零、held Pool 报告后不变），不认识 fixture 细节。metadata 残留只记录实际值和保留对象构成，不以任意上界代替判据；dma-install-failure 不执行两项保留模式，不建立 retention Pool。
+
+core/stress 后半段通过同一 Host::launch 和设备装配运行真实消费者；secondary 保留非空 Copy/Watch 停止，primary 保持运行至全局 request_stop，随后接原 Driver/Device 停止链。[`filesystem::acceptance`](../../user/services/srv_init/src/filesystem/acceptance.rs) 的 `track_stopped_host` 先预留接管容量，取得已完成 Stopped/DONE 且来源实退的唯一 Control，立即纳入原批次后关闭报告接点；`collect_stopped_pool` 用原单进程 Collector 收集 secondary，再取原 Bootstrap Pool 核双维零并关闭。它不再与 pm 控制权耦合。
+
+reset 的对象类型负测使用 test_kernel 自身验收 Job；权限负测使用只有 DUPLICATE 的 SystemReset 别名。真实 reset authority 不交测试进程，init 的 `submit_shutdown` 仍消费已完成停止意图与原 authority，提交唯一最终系统动作。根拓扑遍历与 init 自身不变量留在 init。System 不打包或运行 test_kernel；验收模式继续使用同一 BootPackage/启动 ABI，strip 只操作归档副本。
 
 ## 验证
 

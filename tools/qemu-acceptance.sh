@@ -68,10 +68,8 @@ required+=(
     "committed IPC caller kill passed:"
     "acceptance domain collected"
     "all services supervised to completion"
-    "root supervision failure isolation passed"
     "root startup ownership rollback passed"
     "pm: active mailbox stop and refund passed"
-    "root independent runtime failure isolation passed"
     "peer closed observed"
     "pm delegated domain confirmed Dead"
     "RPC rejected reply cleanup passed"
@@ -110,6 +108,11 @@ required+=(
     "FS1 independent Copy conflict, empty and cancellation variants passed"
     "FS1 independent exclusive target Create and pinned cleanup passed"
 )
+if [[ "$profile" == nofd ]]; then
+    required+=("root failure isolation not applicable: no compatible D64 domain (test_fp NotSupported)")
+else
+    required+=("root supervision failure isolation passed" "root independent runtime failure isolation passed")
+fi
 fi
 case "$profile" in
     memory)

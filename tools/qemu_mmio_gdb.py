@@ -9,11 +9,12 @@ import subprocess
 import qemu_gdb as debug
 
 
-def start(kernel, port, target_file):
+def start(kernel, port, target_file, controller_pid):
     logs = debug.fresh_logs(Path("artifacts/mmio-publication"))
     evidence = logs / "evidence.json"
     evidence.write_text(json.dumps({
         "kernel_sha256": hashlib.sha256(kernel.read_bytes()).hexdigest(),
+        "controller_pid": controller_pid,
         "boot_package_sha256": hashlib.sha256(Path(os.environ["ERHINO_BOOT_PACKAGE"]).read_bytes()).hexdigest(),
         "scope": "real Map/Revoke, read-only state/PTEs, thread-scoped vCont only; no timing claim",
         "windows": [],
@@ -146,7 +147,7 @@ while len(facts['windows'])<2:
         original=caller('kernel::resource::mmio::object::revoke')
         if original is None:continue
         thread=int(original.read_var('thread'))
-        if owner(thread)!=1:continue
+        if owner(thread)!={controller_pid}:continue
         node=arc(frame.read_var('self'))
         if int(node['bytes'])!=32*4096:continue
         end=time.monotonic()+1
@@ -200,7 +201,7 @@ while len(facts['windows'])<2:
     if state=='retire':
         if name=='kernel::resource::mmio::object::query':
             thread=int(frame.read_var('thread'))
-            if owner(thread)!=1:continue
+            if owner(thread)!={controller_pid}:continue
             native_frame=thread+thread_offsets['frame']
             if word(native_frame+context_offsets['x']+10*8)!=record['scope']:continue
             query={{'frame':native_frame,'pc':word(native_frame+context_offsets['sepc']),'satp':word(thread+thread_offsets['satp']),'output':int(frame.read_var('output'))}}

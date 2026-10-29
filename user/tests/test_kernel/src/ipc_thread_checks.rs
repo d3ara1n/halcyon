@@ -304,7 +304,7 @@ fn inspect(mut message: libkernel::ipc::message::ReceivedMessage, seen: &mut Vec
         index + 1,
         "threaded Mailbox badge crossed a delivery"
     );
-    assert_eq!(message.header.sender_pid, super::init_pid() as u64);
+    assert_eq!(message.header.sender_pid, super::current_pid() as u64);
     assert_eq!(message.payload.len(), PAYLOAD_MAX);
     for chunk in message.payload.as_chunks::<8>().0 {
         assert_eq!(
@@ -344,7 +344,7 @@ pub(super) fn committed_kill(job: Handle, image: &[u8]) {
             wait_set::MemberRequest,
         },
     };
-    let baseline = crate::root_pool_allocated().unwrap();
+    let baseline = crate::memory_checks::pool_allocated().unwrap();
     let mut sources = Vec::new();
     let mut owners = Vec::new();
     for _ in 0..2 {
@@ -367,7 +367,7 @@ pub(super) fn committed_kill(job: Handle, image: &[u8]) {
         owners.push(set.into_capability().into_raw());
         sources.push(source);
     }
-    let nested = process::create(job, crate::root_memory_pool(), crate::SUPERVISOR_RIGHTS).unwrap();
+    let nested = process::create(job, crate::memory_pool(), crate::SUPERVISOR_RIGHTS).unwrap();
     process::grant(
         nested.builder,
         &[HandleGrant {
@@ -393,8 +393,8 @@ pub(super) fn committed_kill(job: Handle, image: &[u8]) {
         notification::create(Rights::READ | Rights::WAIT, Rights::SIGNAL | Rights::GRANT).unwrap();
     let control = duplicate(nested.control, Rights::READ | Rights::WAIT | Rights::GRANT).unwrap();
     let started = crate::spawn(crate::SpawnRequest {
-        memory_pool: crate::root_memory_pool(),
-        parent: crate::init_process_info(),
+        memory_pool: crate::memory_pool(),
+        parent: crate::current_process(),
         job,
         image,
         payload: b"ipc-kill",
@@ -453,7 +453,7 @@ pub(super) fn committed_kill(job: Handle, image: &[u8]) {
     }
     assert_eq!(libkernel::ipc::wait_set::abandoned_count(), 0);
     assert_eq!(
-        crate::root_pool_allocated().unwrap(),
+        crate::memory_checks::pool_allocated().unwrap(),
         baseline,
         "IPC process retirement failed to refund Pool charge"
     );

@@ -13,14 +13,12 @@ pub(crate) fn track_stopped_host(
     root.close_filesystem_report(instance)
 }
 
-pub(crate) fn collect_pool_after_batch(
+pub(crate) fn collect_stopped_pool(
     root: &mut RootSupervisor,
     instance: crate::supervision::Instance,
-    completed: u64,
-    parent: Handle,
 ) -> Result<(), &'static str> {
-    let pids = [completed, root.instance_pid(instance)?];
-    root.verify_failure_isolation(parent, pids)?;
+    let pid = root.instance_pid(instance)?;
+    root.collect_process(pid)?;
     let pool = root.filesystem_bootstrap(instance)?.pool;
     let snapshot = libkernel::memory_pool::query(pool)
         .map_err(|_| "filesystem collected Pool query failed")?;
@@ -29,7 +27,7 @@ pub(crate) fn collect_pool_after_batch(
     }
     libkernel::debug!(
         "FS host Pool refunded after Collector: pid={}, pages=0, metadata=0",
-        pids[1]
+        pid
     );
     root.close_control(pool)
 }

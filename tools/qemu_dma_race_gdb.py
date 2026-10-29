@@ -16,11 +16,12 @@ import qemu_gdb as debug
 MODES = {"dma-pin-before", "dma-pin-after", "dma-pin-exit", "dma-reader-retire"}
 
 
-def start(kernel, port, target_file):
+def start(kernel, port, target_file, controller_pid):
     logs = debug.fresh_logs(Path("artifacts/dma-races"))
     evidence = logs / "evidence.json"
     facts = {
         "kernel_sha256": hashlib.sha256(kernel.read_bytes()).hexdigest(),
+        "controller_pid": controller_pid,
         "boot_package_sha256": hashlib.sha256(Path(os.environ["ERHINO_BOOT_PACKAGE"]).read_bytes()).hexdigest(),
         "scope": "real Pin/Seal/ReadSegments/Retire/Kill; vCont only, no state or result mutation; no timing claim",
         "windows": [],
@@ -151,13 +152,13 @@ while len(facts['windows'])<4:
         core=None
         if target['mode'] in ('dma-pin-before','dma-pin-after'):
             original=caller('kernel::task::memory_object::seal')
-            if original is None or pid!=1:continue
+            if original is None or pid!={controller_pid}:continue
             native_frame=thread+thread_offsets['frame']
             if word(native_frame+context_offsets['x']+10*8)!=target['memory']:continue
             core=int(frame.read_var('self'))
             point={before} if target['mode']=='dma-pin-before' else {points[357]}
         elif target['mode']=='dma-pin-exit':
-            if caller('kernel::task::process::kill') is None or pid!=1:continue
+            if caller('kernel::task::process::kill') is None or pid!={controller_pid}:continue
             if int(arc(frame.read_var('self'))['pid'])!=target['pid']:continue
             point={points[381]}
         else:

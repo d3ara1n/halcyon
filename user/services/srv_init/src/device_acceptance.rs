@@ -3,6 +3,7 @@ use super::*;
 use alloc::vec::Vec;
 use libkernel::ipc::message::Mailbox;
 use libkernel::ipc::object;
+use libkernel::memory_pool::MemoryPool;
 pub(super) fn exercise(
     root: &mut RootSupervisor,
     job: Handle,

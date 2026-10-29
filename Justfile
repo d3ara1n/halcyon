@@ -98,7 +98,7 @@ clippy:
     run_lint user-device artifacts/lint/user-device.log \
         bash -c 'cd user && cargo clippy -p srv_init --bin srv_init --features acceptance-device-reuse {{ZFLAGS_USER}} -- -D warnings'
     run_lint user-resources artifacts/lint/user-resources.log \
-        bash -c 'cd user && cargo clippy -p srv_init -p test_target --bins --features srv_init/acceptance-irq-retirement,srv_init/acceptance-irq-exit,srv_init/acceptance-mmio-publication,srv_init/acceptance-mmio-forced,srv_init/acceptance-dma-races,srv_init/acceptance-dma-shared,srv_init/acceptance-dma-quota,srv_init/acceptance-dma-install-failure {{ZFLAGS_USER}} -- -D warnings'
+        bash -c 'cd user && cargo clippy -p srv_init -p test_kernel -p test_target --bins --features srv_init/acceptance-irq-retirement,srv_init/acceptance-irq-exit,srv_init/acceptance-mmio-publication,srv_init/acceptance-mmio-forced,srv_init/acceptance-dma-races,srv_init/acceptance-dma-shared,srv_init/acceptance-dma-quota,srv_init/acceptance-dma-install-failure {{ZFLAGS_USER}} -- -D warnings'
     run_lint shared-host artifacts/lint/shared.log \
         bash -c 'cd shared && cargo clippy --workspace --all-targets --target aarch64-apple-darwin -- -D warnings'
     run_lint os-host artifacts/lint/os-host.log \
@@ -166,6 +166,7 @@ make_initfs: build_user
     @ditto "{{TARGET_DIR}}/build/srv_fs" "{{TARGET_DIR}}/initfs/bin/srv_fs"
     @ditto "{{TARGET_DIR}}/build/srv_device" "{{TARGET_DIR}}/initfs/bin/srv_device"
     @ditto "{{TARGET_DIR}}/build/srv_driver" "{{TARGET_DIR}}/initfs/bin/srv_driver"
+    @if [ "{{ACCEPTANCE_WORKLOAD}}" != system ]; then ditto "{{TARGET_DIR}}/build/test_kernel" "{{TARGET_DIR}}/initfs/bin/test_kernel"; fi
     @if [ "{{ACCEPTANCE_WORKLOAD}}" != system ]; then ditto "{{TARGET_DIR}}/build/test_target" "{{TARGET_DIR}}/initfs/bin/test_target"; fi
     @if [ "{{ACCEPTANCE_WORKLOAD}}" != system ]; then ditto "{{TARGET_DIR}}/build/test_fs" "{{TARGET_DIR}}/initfs/bin/test_fs"; fi
     @if [ "{{ACCEPTANCE_WORKLOAD}}" != system ]; then ditto "{{TARGET_DIR}}/build/test_device" "{{TARGET_DIR}}/initfs/bin/test_device"; fi

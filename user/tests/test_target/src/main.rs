@@ -1,5 +1,5 @@
 //! target：kill 监督靶子——长寿命 sleep 循环，被外部 ProcessKill 终止
-//! 是其唯一正常出口（验证 Waiting 取消与幂等竞争，见 init 剧本）。
+//! 是其唯一正常出口（验证 Waiting 取消与幂等竞争，见 test_kernel 剧本）。
 
 #![no_std]
 
@@ -1011,7 +1011,7 @@ fn retirement_target(startup: &mut libruntime::startup::InitialGrants) -> ! {
     }
 }
 
-/// 发行者使用独立Process Pool；目标Mailbox/原Sender与实际发送者均属于init。
+/// 发行者使用独立Process Pool；目标Mailbox/原Sender与实际发送者均属于test_kernel。
 fn once_payer_target(startup: &mut libruntime::startup::InitialGrants) -> ! {
     use libkernel::ipc::{
         message::{self, MailboxSender},

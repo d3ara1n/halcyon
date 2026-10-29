@@ -66,7 +66,7 @@ Mailbox/Lifetime/Delivery、Notification/观察壳、WaitSet和SignalSource均�
 
 ## 验证设施
 
-[`srv_init/public_ipc.rs`](../../user/services/srv_init/src/public_ipc.rs) 使用真实用户线程验证同槽 Sender 的 Send/Query/WAIT、接收竞争与背压、transit/Once/Delivery/Lifetime 收束，以及已提交等待的调用者退出。[`srv_init/time_checks.rs`](../../user/services/srv_init/src/time_checks.rs) 使用实际 syscall 验证绝对期限、过期优先级、取消观察和已提交投递的保留。
+[`test_kernel/ipc_thread_checks.rs`](../../user/tests/test_kernel/src/ipc_thread_checks.rs) 使用真实用户线程验证同槽 Sender 的 Send/Query/WAIT、接收竞争与背压、transit/Once/Delivery/Lifetime 收束，以及已提交等待的调用者退出。[`test_kernel/time_checks.rs`](../../user/tests/test_kernel/src/time_checks.rs) 使用实际 syscall 验证绝对期限、过期优先级、取消观察和已提交投递的保留。
 
 capability 的 signal host 用例验证插入边界、删除扫描游标、瞬态电平与关闭提示；table host 用例验证消费 claim/restore、Close/shut、rights 和持有数。内部安装、迟到提示、写回撤销及实际 metadata 付款的证据边界由[对象链工作记录](../../plans/archived/todo-2026-10-01-object-chain-kernel-integration.md)拥有。历史自检和运行结果不作为当前实现说明，当前源码不保留旧 actor/Drain 自检。
 
