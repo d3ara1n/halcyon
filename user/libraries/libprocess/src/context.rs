@@ -46,6 +46,12 @@ impl StartupPayload {
         // the process lifetime; the returned slice is tied to this borrow.
         unsafe { core::slice::from_raw_parts(self.bytes, self.len) }
     }
+
+    /// 进程生命期内的 payload 视图；StartupSeed 来源保证映射不被释放。
+    pub fn as_static_bytes(&self) -> &'static [u8] {
+        // SAFETY: 同 as_bytes；启动块映射在进程生命期内有效且只读。
+        unsafe { core::slice::from_raw_parts(self.bytes, self.len) }
+    }
 }
 
 /// Provenance supplied by the creator of the current process.

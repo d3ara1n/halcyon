@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+pub mod birth;
 pub mod context;
 pub mod image;
 

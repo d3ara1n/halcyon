@@ -11,8 +11,6 @@ members = [
     "drivers/drv_usb_xhci",
     "services/srv_pm",
     "tests/test_fp",
-    "tests/test_device",
-    "tests/test_fs",
     "tests/test_hammer",
     "tests/test_target",
     "tests/test_kernel",

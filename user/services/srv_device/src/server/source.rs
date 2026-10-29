@@ -1,10 +1,6 @@
 //! 根和派生来源的实际 Lifetime owner；入口只在两个观察来源准入后交付。
 use super::*;
-use libdevice::{
-    protocol,
-    registry::{Access, Scope, SourceIds},
-};
-use libkernel::ipc::packet::Packet;
+use libdevice::registry::{Access, Scope, SourceIds};
 
 pub(super) struct Source {
     ids: SourceIds,
@@ -20,7 +16,6 @@ pub(super) struct Source {
     admin_life: Observed,
     committed: bool,
     aborted: bool,
-    bootstrap: Option<MailboxSender>,
     published: bool,
     use_reported: bool,
     admin_reported: bool,
@@ -37,17 +32,28 @@ impl Source {
                 .map_err(|failure| Error::from(failure.error))?;
         Ok(sender)
     }
-    pub fn root(world: &World, bootstrap: MailboxSender) -> Result<Self, Error> {
-        let mut value = Self::prepare(
+    /// 根来源由本服务自持；不导出，停止时由 [`Self::release_senders`] 与 `stop` 收束。
+    pub fn root(world: &World) -> Result<Self, Error> {
+        Self::prepare(
             world,
             None,
             Scope::Root,
             Access::ALL,
             world.funding.clone(),
             None,
-        )?;
-        value.bootstrap = Some(bootstrap);
-        Ok(value)
+        )
+    }
+    pub fn committed(&self) -> bool {
+        self.committed
+    }
+    /// 本来源 use 端的 sender context，作为派生来源的 issuer。
+    pub fn use_context(&self) -> u64 {
+        self.ids.use_context
+    }
+    /// 丢弃仍由本服务持有的 sender，使 Lifetime 在外部别名也关闭后观察到 CLOSED。
+    pub fn release_senders(&mut self) {
+        self.use_sender = None;
+        self.admin_sender = None;
     }
     pub fn prepare(
         world: &World,
@@ -95,7 +101,6 @@ impl Source {
             admin_life: Observed::lifetime(admin_role.lifetime, 5),
             committed: false,
             aborted: false,
-            bootstrap: None,
             published: false,
             use_reported: false,
             admin_reported: false,
@@ -252,26 +257,6 @@ impl Source {
             .unwrap_or_else(|error| fatal(error))
         {
             return Ok(step(Step::Runnable));
-        }
-        if self.bootstrap.is_some() && !self.published && world.platform_ready {
-            let (a, b) = self.take_senders().unwrap_or_else(|error| fatal(error));
-            let incarnation = object::query(world.mailbox.as_handle())?.object_id;
-            let mut packet = Packet::new(protocol::BOOT_READY, &incarnation.to_le_bytes())?;
-            packet
-                .push(a.into_capability(), TRANSPORT)
-                .map_err(|f| f.error)?;
-            packet
-                .push(b.into_capability(), TRANSPORT)
-                .map_err(|f| f.error)?;
-            // 私有 bootstrap 只有这一条就绪消息；发送失败由 init 的预付启动监督收束。
-            packet
-                .try_send(
-                    self.bootstrap.as_ref().expect("device bootstrap missing"),
-                    Deadline::INFINITE,
-                )
-                .map_err(|f| f.error)?;
-            self.bootstrap = None;
-            libkernel::debug!("device manager ready; registry={}", incarnation);
         }
         if self.use_life.closed && !self.use_reported {
             world

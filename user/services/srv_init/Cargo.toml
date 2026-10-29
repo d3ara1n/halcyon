@@ -2,52 +2,16 @@
 name = "srv_init"
 version = "0.1.0"
 authors = ["Dearain (d3ara1n@outlook.com)"]
-description = "Halcyon root supervisor and integration acceptance controller"
+description = "Halcyon root supervisor: executes the initfs formation"
 edition = "2024"
 
-[features]
-default = []
-system = []
-acceptance-stress = []
-acceptance-device = ["dep:test_device"]
-acceptance-device-reuse = ["acceptance-device"]
-acceptance-device-retry-race = ["acceptance-device-reuse"]
-acceptance-device-candidates = ["acceptance-device-reuse"]
-acceptance-device-function-session = []
-acceptance-mmio-publication = []
-acceptance-mmio-forced = []
-acceptance-dma-races = []
-acceptance-dma-shared = []
-acceptance-dma-quota = []
-acceptance-dma-install-failure = []
-acceptance-irq-retirement = ["acceptance-device-function-session"]
-acceptance-irq-exit = []
-acceptance-memory = ["acceptance-stress"]
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
-test_kernel = { path = "../../tests/test_kernel" }
 elf = { path = "../../../shared/elf" }
-dtb = { path = "../../../shared/dtb" }
-libkernel = { path = "../../libraries/libkernel" }
 erhino_shared = { path = "../../../shared/erhino_shared" }
-librunnel = { path = "../../libraries/librunnel" }
-librpc = { path = "../../libraries/librpc" }
-libprocess = { path = "../../libraries/libprocess", features = ["management"] }
-liboal = { path = "../../libraries/liboal" }
-libfs = { path = "../../libraries/libfs" }
-libservice = { path = "../../libraries/libservice" }
-libdevice = { path = "../../libraries/libdevice" }
-libpci = { path = "../../libraries/libpci" }
-libusb = { path = "../../libraries/libusb" }
-libdriver = { path = "../../libraries/libdriver" }
-libbudget = { path = "../../libraries/libbudget" }
-libexecution = { path = "../../libraries/libexecution" }
-libruntime = { path = "../../libraries/libruntime" }
-libthread = { path = "../../libraries/libthread" }
-lock_api = "0.4"
-test_fs = { path = "../../tests/test_fs" }
-srv_fs = { path = "../srv_fs" }
+formation = { path = "../../../shared/formation" }
 tar = { path = "../../../shared/tar" }
-test_device = { path = "../../tests/test_device", optional = true }
+libkernel = { path = "../../libraries/libkernel" }
+libprocess = { path = "../../libraries/libprocess", features = ["management"] }
+libservice = { path = "../../libraries/libservice" }
+librpc = { path = "../../libraries/librpc" }
+libruntime = { path = "../../libraries/libruntime" }

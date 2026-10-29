@@ -1,6 +1,6 @@
 # init 组态与统一服务契约
 
-状态：**切面 A（内核级验收移出 init）已完成，提交前整体整理后在冻结点 A-F4 全部路线重跑通过；retry-race 为既有观察器缺陷，已移交设备计划，不计通过；切面 B 未开始**。证据与最终表见[当前接力](#当前接力)。本篇是本任务唯一工作记录，拥有目标设计、实施顺序、验证门、债务与接力。上游职责边界（init 根监督、`srv_service` 分工）由[服务装配计划](todo-2026-10-07-service-assembly.md#已确认的-init-与服务管理职责)拥有；系统停止政策由[关机编排](todo-2026-09-system-shutdown-orchestration.md)拥有；设备安全事实由[设备计划](todo-2026-09-device-system-design.md)拥有。
+状态：**切面 A 已提交（`413f384`）；切面 B 已实施，编译、clippy 与 host 单测通过，未做运行期验证（QEMU 验收设施按 AGENTS 不作提交门）**。当前事实见[当前接力](#当前接力)。本篇是本任务唯一工作记录，拥有目标设计、实施顺序、验证门、债务与接力。上游职责边界（init 根监督、`srv_service` 分工）由[服务装配计划](todo-2026-10-07-service-assembly.md#已确认的-init-与服务管理职责)拥有；系统停止政策由[关机编排](todo-2026-09-system-shutdown-orchestration.md)拥有；设备安全事实由[设备计划](todo-2026-09-device-system-design.md)拥有。
 
 ## 目标与非目标
 
@@ -78,7 +78,7 @@
 
 | 宿主 | 输入 | 导出 |
 |---|---|---|
-| srv_device | `instance.*`、`memory.pool`、`platform.description`、`platform.root` | `device.root`、`device.root.admin`；设定 `sources` 表每项 `<名>` 产生 `device.source.<名>` 与 `device.source.<名>.admin` |
+| srv_device | `instance.*`、`memory.pool`、`platform.description`、`platform.root` | 设定 `sources` 表每项 `<名>` 产生 `device.source.<名>` 与 `device.source.<名>.admin`；根来源不导出，由 srv_device 自持 |
 | srv_driver | `instance.*`、`memory.pool`、`device.source`、`driver.workers`（worker Job）、`driver.image.<组件名>` | `driver.control`、`driver.observer` |
 | srv_fs | `instance.*`、`memory.pool`；不承载 registry 时加 `service.authority` | 每入口 N：`file.root.N`、`file.management.N`；承载 registry 时加 `service.directory.N`、`service.authority.N` |
 
@@ -104,8 +104,6 @@ stop_timeout_ms = 40000
 inputs."memory.pool" = "self/memory.pool"
 inputs."platform.description" = "init/platform.description"
 inputs."platform.root" = "init/platform.root"
-exports."device.root" = { kind = "mailbox_sender", rights = ["write", "wait", "duplicate", "transit", "grant"] }
-exports."device.root.admin" = { kind = "mailbox_sender", rights = ["write", "wait", "duplicate", "transit", "grant"] }
 exports."device.source.driver" = { kind = "mailbox_sender", rights = ["write", "wait", "duplicate", "transit", "grant"] }
 exports."device.source.driver.admin" = { kind = "mailbox_sender", rights = ["write", "wait", "duplicate", "transit", "grant"] }
 settings.sources = [{ name = "driver", scope = "root", access = ["observe", "claim", "child_register", "report_stopped"] }]
@@ -183,7 +181,7 @@ srv_init 约 17.3k 行，直接依赖 `srv_fs`、`test_fs`、`libdevice`、`libd
 | 出生输入 | `libprocess::birth` | payload 帧中的命名输入表与设定段；进程领域，task 与测试进程也可用 |
 | 实例契约 | `libservice::instance` | 保留输入、Export/Ready/Stopped 消息、撤销协议；子进程侧 helper；监督方 launcher（libexecution 任务，init、`srv_service`、验收控制 task 共用） |
 | 组态 schema | `shared/formation` | 二进制编解码、静态校验；`host` feature 下为 TOML 编译器 |
-| 服务设定 | `shared/settings` | 整数、布尔、字节串、列表、表的编码与只读访问；不认识任何服务键 |
+| 服务设定 | `shared/settings` | 布尔、i64 整数、UTF-8 字符串、列表、表的规范编码与只读访问；表键按字节序唯一排列，解析时一次校验全树，访问不再失败于格式；不认识任何服务键。字节值（如驱动 identity）以整数列表表达，由服务按自己的键解释 |
 | 领域语义 | libfs、libdevice、libdriver 等 | 导出名常量、设定键及含义；导出能力的业务协议不变 |
 | 执行器 | srv_init | 组态执行、根监督、系统终局；只依赖 libkernel、libprocess、libservice、libexecution、libbudget、librpc、erhino_shared、tar、elf、formation |
 
@@ -199,7 +197,7 @@ srv_init 约 17.3k 行，直接依赖 `srv_fs`、`test_fs`、`libdevice`、`libd
 
 ## 契约二：就绪与导出
 
-- 子进程在 `instance.report` 上依次发若干 `Export { name }`（每条恰一个句柄），最后发 `Ready { export_count, summary }`。一导出一能力，例如 device 的根入口与管理端是 `device.root` 与 `device.root.admin`。`summary` 为可选领域字节，init 不解释、可转交消费者。
+- 子进程在 `instance.report` 上依次发若干 `Export { name }`（每条恰一个句柄），最后发 `Ready { export_count, summary }`。一导出一能力，例如 device 的预限定来源与其管理端是 `device.source.driver` 与 `device.source.driver.admin`。`summary` 为可选领域字节，init 不解释、可转交消费者。
 - init 通用校验：sender pid 与 `instance.report` 通道 context；导出名属于组态为该实例声明的集合且不重复；实际 kind 与 rights 不低于声明；Ready 时计数相符、声明导出全部到齐、进程仍 Running 且未 DONE。
 - 删除 KOID/incarnation 交叉核对与位掩码（仅 init 消费，见已核实事实）。
 - 就绪等待并入监督轮询，每轮有界领取；init 持续排空 `instance.report`（容量 16）。子进程按启动期限 `try_send`，超期即启动失败。
@@ -261,7 +259,7 @@ srv_init 约 17.3k 行，直接依赖 `srv_fs`、`test_fs`、`libdevice`、`libd
 
 - **srv_fs**：删除 `Profile`。设定 `registry`（布尔）与 `entries`（每入口 watches/sessions 份额）决定形态，`Capacity` 由设定计算。管理与登记 receiver 改由 fs 自建（未找到须由 init 预建的理由）。四种根改为[领域导出名](#领域输入与导出名)所列命名导出。secondary（`registry = false`）的 publication authority 改为输入 `service.authority`，路由自 primary 的 `service.authority.N`，删除 Start 前投递与 parent pid 核对。
 - **srv_driver**：声明表进入设定 `declarations`（implementation、identity、priority、capacity、reusable、child_registrar、trusted_physical），映像为输入 `driver.image.<组件名>`，`image_bytes` 由 sealed 对象有效长度得出。worker Job 为输入 `driver.workers`。worker 工作集计入 driver 实例 `pool.work_pages`，由部署决定；srv_driver 启动时校验额度覆盖声明，不足即启动失败。init 不再识别 ECAM。
-- **srv_device**：输入 `platform.description` 与列表 `platform.root`；导出 `device.root`、`device.root.admin` 与设定 `sources` 声明的预限定来源。init 不再持有 root 入口、observer 与 Watch。
+- **srv_device**：输入 `platform.description` 与列表 `platform.root`；导出设定 `sources` 声明的预限定来源及其管理端。根来源由 srv_device 自持、不导出：`instance.stop` 时它自行封根并等子来源退休，故 init 不再持有 root 入口、observer 与 Watch，终局撤销只针对已路由的来源管理端。
 - **init 平台输入**：平台描述头经 `erhino_shared::platform` 解析，按 `resource_count` 与 `handle_index` 取根。终局按实际 object kind 封 MMIO/IRQ/DMA 根，只需 libkernel。删除 libpci 依赖。
 
 ## 验收迁移
@@ -291,7 +289,7 @@ srv_init 约 17.3k 行，直接依赖 `srv_fs`、`test_fs`、`libdevice`、`libd
 3. `libservice::instance`：消息、撤销协议、子进程 helper、launcher；host 单测覆盖导出校验与撤销状态机。
 4. srv_fs、srv_device（含 SourceAdmin 撤销协议与预限定导出）、srv_driver 迁移。
 5. srv_init 执行器替换 `deployment.rs`、`device.rs`、`driver.rs`、`filesystem/`；平台输入去 libpci；Terminal 改用撤销协议。
-6. `test_device`、`test_fs` 承接服务级验收；`test_kernel` 改由组态启动并从设定取模式。
+6. 测试侧按 AGENTS“验证”中的过渡设施口径，只做保持必要可用的最小迁移：`test_kernel` 改由组态启动并从设定取模式；`test_device`、`test_fs` 只承接仍有证据价值的服务级验收，迁移代价高于价值的检查直接删除，并在本篇写明失去的覆盖。
 7. `user/formations/` 写出 system 与各验收部署；Justfile 改为编译组态、按部署组装 initfs，`bin/` 改为 `image/`。
 
 开发证据：步骤 1–3 的 host 单测；步骤 5 后 System 路线。
@@ -314,7 +312,7 @@ srv_init 约 17.3k 行，直接依赖 `srv_fs`、`test_fs`、`libdevice`、`libd
 | 项 | 现状 | 目标 | 触发与删除条件 |
 |---|---|---|---|
 | `test_kernel` 按 feature 传模式 | 切面 A 使用 `test_kernel::birth` 私有出生帧：56 字节，依次为小端 u32 部署模式位、u8 进程角色（主验收进程或两种保留模式子进程，与部署模式不共用位空间）、12 个输入槽号（主 Pool/Job/reset/pm/target/hammer/MMIO/IRQ/DMA/retention Pool/self 映像/私有报告 sender，255 表示缺省）、保留零字节与 pm/target/hammer/self 四个小端 u64 映像长度；`test_kernel::report` 拥有 104 字节 held Pool 快照报告。能力实际种类/权限在采用时核验。init 按 feature 编码模式；`srv_init` 因共享 birth/report 格式而在 Cargo 中反向依赖测试 crate `test_kernel`。retention Pool 是 RootSupervisor 通用 held Pool 集合的一员，以 `memory.pool.retention` 签发给 test_kernel | 输入改用 `libprocess::birth`，模式写在验收组态的 `settings`，系统服务不再依赖测试 crate；held Pool 集合由组态 `[pool.<名>]` 声明 | 切面 B 步骤 6 接通时删除私有帧、init 侧编码、对应 feature 及 `srv_init → test_kernel` Cargo 依赖 |
-| 单进程工作集无公共推导 | retention Pool 与 `test_kernel` 主 Pool 的额度沿用 `libdriver::boot::WORKER_POOL`（每进程一份）这一已有部署工作集，未从页表预取峰值、VM planner 缓冲、堆碎片等内部布局闭合精确上界；`test_kernel` 因此依赖 libdriver 的该常量。WORKER_POOL 描述普通进程，不含按线程数扩展的成本：memory 部署的 raw thread storm（`PROCESS_MAX_THREADS` 个线程成员并存，要求 ReachLimit 先于 Quota）改用 stress 的 5 份组合，依据是 memory 在 storm 期间的同时存活集合是 stress 的子集，而 stress 在 5 份下已通过同一 storm；这是组合证据，不是逐线程成本推导 | 内存领域提供单进程工作集的公共推导，含每线程成员的 metadata 与栈成本；fs/device/driver/test_kernel 的同类常量收敛为一个真值 | 触发：出现须精确核定单进程工作集的需求（不可信创建域、紧凑部署或额度不足的实证）。由[内存重构](todo-2026-10-01-memory-redesign.md)或[内核内存预算](todo-2026-09-14-kernel-memory-budget.md)承接；接通后删除对 WORKER_POOL 的借用与 memory 借用 stress 组合 |
+| 正式部署工作集无单一真值 | srv_fs、srv_device、srv_driver 各自以独立常量定义部署 Pool 工作集（`deployment::METADATA_BYTES`/`HEAP_PAGES`、device 的 8 MiB、`libdriver::boot::WORKER_POOL`），没有由内存领域给出的公共推导。test_kernel 借用 WORKER_POOL 属测试侧，按 AGENTS 过渡设施口径不在此跟踪 | 内存领域提供单进程工作集的公共推导，正式服务的同类常量收敛为一个真值；切面 B 中额度改由组态 `pool` 字段声明，数值仍沿用这些常量 | 触发：出现须精确核定单进程工作集的需求（不可信创建域、紧凑部署或额度不足的实证）。由[内存重构](todo-2026-10-01-memory-redesign.md)或[内核内存预算](todo-2026-09-14-kernel-memory-budget.md)承接 |
 
 ## 完成门
 
@@ -328,7 +326,23 @@ srv_init 约 17.3k 行，直接依赖 `srv_fs`、`test_fs`、`libdevice`、`libd
 
 ## 当前接力
 
-切面 A（内核级验收移出 init）已完成并经提交前整体整理，在冻结点 A-F4 全部路线重跑，结果见[最终验证](#a-f4-最终验证)；切面 B 未开始，从[切面 B](#切面-b统一契约与组态一次耦合迁移) 接手。retry-race 为既有观察器缺陷，已[移交设备计划](todo-2026-09-device-system-design.md#retry-观察器缺陷2026-10-29)，不计通过。
+切面 A（内核级验收移出 init）已提交为 `413f384`，经提交前整体整理，在冻结点 A-F4 全部路线重跑，结果见[最终验证](#a-f4-最终验证)。retry-race 为既有观察器缺陷，已[移交设备计划](todo-2026-09-device-system-design.md#retry-观察器缺陷2026-10-29)，不计通过。
+
+切面 B 已实施（与切面 A 同分支，提交见 git log）。验证只到编译级：`just check`、`just clippy` 全部分面、shared 与受影响 user 库的 host 单测通过；组态源全部经 host 编译器校验通过。未运行 QEMU，运行期行为（出生、就绪、撤销门、停止顺序、终局）均未经实证。
+
+最终结构：
+
+- **纯逻辑层**：`shared/settings`（设定编码）、`shared/formation`（组态模型、校验、拓扑序与 host 编译器；多个源按序深合并，后者覆盖前者，编译时另写出引用映像清单）、`libprocess::birth`（出生帧与 `Birth` 采用器，`take_list` 接受一组允许 kind）、`libprocess::image::Image::adopt_sealed`（按封存对象整页长度采用）、`libservice::instance`（报告线格式、`Reporter`、`STOP_SIGNALS`、撤销协议线格式，请求体含操作码与绝对期限）。
+- **srv_fs**：设定 `registry`/`entries`/`publish` 取代 `Profile`；自建管理与 registry receiver；导出 `file.root.N`、`file.management.N`，registry 宿主另导出 `service.directory.N`、`service.authority.N`。
+- **srv_device**：根来源自持不导出；设定 `sources` 预签发 `device.source.<名>` 与 `.admin`；`Family::Stop` 观察 `instance.stop`，停止时释放根与未发布来源的 sender 并封根；`request.rs` 第四支以请求方 admin context 服务 `Revoke`/`QueryRevoked`。`libdevice::startup` 已删。
+- **srv_driver**：声明表由 `libdriver::boot::Catalog::from_settings` 解析（identity 为字符串，删 `image_bytes`、槽位常量与 `ManagerReady`）；映像为 `driver.image.<实现键>`；Stop RPC op1 删除，改为 `Family::Stop`；就绪经 `Reporter` 导出 `driver.control`/`driver.observer`。
+- **srv_init**：`platform`（按 `erhino_shared::platform` 取根，不依赖 libpci）、`executor`（组态执行：具名 Pool/Job、实例 Pool 按 ELF runs+主栈+出生页+`work_pages`、出生帧、报告校验、`after`、反拓扑停止与撤销门）、`terminal`（封 services、对已收撤销管理端发 Revoke、封平台根、有界收集、冷重启）。全部 feature、领域依赖与旧装配/服务级验收已删。
+- **test_kernel**：经 `Birth` 采用命名输入，部署模式来自设定 `mode`；保留子进程角色经设定 `role` 传递；私有 `lib.rs` 出生帧删除。
+- **组态与构建**：`user/formations/` 下 `system`、`acceptance`、`fp`、`stress`、`memory` 与各 `mode-*` 源；Justfile 以 `ERHINO_FORMATION` 选组态，`make_initfs` 编译组态并只装入其引用映像，根目录为 `formation` 与 `image/<组件>`。
+
+失去的覆盖（按 AGENTS 过渡设施口径删除，不登记债务）：`test_fs`、`test_device` 与 init 内服务级验收（fs/registry/copy/secondary 生命周期、device/driver 自检、function-session、reuse/candidates/retry-race、manager/controller fault、reset-rejection、fs-stop-order）；init 根监督的 failure-isolation、dispatcher funding、startup capture、idle ownership 自检；test_kernel 的 SystemReset 负路径与 held Pool 跨进程报告比对。`tools/` 中依赖已删路径的观察器与 `qemu-acceptance.sh` 的锚点未更新，等待用户清理验收设施时一并处理。
+
+未闭合：运行期正确性未验证；`irq-retirement` 等引用已删 recipe 的工具脚本残留；完成门 1–5 均待运行期证据。
 
 ### 接线与责任
 

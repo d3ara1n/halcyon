@@ -159,17 +159,22 @@ impl Image {
         }
     }
     pub fn adopt(capability: Capability, length: usize) -> Result<Self, SystemCallError> {
+        if length == 0 {
+            return Err(SystemCallError::RightsDenied);
+        }
+        Self::adopt_with(capability, Some(length))
+    }
+    /// `length` 缺省时取封存对象的整页长度。
+    fn adopt_with(capability: Capability, length: Option<usize>) -> Result<Self, SystemCallError> {
         let info = capability.description()?;
-        if info.kind != ObjectKind::MemoryObject as u32
-            || info.rights != IMAGE_RIGHTS
-            || length == 0
-        {
+        if info.kind != ObjectKind::MemoryObject as u32 || info.rights != IMAGE_RIGHTS {
             return Err(SystemCallError::RightsDenied);
         }
         // SAFETY: 实际类型已核，唯一关闭责任移入。
         let object = unsafe { MemoryObject::from_handle(capability.into_raw()) };
         let snapshot = object.query()?;
         let size = usize::try_from(snapshot.bytes).map_err(|_| SystemCallError::IllegalArgument)?;
+        let length = length.unwrap_or(size);
         if snapshot.state != MemoryObjectState::Executable as u32
             || length > size
             || size > isize::MAX as usize
@@ -177,6 +182,10 @@ impl Image {
             return Err(SystemCallError::IllegalArgument);
         }
         Ok(Self { object, length })
+    }
+    /// 以封存对象的整页长度采用映像；ELF 解析只按自身头部取界，尾部零填充无影响。
+    pub fn adopt_sealed(capability: Capability) -> Result<Self, SystemCallError> {
+        Self::adopt_with(capability, None)
     }
     /// 映像读取方按需要持有只读映射；构造方和能力转交者无需映入完整映像。
     pub fn map(&self) -> Result<ImageView, SystemCallError> {

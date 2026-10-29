@@ -1,0 +1,5 @@
+# D64 浮点验收：仅用于有兼容 D64 域的平台；nofd 组态不叠加本层。
+[instance.fp]
+image = "test_fp"
+kind = "task"
+pool = { work_pages = 256, metadata_bytes = 262144 }

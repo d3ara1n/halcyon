@@ -750,7 +750,7 @@ Managed 从 Claim 至功能安装采用一次绝对 40s 部署准备窗口：本
 
 ### Retry 观察器缺陷（2026-10-29）
 
-**状态与归属：已确认的既有观察器缺陷，与 init 组态切面 A 无关，未修；owner 为本设备计划。** `acceptance-device-retry-race` 因该缺陷不能建立迟到窗口，不计通过。触发条件为下次需要 retry-race 证据时；须在复用该证据前修复观察器并补证，不在切面 A 修复或为归因继续重跑。
+**状态与归属：已确认的既有观察器缺陷，与 init 组态切面 A 无关，未修；按 AGENTS“验证”的过渡设施口径不再主动维护。** `acceptance-device-retry-race` 因该缺陷不能建立迟到窗口，不计通过；Control Retry 的迟到窗口当前没有运行证据。需要该证据时再修复观察器并补证，或删除该路线并在届时的工作记录写明失去的覆盖。
 
 [`qemu_driver_retry_gdb.py`](../tools/qemu_driver_retry_gdb.py) 第193、215行执行 `frame.read_var('self')`；本轮第193行的检查点按control.rs:176落在 `Request::commit_retry`。该函数是关联函数，签名为 `fn commit_retry(retry: &Retry, reply: &librpc::Reply, world: &mut World<'_>) -> Result<(), Error>`，没有self（[`control.rs:176–180`](../user/services/srv_driver/src/server/control.rs)）。两棵树的readelf均显示入口只有retry/reply/world，位置分别为DW_OP_fbreg +936/+944/+952，没有入口self的DW_AT_location。观察器与函数签名不匹配是确定首因，ELF是否逐字相同不影响这一事实；不能据此认定产品Retry合同失败。
 

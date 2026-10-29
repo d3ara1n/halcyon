@@ -1,0 +1,5 @@
+# stress：竞态矩阵、自动退休与控制面压力；主进程、pm、两 hammer 与并发目标取五份工作集。
+[instance.kernel]
+pool = { work_pages = 20480, metadata_bytes = 5242880 }
+inputs."kernel.image.test_hammer" = "init/image.test_hammer"
+settings.mode = ["stress"]

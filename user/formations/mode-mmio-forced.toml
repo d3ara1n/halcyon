@@ -1,0 +1,3 @@
+# 资源专项：在 core 内核验收上选择 mmio_forced 模式。
+[instance.kernel]
+settings.mode = ["mmio_forced"]

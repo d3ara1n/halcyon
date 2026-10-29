@@ -1,0 +1,11 @@
+[package]
+name = "settings"
+authors = ["Dearain (d3ara1n@outlook.com)"]
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# 组态编译器在 host 侧构造并编码设定；服务只用只读解析，不启用。
+encode = []
+
+[dependencies]

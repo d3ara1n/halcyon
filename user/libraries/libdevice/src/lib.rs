@@ -20,7 +20,6 @@ pub mod provision;
 pub mod publication;
 pub mod registry;
 pub mod resource;
-pub mod startup;
 pub mod watch;
 
 /// 领域错误；运输层的 Unsent/Unknown 仍由 librpc 保持。

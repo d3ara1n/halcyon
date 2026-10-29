@@ -5,7 +5,10 @@ use libdevice::{
     registry::Scope,
 };
 use libexecution::runtime::SourcePlan;
-use libkernel::ipc::packet::Packet;
+
+/// 管理入口与公开观察入口的导出名。
+const CONTROL_EXPORT: &str = "driver.control";
+const OBSERVER_EXPORT: &str = "driver.observer";
 
 #[derive(Clone, Copy)]
 enum Operation {
@@ -17,7 +20,6 @@ enum Operation {
     Ack,
 }
 pub(super) struct Manager {
-    bootstrap: Option<MailboxSender>,
     control: Option<MailboxSender>,
     observer: Option<MailboxSender>,
     watch: Option<libdevice::client::Watch>,
@@ -137,9 +139,8 @@ impl Manager {
         }
         Ok(())
     }
-    pub fn new(bootstrap: MailboxSender, control: MailboxSender, observer: MailboxSender) -> Self {
+    pub fn new(control: MailboxSender, observer: MailboxSender) -> Self {
         Self {
-            bootstrap: Some(bootstrap),
             control: Some(control),
             observer: Some(observer),
             watch: None,
@@ -397,45 +398,25 @@ impl Manager {
             return Ok(advance(Step::Runnable));
         }
         if self.watch.is_some() && !world.ready {
-            let ready = libdriver::boot::ManagerReady {
-                control: world.incarnation,
-                observer: object::query(
-                    world
-                        .observer_mailbox
-                        .as_ref()
-                        .ok_or(SystemCallError::ObjectClosed)?
-                        .as_handle(),
-                )?
-                .object_id,
+            let reporter = world
+                .reporter
+                .as_mut()
+                .ok_or(SystemCallError::ObjectClosed)?;
+            for (name, sender) in [
+                (CONTROL_EXPORT, &mut self.control),
+                (OBSERVER_EXPORT, &mut self.observer),
+            ] {
+                let sender = sender.take().expect("driver startup entry missing");
+                reporter
+                    .export(
+                        name,
+                        sender.into_capability(),
+                        TRANSPORT,
+                        Deadline::INFINITE,
+                    )
+                    .map_err(|(_, error)| error)?;
             }
-            .encode()
-            .unwrap_or_else(|e| fatal(e));
-            let mut packet = Packet::new(protocol::BOOT_READY, &ready)?;
-            packet
-                .push(
-                    self.control
-                        .take()
-                        .expect("driver startup control missing")
-                        .into_capability(),
-                    TRANSPORT,
-                )
-                .map_err(|failure| failure.error)?;
-            packet
-                .push(
-                    self.observer
-                        .take()
-                        .expect("driver startup observer missing")
-                        .into_capability(),
-                    TRANSPORT,
-                )
-                .map_err(|failure| failure.error)?;
-            packet
-                .try_send(
-                    self.bootstrap.as_ref().expect("driver bootstrap missing"),
-                    Deadline::INFINITE,
-                )
-                .map_err(|failure| failure.error)?;
-            self.bootstrap = None;
+            reporter.ready(&[], Deadline::INFINITE)?;
             world.ready = true;
             libkernel::debug!(
                 "driver manager ready; declarations={}, device Watch installed",

@@ -1,38 +1,132 @@
-//! 出生输入采用与进程角色分派；命名出生契约接通前只接受 init 签发的私有帧。
+//! 出生输入采用与进程角色分派：主验收进程由组态启动，保留 fixture 子进程由主进程自启动。
 use super::*;
-use libkernel::shared::memory_pool::MemoryPoolSnapshot;
 use libkernel::shared::object::ObjectKind;
-use libprocess::context::{CurrentProcessInfo, InitialGrants};
+use libpci::platform::{DESCRIPTION_RIGHTS, DescriptionObject, Platform, ROOT_RIGHTS};
+use libprocess::birth::Birth;
+use libprocess::context::CurrentProcessInfo;
 use libprocess::image::{IMAGE_RIGHTS, Image, ImageView};
-use test_kernel::birth::{Frame, Input, Role};
+use libservice::instance;
 
-/// 平台根别名的权利；与 init 签发时一致，采用时逐项核验。
-pub(super) const PLATFORM_ROOT_RIGHTS: Rights = Rights::from_raw(
+/// 平台根别名的权利；与组态默认签发一致。
+pub(super) const PLATFORM_ROOT_RIGHTS: Rights = ROOT_RIGHTS;
+/// 主付款 Pool 的权利：race 需 TRANSIT 把付款授权交给 hammer。
+const MAIN_POOL_RIGHTS: Rights = Rights::from_raw(
     Rights::READ.raw()
-        | Rights::WRITE.raw()
-        | Rights::WAIT.raw()
-        | Rights::MANAGE.raw()
         | Rights::CREATE.raw()
         | Rights::DUPLICATE.raw()
         | Rights::TRANSIT.raw()
         | Rights::GRANT.raw(),
 );
-/// retention Pool 与保留子进程付款 Pool 的权利；不含 TRANSIT，别名不再外传。
+/// retention Pool 与保留子进程付款 Pool 的权利。
 const RETENTION_POOL_RIGHTS: Rights = Rights::from_raw(
     Rights::READ.raw() | Rights::CREATE.raw() | Rights::DUPLICATE.raw() | Rights::GRANT.raw(),
 );
+const POOL: &str = "memory.pool";
+const JOB: &str = "kernel.job";
+const RETENTION: &str = "kernel.retention";
+const DMA_ROOT: &str = "kernel.dma";
+const IMAGE_PM: &str = "kernel.image.srv_pm";
+const IMAGE_TARGET: &str = "kernel.image.test_target";
+const IMAGE_HAMMER: &str = "kernel.image.test_hammer";
+const IMAGE_SELF: &str = "kernel.image.test_kernel";
+
+/// 部署模式位，由组态设定 `mode` 列表选择。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct Mode(u32);
+impl Mode {
+    pub const STRESS: u32 = 1;
+    pub const MEMORY: u32 = 1 << 1;
+    pub const MMIO_PUBLICATION: u32 = 1 << 2;
+    pub const MMIO_FORCED: u32 = 1 << 3;
+    pub const DMA_RACES: u32 = 1 << 4;
+    pub const DMA_SHARED: u32 = 1 << 5;
+    pub const DMA_QUOTA: u32 = 1 << 6;
+    pub const DMA_INSTALL_FAILURE: u32 = 1 << 7;
+    pub const IRQ_EXIT: u32 = 1 << 8;
+    const NAMES: [(&'static str, u32); 9] = [
+        ("stress", Self::STRESS),
+        ("memory", Self::MEMORY | Self::STRESS),
+        ("mmio_publication", Self::MMIO_PUBLICATION),
+        ("mmio_forced", Self::MMIO_FORCED),
+        ("dma_races", Self::DMA_RACES),
+        ("dma_shared", Self::DMA_SHARED),
+        ("dma_quota", Self::DMA_QUOTA),
+        ("dma_install_failure", Self::DMA_INSTALL_FAILURE),
+        ("irq_exit", Self::IRQ_EXIT),
+    ];
+    pub fn has(self, flag: u32) -> bool {
+        self.0 & flag != 0
+    }
+    pub fn stress(self) -> bool {
+        self.has(Self::STRESS)
+    }
+    /// memory 部署复用 stress 的线程套件。
+    pub fn memory(self) -> bool {
+        self.has(Self::MEMORY)
+    }
+}
+
+/// 进程角色：主验收进程，或主进程为跨 reset 保留 fixture 自启动的子进程。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Main,
+    RetainExposed,
+    RetainFault,
+}
+impl Role {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Main => "main",
+            Self::RetainExposed => "retain_exposed",
+            Self::RetainFault => "retain_fault",
+        }
+    }
+}
+
+struct Settings {
+    mode: Mode,
+    role: Role,
+}
+fn parse_settings(bytes: &[u8]) -> Settings {
+    let root = settings::Settings::parse(bytes)
+        .expect("kernel acceptance settings invalid")
+        .root();
+    root.only(&["mode", "role"])
+        .expect("kernel acceptance settings key unknown");
+    let mut mode = 0;
+    if let Some(list) = root.get("mode") {
+        for value in list.as_list().expect("mode is a list").iter() {
+            let name = value.as_str().expect("mode entry is a string");
+            mode |= Mode::NAMES
+                .iter()
+                .find(|(text, _)| *text == name)
+                .expect("mode entry unknown")
+                .1;
+        }
+    }
+    let role = match root.get("role").map(|value| value.as_str()) {
+        None => Role::Main,
+        Some(Ok("retain_exposed")) => Role::RetainExposed,
+        Some(Ok("retain_fault")) => Role::RetainFault,
+        _ => panic!("kernel acceptance role invalid"),
+    };
+    Settings {
+        mode: Mode(mode),
+        role,
+    }
+}
 
 struct Context {
     process: CurrentProcessInfo,
     pool: Handle,
     mode: Mode,
-    role: Role,
+    child: bool,
     roots: [Option<Handle>; 3],
     retention: Option<Handle>,
     self_image: Option<(usize, usize)>,
-    target: Option<(Handle, usize)>,
-    /// 最近一次保留子进程收集后的 retention 快照与已运行的保留 fixture 数。
-    retained: Option<(MemoryPoolSnapshot, u64)>,
+    target: Option<Handle>,
+    /// 最近一次保留子进程收集后的 retention 页数与已运行的保留 fixture 数。
+    retained: Option<(u64, u64)>,
 }
 static CONTEXT: Mutex<SimpleLock, Option<Context>> = Mutex::const_new(SimpleLock::new(), None);
 
@@ -56,7 +150,7 @@ pub(super) fn mode() -> Mode {
 }
 /// 本进程是否为保留 fixture 子进程。
 pub(super) fn retention_child() -> bool {
-    with(|ctx| ctx.role != Role::Main)
+    with(|ctx| ctx.child)
 }
 pub(super) fn ecam_handle() -> Option<Handle> {
     with(|ctx| ctx.roots[0])
@@ -68,101 +162,115 @@ pub(super) fn dma_handle() -> Option<Handle> {
     with(|ctx| ctx.roots[2])
 }
 
-fn take(grants: &mut InitialGrants, frame: &Frame, input: Input) -> Option<Capability> {
-    frame.slot(input).map(|slot| {
-        grants
-            .take(slot as usize)
-            .expect("kernel acceptance input missing or duplicated")
-    })
-}
-fn checked(cap: Capability, kind: ObjectKind, rights: Rights) -> Capability {
-    let description = cap
-        .description()
-        .expect("kernel acceptance input query failed");
-    assert_eq!(
-        description.kind, kind as u32,
-        "kernel acceptance input kind mismatch"
-    );
-    assert_eq!(
-        description.rights, rights,
-        "kernel acceptance input rights mismatch"
-    );
-    cap
-}
-fn image(grants: &mut InitialGrants, frame: &Frame, input: Input) -> Option<(Image, ImageView)> {
-    let length = frame.image_length(input);
-    let capability = take(grants, frame, input);
-    assert_eq!(
-        capability.is_some(),
-        length != 0,
-        "kernel acceptance image length mismatch"
-    );
-    capability.map(|cap| {
-        let image = Image::adopt(
-            cap,
-            usize::try_from(length).expect("kernel acceptance image too long"),
-        )
-        .expect("kernel acceptance image invalid");
-        let view = image.map().expect("kernel acceptance image mapping failed");
-        (image, view)
-    })
+fn image(birth: &mut Birth, name: &str) -> Option<(Image, ImageView)> {
+    birth
+        .take(name, ObjectKind::MemoryObject, IMAGE_RIGHTS)
+        .expect("kernel acceptance image input invalid")
+        .map(|cap| {
+            let image = Image::adopt_sealed(cap).expect("kernel acceptance image invalid");
+            let view = image.map().expect("kernel acceptance image mapping failed");
+            (image, view)
+        })
 }
 
 /// 采用全部出生输入后按角色分派；任何输入不符即 panic，由 init 判为验收失败。
 pub(super) fn run() {
-    let (process, payload, mut grants) = libruntime::startup::take()
-        .expect("kernel acceptance startup missing")
-        .into_parts();
-    let frame = Frame::decode(payload.as_bytes()).expect("kernel acceptance birth frame invalid");
-    let pool_rights = if frame.role == Role::Main {
-        RETENTION_POOL_RIGHTS | Rights::TRANSIT
-    } else {
-        RETENTION_POOL_RIGHTS
+    let mut birth =
+        Birth::adopt(libruntime::startup::take().expect("kernel acceptance startup missing"))
+            .expect("kernel acceptance birth frame invalid");
+    let settings = parse_settings(birth.settings());
+    // task 不报告就绪；生命周期输入只取用即关闭。
+    for (name, kind, rights) in [
+        (
+            instance::REPORT,
+            instance::REPORT_KIND,
+            instance::REPORT_RIGHTS,
+        ),
+        (instance::STOP, instance::STOP_KIND, instance::STOP_RIGHTS),
+    ] {
+        drop(
+            birth
+                .take(name, kind, rights)
+                .expect("kernel acceptance lifecycle input invalid"),
+        );
+    }
+    let child = settings.role != Role::Main;
+    let pool = birth
+        .require(
+            POOL,
+            ObjectKind::MemoryPool,
+            if child {
+                RETENTION_POOL_RIGHTS
+            } else {
+                MAIN_POOL_RIGHTS
+            },
+        )
+        .expect("kernel acceptance Pool input invalid");
+    let job = birth
+        .require(JOB, ObjectKind::Job, JOB_FULL_RIGHTS)
+        .expect("kernel acceptance Job input invalid");
+    let retention = birth
+        .take(RETENTION, ObjectKind::MemoryPool, RETENTION_POOL_RIGHTS)
+        .expect("kernel acceptance retention input invalid");
+    let self_image = image(&mut birth, IMAGE_SELF);
+    let pm = image(&mut birth, IMAGE_PM);
+    let target = image(&mut birth, IMAGE_TARGET);
+    let hammer = image(&mut birth, IMAGE_HAMMER);
+    // 主进程按平台描述识别 ECAM/IRQ/DMA 根；保留子进程只收 DMA 根别名。
+    let child_dma = birth
+        .take(DMA_ROOT, ObjectKind::DmaDomainControl, PLATFORM_ROOT_RIGHTS)
+        .expect("kernel acceptance DMA root input invalid");
+    let platform = birth
+        .take(
+            "platform.description",
+            ObjectKind::MemoryObject,
+            DESCRIPTION_RIGHTS,
+        )
+        .expect("kernel acceptance platform description input invalid")
+        .map(|description| {
+            let roots = birth
+                .take_list(
+                    "platform.root",
+                    &[
+                        ObjectKind::MmioControl,
+                        ObjectKind::IrqControl,
+                        ObjectKind::DmaDomainControl,
+                    ],
+                    PLATFORM_ROOT_RIGHTS,
+                )
+                .expect("kernel acceptance platform root input invalid");
+            Platform::adopt(
+                DescriptionObject::adopt(description).expect("platform description invalid"),
+                roots,
+            )
+            .expect("platform roots invalid")
+        });
+    let process = birth.process();
+    birth
+        .finish()
+        .expect("kernel acceptance birth has unclaimed inputs");
+    let roots = match (&platform, &child_dma) {
+        (Some(platform), _) => [
+            platform.ecam_handle(),
+            platform.irq_handle(),
+            platform.dma_handle(),
+        ],
+        (None, dma) => [None, None, dma.as_ref().map(Capability::as_handle)],
     };
-    let pool = checked(
-        take(&mut grants, &frame, Input::Pool).expect("kernel acceptance Pool missing"),
-        ObjectKind::MemoryPool,
-        pool_rights,
-    );
-    let job = checked(
-        take(&mut grants, &frame, Input::Job).expect("kernel acceptance Job missing"),
-        ObjectKind::Job,
-        JOB_FULL_RIGHTS,
-    );
-    let reset = take(&mut grants, &frame, Input::Reset)
-        .map(|cap| checked(cap, ObjectKind::SystemReset, Rights::DUPLICATE));
-    let retention = take(&mut grants, &frame, Input::Retention)
-        .map(|cap| checked(cap, ObjectKind::MemoryPool, RETENTION_POOL_RIGHTS));
-    let self_image = image(&mut grants, &frame, Input::SelfImage);
-    let report = take(&mut grants, &frame, Input::Report);
-    let pm = image(&mut grants, &frame, Input::Pm);
-    let target = image(&mut grants, &frame, Input::Target);
-    let hammer = image(&mut grants, &frame, Input::Hammer);
-    let roots: [Option<Capability>; 3] = core::array::from_fn(|index| {
-        let (input, kind) = [
-            (Input::Mmio, ObjectKind::MmioControl),
-            (Input::Irq, ObjectKind::IrqControl),
-            (Input::Dma, ObjectKind::DmaDomainControl),
-        ][index];
-        take(&mut grants, &frame, input).map(|cap| checked(cap, kind, PLATFORM_ROOT_RIGHTS))
-    });
-    assert_eq!(grants.remaining(), 0, "kernel acceptance has extra inputs");
     *CONTEXT.lock() = Some(Context {
         process,
         pool: pool.as_handle(),
-        mode: frame.mode,
-        role: frame.role,
-        roots: core::array::from_fn(|index| roots[index].as_ref().map(Capability::as_handle)),
+        mode: settings.mode,
+        child,
+        roots,
         retention: retention.as_ref().map(Capability::as_handle),
         self_image: self_image
             .as_ref()
             .map(|(_, view)| (view.bytes().as_ptr() as usize, view.bytes().len())),
-        target: target
-            .as_ref()
-            .map(|(image, view)| (image.handle(), view.bytes().len())),
+        target: target.as_ref().map(|(image, _)| image.handle()),
         retained: None,
     });
-    let fixture = match frame.role {
+    let fixture = match settings.role {
         Role::Main => None,
         Role::RetainExposed => Some(b"dma-exposed".as_slice()),
         Role::RetainFault => Some(b"dma-output-fault".as_slice()),
@@ -195,55 +303,22 @@ pub(super) fn run() {
     harness
         .collect_job(job.as_handle())
         .expect("kernel acceptance Job collection failed");
-    check_reset_authority(
-        job.as_handle(),
-        reset
-            .as_ref()
-            .expect("kernel acceptance reset alias missing")
-            .as_handle(),
-    );
-    if let Some((snapshot, fixtures)) = with(|ctx| ctx.retained) {
-        // 每个保留 fixture 跨 reset 留下的页数由 dma_checks 拥有；init 只比对报告后不变。
+    if let Some((pages, fixtures)) = with(|ctx| ctx.retained) {
         assert_eq!(
-            snapshot.allocated,
+            pages,
             fixtures * dma_checks::RETAINED_PAGES_PER_FIXTURE,
             "retention Pool did not preserve exactly the retained DMA pages"
         );
-        let bytes = test_kernel::report::encode_pool(snapshot);
-        // SAFETY: report 是本进程出生专属 sender，无能力移交；错误使验收失败。
-        unsafe {
-            send_raw(
-                report
-                    .as_ref()
-                    .expect("kernel acceptance report missing")
-                    .as_handle(),
-                test_kernel::report::KIND,
-                &bytes,
-                &[],
-            )
-        }
-        .expect("kernel acceptance retention report failed");
     }
+    drop(platform);
     debug!("kernel acceptance completed");
-}
-
-/// SystemReset 的对象类型与权限负路径：Job 句柄类型不符，衰减别名权利不足；不提交成功动作。
-fn check_reset_authority(job: Handle, reset: Handle) {
-    assert!(matches!(
-        system::reset(job, ResetAction::Shutdown, ResetReason::Requested),
-        Err(SystemCallError::WrongObjectType)
-    ));
-    assert!(matches!(
-        system::reset(reset, ResetAction::Shutdown, ResetReason::Requested),
-        Err(SystemCallError::RightsDenied)
-    ));
-    debug!("system reset authority checks passed");
 }
 
 /// 在绑定 retention Pool 的自启动子进程中运行跨 reset 保留的 fixture；主 Pool 不留下跨收集计费。
 pub(super) fn retained_fixture(job: Handle, fixture: &[u8]) -> Result<(), &'static str> {
+    use alloc::{collections::BTreeMap, string::String};
     use libprocess::GrantOutcome;
-    let (pool, (address, length), (target, target_length)) = with(|ctx| {
+    let (pool, (address, length), target) = with(|ctx| {
         Ok((
             ctx.retention.ok_or("retention Pool missing")?,
             ctx.self_image.ok_or("retention self image missing")?,
@@ -255,16 +330,21 @@ pub(super) fn retained_fixture(job: Handle, fixture: &[u8]) -> Result<(), &'stat
     } else {
         Role::RetainExposed
     };
-    let mut frame = Frame::new(Mode(0), role);
-    frame.set_image_length(Input::Target, target_length as u64);
+    let mut table = BTreeMap::new();
+    table.insert(
+        String::from("role"),
+        settings::Owned::Str(role.name().into()),
+    );
+    let encoded = settings::encode(&table).map_err(|_| "retention settings encoding failed")?;
     let mut owners = alloc::vec::Vec::new();
     let mut grants = alloc::vec::Vec::new();
-    for (input, source, rights) in [
-        (Input::Pool, pool, RETENTION_POOL_RIGHTS),
-        (Input::Job, job, JOB_FULL_RIGHTS),
-        (Input::Target, target, IMAGE_RIGHTS),
+    let mut inputs = alloc::vec::Vec::new();
+    for (name, source, rights) in [
+        (POOL, pool, RETENTION_POOL_RIGHTS),
+        (JOB, job, JOB_FULL_RIGHTS),
+        (IMAGE_TARGET, target, IMAGE_RIGHTS),
         (
-            Input::Dma,
+            DMA_ROOT,
             dma_handle().ok_or("retention DMA root missing")?,
             PLATFORM_ROOT_RIGHTS,
         ),
@@ -272,11 +352,12 @@ pub(super) fn retained_fixture(job: Handle, fixture: &[u8]) -> Result<(), &'stat
         let handle = duplicate(source, rights).map_err(|_| "retention grant duplicate failed")?;
         // SAFETY: duplicate 返回的新表项由此唯一采用，按 GrantOutcome 兑现移交。
         owners.push(unsafe { Capability::from_raw(handle) });
-        frame.set_slot(input, grants.len() as u8);
+        inputs.push((name, grants.len() as u8));
         grants.push(HandleGrant { handle, rights });
     }
-    let payload = frame.encode();
-    // SAFETY: self_image 与只读 ImageView 由 run 栈持有至进程结束，已核 sealed 长度。
+    let payload = libprocess::birth::encode(&inputs, &encoded)
+        .map_err(|_| "retention birth frame encoding failed")?;
+    // SAFETY: self_image 与只读 ImageView 由 run 栈持有至进程结束。
     let bytes = unsafe { core::slice::from_raw_parts(address as *const u8, length) };
     let result = spawn(SpawnRequest {
         memory_pool: pool,
@@ -313,7 +394,7 @@ pub(super) fn retained_fixture(job: Handle, fixture: &[u8]) -> Result<(), &'stat
     let mut guard = CONTEXT.lock();
     let ctx = guard.as_mut().expect("kernel acceptance startup missing");
     let fixtures = ctx.retained.map_or(0, |(_, count)| count) + 1;
-    ctx.retained = Some((snapshot, fixtures));
+    ctx.retained = Some((snapshot.allocated, fixtures));
     Ok(())
 }
 

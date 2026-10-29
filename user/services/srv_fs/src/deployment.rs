@@ -1,5 +1,5 @@
 //! 有限部署的入口、工作集与故障检测政策。
-use crate::startup::Profile;
+use crate::startup::Config;
 use erhino_shared::{call::SystemCallError, object::Rights};
 
 pub fn root_output_transport() -> Rights {
@@ -17,7 +17,8 @@ pub const GRANTS: usize = 16;
 pub const ROLES: usize = 16;
 pub const REGISTRATIONS: usize = 16;
 pub const WATCHES: usize = 24;
-pub const MAX_ENTRIES: usize = Profile::AcceptancePrimary.entries();
+/// 每入口最多四个导出，组态单实例导出上限为 32，故入口不超过 8。
+pub const MAX_ENTRIES: usize = 8;
 pub const REQUESTS: usize = 16;
 pub const SESSIONS: usize = GRANTS;
 pub const OFFER_WINDOW_NS: u64 = 5_000_000_000;
@@ -32,18 +33,18 @@ pub const HEAP_PAGES: usize = 4096;
 /// 映射与对象/能力/来源/退休峰值的部署 metadata 工作集。
 pub const METADATA_BYTES: usize = 1024 * 1024;
 
+/// 运行体容量：固定 ingress/退休/释放/维护/Dispatcher 与实际入口数的 Root 推导。
 #[derive(Clone, Copy)]
 pub struct Capacity {
-    pub profile: Profile,
     pub tasks: usize,
     pub sources: usize,
 }
 impl Capacity {
-    pub fn new(profile: Profile) -> Result<Self, SystemCallError> {
-        // 固定 ingress/退休/释放/维护/Dispatcher，加实际入口的四种 Root。
-        let roots = profile
+    pub fn new(config: &Config<'_>) -> Result<Self, SystemCallError> {
+        let roots = config
             .entries()
-            .checked_mul(if profile.registry() { 4 } else { 2 })
+            .len()
+            .checked_mul(if config.registry { 4 } else { 2 })
             .ok_or(SystemCallError::ReachLimit)?;
         let tasks = (GRANTS + 2 * ROLES + REGISTRATIONS + 2 * WATCHES + REQUESTS + SESSIONS + 6)
             .checked_add(roots)
@@ -59,25 +60,6 @@ impl Capacity {
             + 1)
         .checked_add(roots)
         .ok_or(SystemCallError::ReachLimit)?;
-        Ok(Self {
-            profile,
-            tasks,
-            sources,
-        })
-    }
-    pub const fn entry_watches(self, entry: usize) -> usize {
-        if matches!(self.profile, Profile::AcceptancePrimary) && entry == 0 {
-            WATCHES / 2
-        } else {
-            WATCHES
-        }
-    }
-    pub const fn entry_sessions(self, entry: usize) -> usize {
-        if matches!(self.profile, Profile::AcceptancePrimary) && entry == 0 {
-            SESSIONS / 2
-        } else {
-            SESSIONS
-        }
+        Ok(Self { tasks, sources })
     }
 }
-const _: () = assert!(MAX_ENTRIES <= erhino_shared::message::MESSAGE_HANDLE_MAX);

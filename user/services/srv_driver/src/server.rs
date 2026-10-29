@@ -30,6 +30,7 @@ use librpc::{
     Request,
     dispatcher::{Dispatcher, ServiceOwner},
 };
+use libservice::instance::{self, child::Reporter};
 use ordered_table::OrderedTable;
 mod control;
 mod managed;
@@ -124,8 +125,54 @@ impl Run {
             })
     }
 }
+/// 观察 `instance.stop`：监督方 signal 或关闭即请求停止，与原管理停止同一效果。
+struct StopWatch {
+    owner: Capability,
+    source: SourceRegistration,
+    stopping: bool,
+}
+const STOP_KIND: u64 = 1;
+impl StopWatch {
+    fn advance(
+        &mut self,
+        world: &mut World<'_>,
+        requests: &mut Requests<'_, Family>,
+        input: &mut Input<'_>,
+    ) -> Result<Advance, SystemCallError> {
+        let mut requested = false;
+        while let Some(event) = input.pull() {
+            requested |=
+                event.kind == STOP_KIND && event.observed.intersects(instance::STOP_SIGNALS);
+        }
+        if requested && !world.stopping {
+            world.stopping = true;
+            requests.wake(world.manager_task)?;
+        }
+        if self.stopping || world.stopping {
+            self.source.remove(requests)?;
+            return Ok(advance(if self.source.is_empty() {
+                Step::Complete
+            } else {
+                Step::Runnable
+            }));
+        }
+        if self.source.is_empty() {
+            self.source.install(
+                requests,
+                libexecution::runtime::SourcePlan::new(
+                    self.owner.as_handle(),
+                    instance::STOP_SIGNALS,
+                ),
+                STOP_KIND,
+            )?;
+        }
+        Ok(advance(Step::Parked))
+    }
+}
 struct World<'a> {
     mailbox: Mailbox,
+    /// 就绪时由管理任务导出 control/observer；停止后报 Stopped。
+    reporter: Option<Reporter>,
     observer_mailbox: Option<Mailbox>,
     incarnation: u64,
     control_context: u64,
@@ -196,6 +243,7 @@ enum Family {
     Control(Box<control::Request>),
     Subscription(subscription::Subscription),
     Transport { deadline: Deadline, stopping: bool },
+    Stop(StopWatch),
 }
 impl Task<World<'_>> for Family {
     type Family = Self;
@@ -222,6 +270,7 @@ impl Task<World<'_>> for Family {
                 *deadline = world.rpc.deadline();
                 Ok(result)
             }
+            Self::Stop(task) => task.advance(world, requests, input),
         }
     }
     fn registered(&mut self, world: &mut World<'_>, kind: u64, source: SourceId) {
@@ -233,6 +282,7 @@ impl Task<World<'_>> for Family {
             Self::Control(task) => task.registered(kind, source),
             Self::Subscription(task) => task.registered(kind, source),
             Self::Transport { .. } => world.rpc.registered(&mut (), kind, source),
+            Self::Stop(task) => task.source.registered(kind, source),
         }
     }
     fn unregistered(&mut self, world: &mut World<'_>, kind: u64, source: SourceId) {
@@ -244,6 +294,9 @@ impl Task<World<'_>> for Family {
             Self::Control(task) => task.unregistered(kind, source),
             Self::Subscription(task) => task.unregistered(source),
             Self::Transport { .. } => world.rpc.unregistered(&mut (), kind, source),
+            Self::Stop(task) => {
+                task.source.unregistered(source);
+            }
         }
     }
     fn refused(&mut self, world: &mut World<'_>, failure: RequestFailure<Self>) {
@@ -267,6 +320,7 @@ impl Task<World<'_>> for Family {
             Self::Control(task) => task.stop(),
             Self::Subscription(task) => task.stop(),
             Self::Transport { stopping, .. } => *stopping = true,
+            Self::Stop(task) => task.stopping = true,
         }
     }
     fn deadline(&self) -> Deadline {
@@ -278,19 +332,32 @@ impl Task<World<'_>> for Family {
             Self::Control(task) => task.deadline(),
             Self::Subscription(task) => task.deadline(),
             Self::Transport { deadline, .. } => *deadline,
+            Self::Stop(_) => Deadline::INFINITE,
         }
     }
 }
 
-pub(super) fn run(
-    process: CurrentProcessInfo,
-    bootstrap: MailboxSender,
-    pool: Capability,
-    job: Capability,
-    claim: MailboxSender,
-    catalog: Catalog<'_>,
-    images: Vec<Image>,
-) {
+pub(super) struct Startup<'a> {
+    pub process: CurrentProcessInfo,
+    pub reporter: Reporter,
+    pub stop: Capability,
+    pub pool: Capability,
+    pub job: Capability,
+    pub claim: MailboxSender,
+    pub catalog: Catalog<'a>,
+    pub images: Vec<Image>,
+}
+pub(super) fn run(startup: Startup<'_>) {
+    let Startup {
+        process,
+        reporter,
+        stop,
+        pool,
+        job,
+        claim,
+        catalog,
+        images,
+    } = startup;
     let input = Runtime::<Family, WaitSet>::fixed_input_budget(WAIT_SOURCES)
         .and_then(|fixed| {
             Runtime::<Family, WaitSet>::source_input_budget(WAIT_SOURCES).and_then(|sources| {
@@ -336,6 +403,7 @@ pub(super) fn run(
     let claim = Arc::try_new(claim).expect("driver ClaimSource storage failed");
     let mut world = World {
         mailbox,
+        reporter: Some(reporter),
         observer_mailbox: Some(observer_mailbox),
         incarnation: control_info.related_object_id,
         control_context: control_info.object_id,
@@ -386,7 +454,7 @@ pub(super) fn run(
     );
     world.manager_task = spawn(
         &mut runtime,
-        Family::Manager(Manager::new(bootstrap, control.sender, observer.sender)),
+        Family::Manager(Manager::new(control.sender, observer.sender)),
         1,
     );
     spawn(
@@ -402,6 +470,15 @@ pub(super) fn run(
             Ingress::new(observer_handle, true).expect("driver observer ingress failed"),
         ),
         2,
+    );
+    spawn(
+        &mut runtime,
+        Family::Stop(StopWatch {
+            owner: stop,
+            source: SourceRegistration::new(),
+            stopping: false,
+        }),
+        1,
     );
     let mut stopping = false;
     loop {
@@ -447,10 +524,17 @@ pub(super) fn run(
     assembly
         .close()
         .unwrap_or_else(|(_, error)| panic!("driver assembly close failed: {error:?}"));
+    let reporter = world
+        .reporter
+        .take()
+        .expect("driver reporter remains owned");
     drop(world);
     assert!(
         budget.is_empty(),
         "driver manager retained execution budget"
     );
     libkernel::debug!("driver manager stopped; bindings and worker processes collected");
+    reporter
+        .stopped(Deadline::INFINITE)
+        .expect("driver stopped report failed");
 }

@@ -39,11 +39,9 @@ use libkernel::{
         message::{HandleMove, MAILBOX_CAPACITY},
         object::{Handle, ObjectSignals, Rights},
         proc::{HandleGrant, JobMemberKind, JobState, ProcessState, TerminationCause},
-        reset::{ResetAction, ResetReason},
         wait::WaitReason,
         wait_set::MemberRequest,
     },
-    system,
 };
 use libprocess::{
     DEFAULT_SUPERVISION_POLICY, DERIVED_CONTROL_RIGHTS, SpawnRequest, SupervisionCause,
@@ -60,8 +58,8 @@ use lock_api::Mutex;
 mod harness;
 use harness::Harness;
 mod startup;
+use startup::Mode;
 use startup::{current_pid, current_process, memory_pool, mode};
-use test_kernel::birth::Mode;
 mod building;
 mod dma_checks;
 mod ipc_checks;

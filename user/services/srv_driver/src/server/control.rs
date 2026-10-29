@@ -308,10 +308,6 @@ impl Request {
                 } else {
                     let error = if !self.authorized {
                         Some(Error::Permission)
-                    } else if self.header.op == 1 {
-                        world.stopping = true;
-                        requests.wake(world.manager_task)?;
-                        None
                     } else if self.header.op == 2 {
                         None
                     } else if self.header.op == protocol::MANAGER_RETRY {

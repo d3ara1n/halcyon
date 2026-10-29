@@ -9,6 +9,7 @@ extern crate alloc;
 
 pub mod authority;
 mod funding;
+pub mod instance;
 pub use funding::Funding;
 #[cfg(target_arch = "riscv64")]
 pub mod client;

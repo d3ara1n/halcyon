@@ -15,3 +15,6 @@ librpc = { path = "../../libraries/librpc" }
 librunnel = { path = "../../libraries/librunnel" }
 lock_api = "0.4"
 libdriver = { path = "../../libraries/libdriver" }
+libpci = { path = "../../libraries/libpci" }
+libservice = { path = "../../libraries/libservice" }
+settings = { path = "../../../shared/settings", features = ["encode"] }

@@ -1,47 +1,8 @@
-//! 首批 boot 配对来源。声明与对应只读映像在同次出生委托中交付。
+//! 驱动声明表与 worker 出生配置。声明表来自 srv_driver 的实例设定，映像为同名命名输入。
+use alloc::vec::Vec;
 use libdevice::Error;
-use librpc::bytes::{Reader, Writer};
 
-pub const BOOTSTRAP: usize = 0;
-pub const POOL: usize = 1;
-pub const DRIVER_JOB: usize = 2;
-pub const CLAIM_SOURCE: usize = 3;
-pub const IMAGE_BASE: usize = 4;
 pub const VERSION: u32 = 1;
-pub const HEADER_BYTES: usize = 8;
-pub const MANAGER_READY_CONTROL: usize = 0;
-pub const MANAGER_READY_OBSERVER: usize = 1;
-pub const MANAGER_READY_SLOTS: usize = 2;
-pub const MANAGER_READY_BYTES: usize = 16;
-
-/// 两队列的真实Mailbox KOID，与两个实际sender槽逐项核对；数字不授予权限。
-#[derive(Clone, Copy)]
-pub struct ManagerReady {
-    pub control: u64,
-    pub observer: u64,
-}
-impl ManagerReady {
-    pub fn encode(self) -> Result<[u8; MANAGER_READY_BYTES], Error> {
-        if self.control == 0 || self.observer == 0 || self.control == self.observer {
-            return Err(Error::Invalid);
-        }
-        let mut out = [0; MANAGER_READY_BYTES];
-        let mut w = Writer::new(&mut out);
-        w.u64(self.control);
-        w.u64(self.observer);
-        Ok(out)
-    }
-    pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        let mut r = Reader::new(bytes);
-        let info = Self {
-            control: r.u64()?,
-            observer: r.u64()?,
-        };
-        r.finish()?;
-        info.encode()?;
-        Ok(info)
-    }
-}
 
 /// 首批执行者的实际Pool配置：ABI主栈之外8 MiB映像/堆/执行存储，1 MiB内核元数据。
 pub const WORKER_POOL: erhino_shared::memory_pool::MemoryPoolBudget =
@@ -51,20 +12,20 @@ pub const WORKER_POOL: erhino_shared::memory_pool::MemoryPoolBudget =
         metadata: 1024 * 1024 / erhino_shared::memory_pool::METADATA_SLOT_BYTES,
     };
 
-/// 首批只使用有限的静态 identity 精确匹配；identity 的业务字段由 PCI/USB 等领域拥有。
-#[derive(Clone, Copy, Debug)]
+/// 一项驱动声明；`key` 即实现映像的组件名，srv_driver 据此取输入 `driver.image.<key>`。
+/// identity 的业务字段由 PCI/USB 等领域拥有，这里只做精确匹配。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Declaration<'a> {
     pub key: &'a str,
     pub identity: &'a [u8],
     pub priority: u32,
     /// 每个可复用进程可承载的绑定数，不是全实现的进程/Run上限。
     pub capacity: u32,
-    /// 实际装配是否允许多个绑定复用同一进程；与物理信任/子登记授权独立。
+    /// 是否允许多个绑定复用同一进程；与物理信任/子登记授权独立。
     pub reusable: bool,
-    /// init 的真实装配政策，不从程序自报数据、匹配字符串或路径授予。
+    /// 装配政策授予，不从程序自报数据、匹配字符串或路径授予。
     pub child_registrar: bool,
     pub trusted_physical: bool,
-    pub image_bytes: u64,
 }
 impl Declaration<'_> {
     fn validate(&self) -> Result<(), Error> {
@@ -72,7 +33,6 @@ impl Declaration<'_> {
             || self.key.len() > crate::view::MAX_IMPLEMENTATION_KEY
             || self.identity.is_empty()
             || self.capacity == 0
-            || self.image_bytes == 0
         {
             Err(Error::Invalid)
         } else {
@@ -80,94 +40,67 @@ impl Declaration<'_> {
         }
     }
 }
-pub fn encoded_bytes(declarations: &[Declaration<'_>]) -> Result<usize, Error> {
-    declarations
-        .iter()
-        .try_fold(HEADER_BYTES, |length, declaration| {
-            declaration.validate()?;
-            length
-                .checked_add(32)
-                .and_then(|n| n.checked_add(declaration.key.len()))
-                .and_then(|n| n.checked_add(declaration.identity.len()))
-                .ok_or(Error::Invalid)
-        })
-}
-pub fn encode(declarations: &[Declaration<'_>], out: &mut [u8]) -> Result<usize, Error> {
-    let length = encoded_bytes(declarations)?;
-    if length > out.len() {
-        return Err(Error::Invalid);
-    }
-    let mut writer = Writer::new(out);
-    writer.u32(VERSION);
-    writer.u32(u32::try_from(declarations.len()).map_err(|_| Error::Invalid)?);
-    for declaration in declarations {
-        writer.bytes32(declaration.key.as_bytes());
-        writer.bytes32(declaration.identity);
-        writer.u32(declaration.priority);
-        writer.u32(declaration.capacity);
-        writer.u32(
-            u32::from(declaration.child_registrar)
-                | (u32::from(declaration.trusted_physical) << 1)
-                | (u32::from(declaration.reusable) << 2),
-        );
-        writer.u32(0);
-        writer.u64(declaration.image_bytes);
-    }
-    Ok(writer.written())
-}
+
+const KEYS: [&str; 7] = [
+    "implementation",
+    "identity",
+    "priority",
+    "capacity",
+    "reusable",
+    "child_registrar",
+    "trusted_physical",
+];
+
+/// 已校验的声明表：实现键唯一、字段合法。
 pub struct Catalog<'a> {
-    bytes: &'a [u8],
-    count: usize,
+    declarations: Vec<Declaration<'a>>,
 }
 impl<'a> Catalog<'a> {
-    pub fn decode(bytes: &'a [u8], grants: usize) -> Result<Self, Error> {
-        let mut reader = Reader::new(bytes);
-        if reader.u32()? != VERSION {
-            return Err(Error::Invalid);
-        }
-        let count = reader.u32()? as usize;
-        if count.checked_add(IMAGE_BASE) != Some(grants) {
-            return Err(Error::Invalid);
-        }
-        let value = Self {
-            bytes: &bytes[HEADER_BYTES..],
-            count,
-        };
-        let mut records = value.records();
-        for index in 0..count {
-            let record = records.next().ok_or(Error::Invalid)??;
-            record.validate()?;
-            // 支持声明和映像的一一身份不能被同名后项覆盖。
-            for previous in value.records().take(index) {
-                if previous?.key == record.key {
-                    return Err(Error::Conflict);
-                }
+    /// 从实例设定的 `declarations` 列表解析；任一字段越界、未知键或重复实现键即拒绝。
+    pub fn from_settings(bytes: &'a [u8]) -> Result<Self, Error> {
+        let invalid = |_| Error::Invalid;
+        let root = settings::Settings::parse(bytes).map_err(invalid)?.root();
+        root.only(&["declarations"]).map_err(invalid)?;
+        let list = root.list("declarations").map_err(invalid)?;
+        let mut declarations = Vec::new();
+        declarations
+            .try_reserve_exact(list.len())
+            .map_err(|_| Error::Resource)?;
+        for value in list.iter() {
+            let table = value.as_table().map_err(invalid)?;
+            table.only(&KEYS).map_err(invalid)?;
+            let declaration = Declaration {
+                key: table.str("implementation").map_err(invalid)?,
+                identity: table.str("identity").map_err(invalid)?.as_bytes(),
+                priority: table.integer("priority").map_err(invalid)?,
+                capacity: table.integer("capacity").map_err(invalid)?,
+                reusable: table.bool("reusable").map_err(invalid)?,
+                child_registrar: table.bool("child_registrar").map_err(invalid)?,
+                trusted_physical: table.bool("trusted_physical").map_err(invalid)?,
+            };
+            declaration.validate()?;
+            // 声明与映像一一对应，同名实现不能被后项覆盖。
+            if declarations
+                .iter()
+                .any(|previous: &Declaration<'_>| previous.key == declaration.key)
+            {
+                return Err(Error::Conflict);
             }
+            declarations.push(declaration);
         }
-        if records.reader.remaining() != 0 {
-            return Err(Error::Invalid);
-        }
-        Ok(value)
+        Ok(Self { declarations })
     }
     pub fn count(&self) -> usize {
-        self.count
+        self.declarations.len()
     }
-    pub fn records(&self) -> Records<'a> {
-        Records {
-            reader: Reader::new(self.bytes),
-            remaining: self.count,
-        }
-    }
-    pub fn image_slot(&self, index: usize) -> Option<usize> {
-        (index < self.count)
-            .then(|| IMAGE_BASE.checked_add(index))
-            .flatten()
+    pub fn records(&self) -> impl Iterator<Item = Result<Declaration<'a>, Error>> + '_ {
+        self.declarations.iter().copied().map(Ok)
     }
     /// 同一优先级的多个匹配项明确 Ambiguous；不通过进程启动/Claim 竞速选择。
     pub fn select(&self, identity: &[u8], previous: Option<usize>) -> Result<Option<usize>, Error> {
         let ceiling = previous
             .map(|index| {
-                let record = self.records().nth(index).ok_or(Error::Invalid)??;
+                let record = self.declarations.get(index).ok_or(Error::Invalid)?;
                 if record.identity != identity {
                     return Err(Error::Invalid);
                 }
@@ -177,8 +110,7 @@ impl<'a> Catalog<'a> {
         let mut selected = None;
         let mut priority = 0;
         let mut ambiguous = false;
-        for (index, record) in self.records().enumerate() {
-            let record = record?;
+        for (index, record) in self.declarations.iter().enumerate() {
             if record.identity != identity
                 || ceiling.is_some_and(|ceiling| record.priority >= ceiling)
             {
@@ -197,39 +129,6 @@ impl<'a> Catalog<'a> {
         } else {
             Ok(selected)
         }
-    }
-}
-pub struct Records<'a> {
-    reader: Reader<'a>,
-    remaining: usize,
-}
-impl<'a> Iterator for Records<'a> {
-    type Item = Result<Declaration<'a>, Error>;
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 {
-            return None;
-        }
-        self.remaining -= 1;
-        Some((|| {
-            let key = self.reader.text32()?;
-            let identity = self.reader.bytes32()?;
-            let priority = self.reader.u32()?;
-            let capacity = self.reader.u32()?;
-            let flags = self.reader.u32()?;
-            if flags & !7 != 0 || self.reader.u32()? != 0 {
-                return Err(Error::Invalid);
-            }
-            Ok(Declaration {
-                key,
-                identity,
-                priority,
-                capacity,
-                reusable: flags & 4 != 0,
-                child_registrar: flags & 1 != 0,
-                trusted_physical: flags & 2 != 0,
-                image_bytes: self.reader.u64()?,
-            })
-        })())
     }
 }
 
@@ -268,42 +167,53 @@ impl WorkerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // 选择依据是明确优先级/歧义规则；映像槽数来自真实出生委托，不能暗增候选。
+    use alloc::{collections::BTreeMap, string::String, vec};
+    use settings::Owned;
+
+    fn declaration(key: &str, identity: &str, priority: i64) -> Owned {
+        let mut table = BTreeMap::new();
+        table.insert(String::from("implementation"), Owned::Str(key.into()));
+        table.insert(String::from("identity"), Owned::Str(identity.into()));
+        table.insert(String::from("priority"), Owned::Int(priority));
+        table.insert(String::from("capacity"), Owned::Int(2));
+        table.insert(String::from("reusable"), Owned::Bool(true));
+        table.insert(String::from("child_registrar"), Owned::Bool(false));
+        table.insert(String::from("trusted_physical"), Owned::Bool(false));
+        Owned::Table(table)
+    }
+
+    fn encode(items: Vec<Owned>) -> Vec<u8> {
+        let mut root = BTreeMap::new();
+        root.insert(String::from("declarations"), Owned::List(items));
+        settings::encode(&root).unwrap()
+    }
+
+    // 选择依据是明确优先级/歧义规则；同名实现被拒绝。
     #[test]
     fn unique_priority_wins_and_equal_priority_is_ambiguous() {
-        let first = Declaration {
-            key: "one",
-            identity: b"pci:0c0330",
-            priority: 1,
-            capacity: 1,
-            reusable: false,
-            child_registrar: true,
-            trusted_physical: true,
-            image_bytes: 64,
-        };
-        let mut second = Declaration {
-            key: "two",
-            priority: 2,
-            ..first
-        };
-        let mut bytes = [0; 256];
-        let used = encode(&[first, second], &mut bytes).unwrap();
-        let catalog = Catalog::decode(&bytes[..used], IMAGE_BASE + 2).unwrap();
+        let bytes = encode(vec![
+            declaration("one", "pci:0c0330", 1),
+            declaration("two", "pci:0c0330", 2),
+        ]);
+        let catalog = Catalog::from_settings(&bytes).unwrap();
         assert_eq!(catalog.select(b"pci:0c0330", None), Ok(Some(1)));
-        assert_eq!(catalog.select(b"usb:03/01/01", None), Ok(None));
-        assert!(Catalog::decode(&bytes[..used], IMAGE_BASE + 3).is_err());
-        second.priority = 1;
-        let used = encode(&[first, second], &mut bytes).unwrap();
+        assert_eq!(catalog.select(b"usb:03:01:01", None), Ok(None));
+        let tie = encode(vec![
+            declaration("one", "pci:0c0330", 1),
+            declaration("two", "pci:0c0330", 1),
+        ]);
         assert_eq!(
-            Catalog::decode(&bytes[..used], IMAGE_BASE + 2)
+            Catalog::from_settings(&tie)
                 .unwrap()
                 .select(b"pci:0c0330", None),
             Err(Error::Conflict)
         );
-        second.key = first.key;
-        let used = encode(&[first, second], &mut bytes).unwrap();
+        let duplicate = encode(vec![
+            declaration("one", "pci:0c0330", 1),
+            declaration("one", "pci:0c0330", 2),
+        ]);
         assert!(matches!(
-            Catalog::decode(&bytes[..used], IMAGE_BASE + 2),
+            Catalog::from_settings(&duplicate),
             Err(Error::Conflict)
         ));
     }
@@ -311,65 +221,36 @@ mod tests {
     // 降序和下层歧义来自选择合同；原游标不能越界或跨identity，也不能回到高优先级。
     #[test]
     fn finite_candidates_descend_and_lower_ties_remain_ambiguous() {
-        let mut records = [
-            Declaration {
-                key: "top",
-                identity: b"usb:kbd",
-                priority: u32::MAX,
-                capacity: 2,
-                reusable: true,
-                child_registrar: false,
-                trusted_physical: false,
-                image_bytes: 64,
-            },
-            Declaration {
-                key: "low",
-                identity: b"usb:kbd",
-                priority: 1,
-                capacity: 2,
-                reusable: true,
-                child_registrar: false,
-                trusted_physical: false,
-                image_bytes: 64,
-            },
-            Declaration {
-                key: "middle",
-                identity: b"usb:kbd",
-                priority: 2,
-                capacity: 2,
-                reusable: true,
-                child_registrar: false,
-                trusted_physical: false,
-                image_bytes: 64,
-            },
-            Declaration {
-                key: "tie",
-                identity: b"usb:kbd",
-                priority: 2,
-                capacity: 2,
-                reusable: true,
-                child_registrar: false,
-                trusted_physical: false,
-                image_bytes: 64,
-            },
-        ];
-        let mut bytes = [0; 1024];
-        let used = encode(&records, &mut bytes).unwrap();
-        let catalog = Catalog::decode(&bytes[..used], IMAGE_BASE + records.len()).unwrap();
+        let bytes = encode(vec![
+            declaration("top", "usb:kbd", i64::from(u32::MAX)),
+            declaration("low", "usb:kbd", 1),
+            declaration("middle", "usb:kbd", 2),
+            declaration("tie", "usb:kbd", 2),
+        ]);
+        let catalog = Catalog::from_settings(&bytes).unwrap();
         assert_eq!(catalog.select(b"usb:kbd", None), Ok(Some(0)));
         assert_eq!(catalog.select(b"usb:kbd", Some(0)), Err(Error::Conflict));
         assert_eq!(catalog.select(b"pci:other", Some(0)), Err(Error::Invalid));
-        assert_eq!(
-            catalog.select(b"usb:kbd", Some(records.len())),
-            Err(Error::Invalid)
-        );
-        records[3].priority = 0;
-        let used = encode(&records, &mut bytes).unwrap();
-        let catalog = Catalog::decode(&bytes[..used], IMAGE_BASE + records.len()).unwrap();
-        assert_eq!(catalog.select(b"usb:kbd", None), Ok(Some(0)));
+        assert_eq!(catalog.select(b"usb:kbd", Some(4)), Err(Error::Invalid));
+        let bytes = encode(vec![
+            declaration("top", "usb:kbd", i64::from(u32::MAX)),
+            declaration("low", "usb:kbd", 1),
+            declaration("middle", "usb:kbd", 2),
+            declaration("tie", "usb:kbd", 0),
+        ]);
+        let catalog = Catalog::from_settings(&bytes).unwrap();
         assert_eq!(catalog.select(b"usb:kbd", Some(0)), Ok(Some(2)));
         assert_eq!(catalog.select(b"usb:kbd", Some(2)), Ok(Some(1)));
         assert_eq!(catalog.select(b"usb:kbd", Some(1)), Ok(Some(3)));
         assert_eq!(catalog.select(b"usb:kbd", Some(3)), Ok(None));
+    }
+
+    #[test]
+    fn malformed_declarations_are_rejected() {
+        let mut bad = BTreeMap::new();
+        bad.insert(String::from("implementation"), Owned::Str("x".into()));
+        assert!(Catalog::from_settings(&encode(vec![Owned::Table(bad)])).is_err());
+        assert!(Catalog::from_settings(&encode(vec![declaration("", "pci:x", 1)])).is_err());
+        assert!(Catalog::from_settings(&encode(vec![declaration("x", "pci:x", -1)])).is_err());
     }
 }

@@ -41,6 +41,8 @@ enum Owner {
 }
 pub(super) struct Request {
     oal: bool,
+    /// 撤销协议请求：只在来源管理端上执行 `instance::revoke`。
+    revoke: bool,
     provision: bool,
     wire: Vec<u8>,
     header: Header,
@@ -64,25 +66,38 @@ impl Request {
     pub fn accept(message: ReceivedMessage, world: &World) -> Result<Self, ()> {
         let oal = message.header.kind == liboal::protocol::ID;
         let provision = message.header.kind == protocol::PROVISION_ID;
+        let revoke = message.header.kind == libservice::instance::revoke::PROTOCOL;
         let mut context = RequestContext::decode(
             message,
             if oal {
                 liboal::protocol::ID
             } else if provision {
                 protocol::PROVISION_ID
+            } else if revoke {
+                libservice::instance::revoke::PROTOCOL
             } else {
                 protocol::ID
             },
         )
         .map_err(|_| ())?;
-        let (header, _) = Header::decode(&context.payload).map_err(|_| ())?;
+        let header = if revoke {
+            let (op, deadline) =
+                libservice::instance::revoke::decode_request(&context.payload).ok_or(())?;
+            Header {
+                op,
+                error: None,
+                deadline,
+            }
+        } else {
+            Header::decode(&context.payload).map_err(|_| ())?.0
+        };
         let input_handles = context.handles.remaining();
-        let decoded = if oal {
+        let decoded = if oal || revoke {
             Err(Error::Unsupported)
         } else {
             Command::decode(&context.payload, input_handles)
         };
-        let error = if oal {
+        let error = if oal || revoke {
             None
         } else if provision {
             protocol::ProvisionCommand::decode(&context.payload, input_handles).err()
@@ -105,7 +120,10 @@ impl Request {
         };
         let access = world.registry.source_access(who).ok();
         // 只有实际控制角色可使用管理预留；自报一个 Stop opcode 不获得预留额度。
-        let control = if provision {
+        // 撤销是管理端的停止操作，与 SealSource 一样使用管理预留。
+        let control = if revoke {
+            world.registry.is_source_admin(who)
+        } else if provision {
             world
                 .platform
                 .as_ref()
@@ -181,6 +199,7 @@ impl Request {
         .map_err(|_| ())?;
         Ok(Self {
             oal,
+            revoke,
             provision,
             wire,
             header,
@@ -327,6 +346,28 @@ impl Request {
     }
     fn encode(&mut self, error: Option<Error>, body: &[u8]) -> Result<(), Error> {
         let response = self.outbox.as_mut().ok_or(Error::Closed)?.response_mut()?;
+        if self.revoke {
+            // 撤销回复由 execute_revoke 按 instance 线格式编码；执行失败一律报拒绝。
+            let mut denied = [0; libservice::instance::revoke::REPLY_MAX];
+            let body = if error.is_some() || body.is_empty() {
+                let used = libservice::instance::revoke::encode_reply(
+                    self.header.op,
+                    libservice::instance::revoke::Reply::Denied,
+                    &mut denied,
+                );
+                &denied[..used]
+            } else {
+                body
+            };
+            let out = response.body_mut()?;
+            if body.len() > out.len() {
+                return Err(Error::Invalid);
+            }
+            out[..body.len()].copy_from_slice(body);
+            response.finish_body(body.len())?;
+            self.encoded = true;
+            return Ok(());
+        }
         if self.oal {
             let used = liboal::protocol::encode_response(
                 self.header.op,
@@ -386,6 +427,9 @@ impl Request {
     ) -> Result<(), Error> {
         if self.oal {
             return self.execute_oal(wire, world);
+        }
+        if self.revoke {
+            return self.execute_revoke(world);
         }
         if self.provision {
             return self.execute_provision(wire, world);
@@ -815,6 +859,27 @@ impl Request {
         let (_, body) = Header::decode(&bytes[..used])?;
         self.wake = Some(world.platform_task);
         self.encode(None, body)
+    }
+    /// `Revoke` 封请求方管理的来源；`QueryRevoked` 投影其活跃 seat 状态。
+    fn execute_revoke(&mut self, world: &mut World) -> Result<(), Error> {
+        use libservice::instance::revoke::{self, Reply, State};
+        let reply = if !world.registry.is_source_admin(self.context) {
+            Reply::Denied
+        } else if self.header.op == revoke::REVOKE {
+            let task = world.registry.seal_source(self.context)?;
+            self.wake = Some(task);
+            world.dirty = true;
+            Reply::Revoked
+        } else {
+            Reply::State(match world.registry.query_source_stop(self.context)? {
+                libdevice::registry::SourceStop::Open => State::Open,
+                libdevice::registry::SourceStop::Stopping => State::Revoking,
+                libdevice::registry::SourceStop::Closed => State::Closed,
+            })
+        };
+        let mut bytes = [0; revoke::REPLY_MAX];
+        let used = revoke::encode_reply(self.header.op, reply, &mut bytes);
+        self.encode(None, &bytes[..used])
     }
     fn execute_oal(&mut self, wire: &[u8], world: &World) -> Result<(), Error> {
         let response = self.outbox.as_mut().ok_or(Error::Closed)?.response_mut()?;

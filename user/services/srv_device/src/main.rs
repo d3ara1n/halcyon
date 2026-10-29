@@ -3,58 +3,68 @@
 #![feature(allocator_ext)]
 extern crate alloc;
 extern crate libruntime;
-use alloc::vec::Vec;
-use libdevice::startup::{self, Delegation};
-use libpci::platform::{DescriptionObject, Platform};
+use erhino_shared::object::{ObjectKind, Rights};
+use libpci::platform::{DESCRIPTION_RIGHTS, DescriptionObject, Platform, ROOT_RIGHTS};
+use libprocess::birth::Birth;
+use libservice::instance::{self, child::Reporter};
+mod config;
 mod server;
 
+/// 平台根列表中允许的控制种类；具体资源几何由 `Platform::adopt` 核验。
+const ROOT_KINDS: [ObjectKind; 3] = [
+    ObjectKind::MmioControl,
+    ObjectKind::IrqControl,
+    ObjectKind::DmaDomainControl,
+];
+
 fn main() {
-    let startup = libruntime::startup::take().expect("device startup context missing");
-    let (_, payload, mut grants) = startup.into_parts();
-    let config = Delegation::decode(payload.as_bytes(), grants.remaining())
-        .expect("device platform delegation invalid");
+    let mut birth =
+        Birth::adopt(libruntime::startup::take().expect("device startup context missing"))
+            .expect("device birth frame invalid");
+    let config = config::Config::parse(birth.settings())
+        .unwrap_or_else(|invalid| panic!("device settings invalid: {}", invalid.0));
+    let reporter = Reporter::new(
+        birth
+            .require(
+                instance::REPORT,
+                instance::REPORT_KIND,
+                instance::REPORT_RIGHTS,
+            )
+            .expect("device report input invalid"),
+    )
+    .expect("device report sender invalid");
+    let stop = birth
+        .require(instance::STOP, instance::STOP_KIND, instance::STOP_RIGHTS)
+        .expect("device stop input invalid");
+    let pool = birth
+        .require("memory.pool", ObjectKind::MemoryPool, Rights::CREATE)
+        .expect("device Pool input invalid");
     let description = DescriptionObject::adopt(
-        grants
-            .take(startup::DESCRIPTION)
-            .expect("device platform description missing"),
+        birth
+            .require(
+                "platform.description",
+                ObjectKind::MemoryObject,
+                DESCRIPTION_RIGHTS,
+            )
+            .expect("device platform description input invalid"),
     )
     .expect("device platform description invalid");
+    let roots = birth
+        .take_list("platform.root", &ROOT_KINDS, ROOT_RIGHTS)
+        .expect("device platform root input invalid");
+    birth.finish().expect("device birth has unclaimed inputs");
     assert_eq!(
-        config.count(),
+        roots.len(),
         description.description().header().resource_count,
-        "device platform delegation count mismatch"
+        "device platform root count mismatch"
     );
-    let mut roots = Vec::new();
-    roots
-        .try_reserve_exact(config.count())
-        .expect("device platform input storage failed");
-    for index in 0..config.count() {
-        roots.push(
-            grants
-                .take(config.grant(index).expect("device platform record missing"))
-                .expect("device platform root missing"),
-        );
-    }
     let platform =
         Platform::adopt(description, roots).expect("device platform root binding invalid");
-    let bootstrap = grants
-        .take(startup::BOOTSTRAP)
-        .expect("device bootstrap sender missing");
-    let (bootstrap, description) =
-        libkernel::ipc::message::MailboxSender::from_capability(bootstrap)
-            .map_err(|failure| failure.error)
-            .expect("device bootstrap sender invalid");
-    assert!(
-        description
-            .rights
-            .contains(erhino_shared::object::Rights::WRITE),
-        "device bootstrap sender rights invalid"
-    );
-    let pool = grants.take(startup::POOL).expect("device Pool missing");
-    assert_eq!(
-        pool.description().expect("device Pool query failed").kind,
-        erhino_shared::object::ObjectKind::MemoryPool as u32,
-        "device Pool role invalid"
-    );
-    server::run(bootstrap, pool, platform);
+    server::run(server::Startup {
+        reporter,
+        stop,
+        pool,
+        platform,
+        config,
+    });
 }

@@ -10,6 +10,7 @@ libkernel = { path = "../../libraries/libkernel" }
 libdevice = { path = "../../libraries/libdevice" }
 libdriver = { path = "../../libraries/libdriver" }
 libprocess = { path = "../../libraries/libprocess", features = ["management"] }
+libservice = { path = "../../libraries/libservice" }
 libbudget = { path = "../../libraries/libbudget" }
 libexecution = { path = "../../libraries/libexecution" }
 librpc = { path = "../../libraries/librpc" }

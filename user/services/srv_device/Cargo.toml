@@ -15,3 +15,6 @@ libexecution = { path = "../../libraries/libexecution" }
 librpc = { path = "../../libraries/librpc" }
 erhino_shared = { path = "../../../shared/erhino_shared" }
 ordered_table = { path = "../../../shared/ordered_table" }
+settings = { path = "../../../shared/settings" }
+libprocess = { path = "../../libraries/libprocess" }
+libservice = { path = "../../libraries/libservice" }

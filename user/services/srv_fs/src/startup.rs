@@ -1,94 +1,84 @@
-//! 文件宿主私有出生协议；profile 选择部署，不授予权限。
+//! 文件宿主的出生输入名、导出名与实例设定。
+//!
+//! 设定键：
+//! - `registry`（布尔）：是否在本宿主承载服务 registry；
+//! - `entries`（表列表，1..=[`MAX_ENTRIES`]）：每入口 `watches`、`sessions` 份额；
+//! - `publish`（字符串，仅不承载 registry 时必需）：把首入口文件根登记到外部 registry 的服务名。
+use crate::deployment::{MAX_ENTRIES, SESSIONS, WATCHES};
 use erhino_shared::call::SystemCallError;
 
-pub const GRANTS: usize = 5;
-pub const PAYLOAD_LEN: usize = 8;
+/// 本实例 Pool 的 CREATE 别名。
+pub const POOL_INPUT: &str = "memory.pool";
+/// 不承载 registry 时，向外部 registry 登记首入口的发布授权。
+pub const AUTHORITY_INPUT: &str = "service.authority";
+
+/// 第 N 个入口的导出名前缀；完整名为 `<前缀>.<N>`。
+pub const FILE_ROOT_EXPORT: &str = "file.root";
+pub const MANAGEMENT_EXPORT: &str = "file.management";
+pub const DIRECTORY_EXPORT: &str = "service.directory";
+pub const AUTHORITY_EXPORT: &str = "service.authority";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u32)]
-pub enum Profile {
-    System = 0,
-    AcceptancePrimary = 1,
-    AcceptanceSecondary = 2,
+pub struct Entry {
+    pub watches: usize,
+    pub sessions: usize,
 }
-impl Profile {
-    pub const fn encode(self) -> [u8; PAYLOAD_LEN] {
-        let version = 1u32.to_le_bytes();
-        let profile = (self as u32).to_le_bytes();
-        [
-            version[0], version[1], version[2], version[3], profile[0], profile[1], profile[2],
-            profile[3],
-        ]
+
+#[derive(Clone, Copy, Debug)]
+pub struct Config<'a> {
+    pub registry: bool,
+    entries: [Entry; MAX_ENTRIES],
+    count: usize,
+    pub publish: Option<&'a str>,
+}
+
+impl<'a> Config<'a> {
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries[..self.count]
     }
-    pub fn decode(bytes: &[u8]) -> Result<Self, SystemCallError> {
-        if bytes.len() != PAYLOAD_LEN || bytes[..4] != 1u32.to_le_bytes() {
+
+    /// 解析并校验实例设定；任何越界或缺键都拒绝启动。
+    pub fn parse(bytes: &'a [u8]) -> Result<Self, SystemCallError> {
+        let invalid = |_| SystemCallError::IllegalArgument;
+        let root = settings::Settings::parse(bytes).map_err(invalid)?.root();
+        root.only(&["registry", "entries", "publish"])
+            .map_err(invalid)?;
+        let registry = root.bool("registry").map_err(invalid)?;
+        let list = root.list("entries").map_err(invalid)?;
+        if list.is_empty() || list.len() > MAX_ENTRIES {
             return Err(SystemCallError::IllegalArgument);
         }
-        match &bytes[4..] {
-            [0, 0, 0, 0] => Ok(Self::System),
-            [1, 0, 0, 0] => Ok(Self::AcceptancePrimary),
-            [2, 0, 0, 0] => Ok(Self::AcceptanceSecondary),
-            _ => Err(SystemCallError::IllegalArgument),
+        let mut entries = [Entry {
+            watches: 0,
+            sessions: 0,
+        }; MAX_ENTRIES];
+        for (slot, value) in entries.iter_mut().zip(list.iter()) {
+            let table = value.as_table().map_err(invalid)?;
+            table.only(&["watches", "sessions"]).map_err(invalid)?;
+            *slot = Entry {
+                watches: table.integer("watches").map_err(invalid)?,
+                sessions: table.integer("sessions").map_err(invalid)?,
+            };
+            if slot.watches == 0
+                || slot.watches > WATCHES
+                || slot.sessions == 0
+                || slot.sessions > SESSIONS
+            {
+                return Err(SystemCallError::IllegalArgument);
+            }
         }
-    }
-    pub const fn registry(self) -> bool {
-        !matches!(self, Self::AcceptanceSecondary)
-    }
-    pub const fn entries(self) -> usize {
-        match self {
-            Self::AcceptancePrimary => 2,
-            _ => 1,
+        let publish = match root.get("publish") {
+            Some(value) => Some(value.as_str().map_err(invalid)?),
+            None => None,
+        };
+        if registry == publish.is_some() {
+            return Err(SystemCallError::IllegalArgument);
         }
-    }
-    pub const fn root_messages(self) -> usize {
-        if self.registry() { 4 } else { 1 }
-    }
-    pub const fn bootstrap_messages(self) -> usize {
-        self.root_messages() + 2
-    }
-}
-const _: () = {
-    assert!(Profile::System.bootstrap_messages() <= erhino_shared::message::MAILBOX_CAPACITY);
-    assert!(
-        Profile::AcceptancePrimary.bootstrap_messages() <= erhino_shared::message::MAILBOX_CAPACITY
-    );
-};
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn birth_wire_is_versioned_and_rejects_old_payloads() {
-        for (profile, tag) in [
-            (Profile::System, 0),
-            (Profile::AcceptancePrimary, 1),
-            (Profile::AcceptanceSecondary, 2),
-        ] {
-            let wire = [1, 0, 0, 0, tag, 0, 0, 0];
-            assert_eq!(profile.encode(), wire);
-            assert_eq!(Profile::decode(&wire), Ok(profile));
-        }
-        for bytes in [
-            &b""[..],
-            &b"secondary"[..],
-            &[0, 0, 0, 0, 0, 0, 0, 0][..],
-            &[1, 0, 0, 0, 3, 0, 0, 0][..],
-            &[1, 0, 0, 0, 0, 0, 0][..],
-        ] {
-            assert!(Profile::decode(bytes).is_err());
-        }
-    }
-    #[test]
-    fn system_has_one_full_entry_and_acceptance_preserves_shared_quotas() {
-        use crate::deployment::*;
-        let system = Capacity::new(Profile::System).unwrap();
-        let acceptance = Capacity::new(Profile::AcceptancePrimary).unwrap();
-        assert_eq!(Profile::System.bootstrap_messages(), 6);
-        assert_eq!(Profile::AcceptanceSecondary.bootstrap_messages(), 3);
-        assert_eq!(system.entry_watches(0), WATCHES);
-        assert_eq!(system.entry_sessions(0), SESSIONS);
-        assert_eq!(acceptance.entry_watches(0), WATCHES / 2);
-        assert_eq!(acceptance.entry_sessions(0), SESSIONS / 2);
-        assert_eq!(acceptance.entry_watches(1), WATCHES);
-        assert_eq!(acceptance.entry_sessions(1), SESSIONS);
+        Ok(Self {
+            registry,
+            entries,
+            count: list.len(),
+            publish,
+        })
     }
 }

@@ -1,0 +1,55 @@
+# System 组态：设备登记、驱动选择与内存文件宿主（承载服务 registry）。
+# 验收形态在此之上叠加覆盖层，见 Justfile 的 FORMATION 选择。
+finish = "stay"
+
+[job.drivers]
+parent = "services"
+pool = "driver"
+
+[instance.device]
+image = "srv_device"
+kind = "resident"
+pool = { work_pages = 2048, metadata_bytes = 1048576 }
+start_timeout_ms = 5000
+stop_timeout_ms = 40000
+inputs."memory.pool" = "self/memory.pool"
+inputs."platform.description" = "init/platform.description"
+inputs."platform.root" = "init/platform.root"
+exports."device.source.driver" = { kind = "mailbox_sender", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+exports."device.source.driver.admin" = { kind = "mailbox_sender", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+settings.sources = [{ name = "driver", scope = "root", access = ["observe", "claim", "child_register", "report_stopped"] }]
+
+[instance.driver]
+image = "srv_driver"
+kind = "resident"
+# 管理者加三份活 worker 与一次退休重叠，每份为 libdriver::boot::WORKER_POOL。
+pool = { work_pages = 20480, metadata_bytes = 5246976 }
+start_timeout_ms = 5000
+stop_timeout_ms = 40000
+inputs."memory.pool" = "self/memory.pool"
+inputs."device.source" = { from = "device/device.source.driver", revoke = "device/device.source.driver.admin" }
+inputs."driver.workers" = "init/job.drivers"
+inputs."driver.image.drv_pci_generic" = "init/image.drv_pci_generic"
+inputs."driver.image.drv_usb_xhci" = "init/image.drv_usb_xhci"
+inputs."driver.image.drv_usb_hid" = "init/image.drv_usb_hid"
+exports."driver.control" = { kind = "mailbox_sender", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+exports."driver.observer" = { kind = "mailbox_sender", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+settings.declarations = [
+  { implementation = "drv_pci_generic", identity = "platform:pci-host-ecam-generic", priority = 1, capacity = 1, reusable = false, child_registrar = true, trusted_physical = true },
+  { implementation = "drv_usb_xhci", identity = "pci:0c0330", priority = 1, capacity = 1, reusable = false, child_registrar = true, trusted_physical = true },
+  { implementation = "drv_usb_hid", identity = "usb:03:01:01", priority = 1, capacity = 2, reusable = true, child_registrar = false, trusted_physical = false },
+]
+
+[instance.fs]
+image = "srv_fs"
+kind = "resident"
+pool = { work_pages = 4096, metadata_bytes = 1048576 }
+start_timeout_ms = 10000
+stop_timeout_ms = 10000
+inputs."memory.pool" = "self/memory.pool"
+exports."file.root.0" = { kind = "mailbox_sender", rights = ["write", "wait", "transit"] }
+exports."file.management.0" = { kind = "mailbox_sender", rights = ["write", "wait", "transit"] }
+exports."service.directory.0" = { kind = "mailbox_sender", rights = ["write", "wait", "transit"] }
+exports."service.authority.0" = { kind = "mailbox_sender", rights = ["write", "wait", "transit"] }
+settings.registry = true
+settings.entries = [{ watches = 24, sessions = 16 }]

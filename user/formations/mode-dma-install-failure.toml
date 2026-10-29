@@ -1,0 +1,3 @@
+# 资源专项：在 core 内核验收上选择 dma_install_failure 模式。
+[instance.kernel]
+settings.mode = ["dma_install_failure"]

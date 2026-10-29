@@ -1,11 +1,7 @@
 //! 启动装配：两个独立 mailbox/backing 在同一 Runtime 推进，母本直接移入启动 Packet。
 use super::{FileTask, Ingress, World, lifecycle, services};
 use alloc::{boxed::Box, rc::Rc};
-use erhino_shared::{
-    call::SystemCallError,
-    object::{Handle, Rights},
-    time::Deadline,
-};
+use erhino_shared::{call::SystemCallError, object::Rights, time::Deadline};
 use libbudget::{Budget, Taxonomy};
 use libexecution::{
     ExecutionResource,
@@ -18,9 +14,9 @@ use libkernel::ipc::{
     message::{Mailbox, MailboxSender},
     notification,
     object::query,
-    packet::Packet,
     wait_set::WaitSet,
 };
+use libservice::instance::child::Reporter;
 use libservice::{
     authority::{AccessTable, AuthorityTable, Scope},
     maintenance::Maintenance,
@@ -38,35 +34,32 @@ use srv_fs::{
         BINDINGS, Capacity, GRANTS, MAX_ENTRIES as ENTRIES, NODES, REGISTRATIONS, REQUESTS, ROLES,
         RPC_CALLS, WATCHES,
     },
-    startup::Profile,
+    startup::{AUTHORITY_EXPORT, Config, DIRECTORY_EXPORT, FILE_ROOT_EXPORT, MANAGEMENT_EXPORT},
 };
-fn cap(handle: Handle) -> Capability {
-    // SAFETY: 参数来自本进程 StartupBlock 的独占 grant，调用者已转出其原 owner。
-    unsafe { Capability::from_raw(handle) }
-}
-fn publish(bootstrap: &MailboxSender, kind: u64, senders: &mut [Option<MailboxSender>]) {
-    let mut packet = Packet::new(kind, &[]).expect("bootstrap packet allocation failed");
-    for sender in senders {
-        let sender = sender.take().expect("bootstrap entry sender missing");
+/// 每个入口一条命名导出 `<prefix>.<序号>`，权利取 sender 的实际权利。
+fn export_all(reporter: &mut Reporter, prefix: &str, senders: &mut [Option<MailboxSender>]) {
+    let mut name = alloc::string::String::new();
+    for (entry, sender) in senders.iter_mut().enumerate() {
+        let sender = sender.take().expect("export entry sender missing");
         let rights = sender
             .description()
-            .expect("bootstrap sender description failed")
+            .expect("export sender description failed")
             .rights;
-        packet
-            .push(sender.into_capability(), rights)
-            .map_err(|f| f.error)
-            .expect("bootstrap sender packet failed");
+        name.clear();
+        core::fmt::write(&mut name, format_args!("{prefix}.{entry}"))
+            .expect("String write cannot fail");
+        reporter
+            .export(&name, sender.into_capability(), rights, Deadline::INFINITE)
+            .map_err(|(_, error)| error)
+            .expect("export publication failed");
     }
-    packet
-        .try_send(bootstrap, Deadline::INFINITE)
-        .map_err(|f| f.error)
-        .expect("bootstrap sender publication failed");
 }
 fn begin_registration(
     dispatcher: &mut librpc::dispatcher::Dispatcher,
     authority: MailboxSender,
     endpoint: MailboxSender,
     funding: &libbudget::AccountView<ExecutionResource>,
+    name: &str,
 ) -> Result<(u64, Deadline), SystemCallError> {
     let deadline = libkernel::time::timeout_millis(5000)?;
     let descriptor = [ProtocolDescriptor {
@@ -80,7 +73,7 @@ fn begin_registration(
         .map_err(|_| SystemCallError::IllegalArgument)?;
     let transport = Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE;
     let request = Command::Register {
-        name: "fs.secondary",
+        name,
         mode: RegisterMode::CreateOnly,
         descriptors: Descriptors::decode(&descriptor_bytes[..used])
             .map_err(|_| SystemCallError::IllegalArgument)?,
@@ -130,80 +123,32 @@ fn begin_withdraw(
     Ok((txid, deadline))
 }
 pub(crate) struct Startup {
-    pub bootstrap: MailboxSender,
-    pub route: Handle,
-    pub release: Handle,
-    pub registration: Handle,
+    pub reporter: Reporter,
+    pub stop: Capability,
     pub pool: Capability,
-    pub profile: Profile,
-    pub parent_pid: u64,
+    pub config: Config<'static>,
+    pub authority: Option<MailboxSender>,
 }
 pub(crate) fn run(mailbox: Mailbox, startup: Startup) {
     let Startup {
-        bootstrap,
-        route,
-        release,
-        registration,
+        mut reporter,
+        stop,
         pool: _pool,
-        profile,
-        parent_pid,
+        config,
+        authority,
     } = startup;
-    let with_registry = profile.registry();
-    let entries = profile.entries();
-    let capacity = Capacity::new(profile).expect("provider capacity invalid");
+    let with_registry = config.registry;
+    let entries = config.entries().len();
+    let capacity = Capacity::new(&config).expect("provider capacity invalid");
     let sources = capacity.sources;
     let tasks = capacity.tasks;
-    let registration = cap(registration);
-    let mut publisher = None;
-    let service_mailbox = if with_registry {
-        Some(
-            Mailbox::from_capability(registration)
-                .map_err(|f| f.error)
-                .expect("registry mailbox role invalid")
-                .0,
-        )
-    } else {
-        let inbox = Mailbox::from_capability(registration)
-            .map_err(|f| f.error)
-            .expect("publication inbox role invalid")
-            .0;
-        let deadline =
-            libkernel::time::timeout_millis(10_000).expect("publication handoff deadline failed");
-        let mut message = libkernel::ipc::message::wait_message_until(inbox.as_handle(), deadline)
-            .expect("publication authority receive failed");
-        assert!(
-            message.header.sender_pid == parent_pid
-                && message.header.kind == service::AUTHORITY_GRANT_KIND
-                && message.payload.is_empty()
-                && message.handles.remaining() == 1,
-            "publication authority message invalid"
-        );
-        let capability = message
-            .handles
-            .take(0)
-            .expect("publication authority missing");
-        let (sender, description) = MailboxSender::from_capability(capability)
-            .map_err(|f| f.error)
-            .expect("publication authority role invalid");
-        assert!(
-            description
-                .rights
-                .contains(Rights::WRITE | Rights::WAIT | Rights::TRANSIT)
-                && !description.rights.contains(Rights::GRANT),
-            "publication authority transport invalid"
-        );
-        publisher = Some(sender);
-        inbox
-            .close()
-            .map_err(|(_, e)| e)
-            .expect("publication inbox close failed");
-        None
-    };
+    let mut publisher = authority;
+    let publish_name = config.publish.unwrap_or_default();
+    let owner_rights = Rights::READ | Rights::WAIT | Rights::MANAGE;
+    let service_mailbox = with_registry
+        .then(|| Mailbox::create(owner_rights).expect("registry mailbox creation failed"));
     // 管理 receiver 的运行与最终关闭责任进入 World，入口由独立管理 sender 出生。
-    let route = Mailbox::from_capability(cap(route))
-        .map_err(|f| f.error)
-        .expect("management mailbox role invalid")
-        .0;
+    let route = Mailbox::create(owner_rights).expect("management mailbox creation failed");
     let input = Runtime::<FileTask, WaitSet>::fixed_input_budget(sources)
         .and_then(|fixed| {
             fixed
@@ -262,10 +207,10 @@ pub(crate) fn run(mailbox: Mailbox, startup: Startup) {
     let tenants: alloc::vec::Vec<_> = (0..entries)
         .map(|entry| {
             let mut local = limits;
-            local[fs_base + FsResource::Watch.slot()] = capacity.entry_watches(entry);
-            local[fs_base + FsResource::Stream.slot()] = capacity.entry_sessions(entry);
-            local[fs_base + FsResource::Offer.slot()] = capacity.entry_sessions(entry);
-            local[service_base + ServiceResource::Watch.slot()] = capacity.entry_watches(entry);
+            local[fs_base + FsResource::Watch.slot()] = config.entries()[entry].watches;
+            local[fs_base + FsResource::Stream.slot()] = config.entries()[entry].sessions;
+            local[fs_base + FsResource::Offer.slot()] = config.entries()[entry].sessions;
+            local[service_base + ServiceResource::Watch.slot()] = config.entries()[entry].watches;
             let account = budget
                 .account(&local)
                 .expect("entry account creation failed");
@@ -437,7 +382,7 @@ pub(crate) fn run(mailbox: Mailbox, startup: Startup) {
         .spawn(libexecution::TaskSubmission::new(
             FileTask::Release(
                 lifecycle::Release::new(
-                    notification::NotificationOwner::from_capability(cap(release))
+                    notification::NotificationOwner::from_capability(stop)
                         .map_err(|f| f.error)
                         .expect("provider release role invalid")
                         .0,
@@ -670,9 +615,9 @@ pub(crate) fn run(mailbox: Mailbox, startup: Startup) {
             && file_senders[..entries].iter().all(Option::is_some)
         {
             if with_registry {
-                publish(
-                    &bootstrap,
-                    libfs::protocol::ROOT_GRANT_KIND,
+                export_all(
+                    &mut reporter,
+                    FILE_ROOT_EXPORT,
                     &mut file_senders[..entries],
                 );
             } else {
@@ -685,6 +630,7 @@ pub(crate) fn run(mailbox: Mailbox, startup: Startup) {
                             .take()
                             .expect("publication file root missing"),
                         &tenants[0].0,
+                        publish_name,
                     )
                     .expect("publication request preparation failed"),
                 );
@@ -697,9 +643,9 @@ pub(crate) fn run(mailbox: Mailbox, startup: Startup) {
             && !published_directory
             && directory_senders[..entries].iter().all(Option::is_some)
         {
-            publish(
-                &bootstrap,
-                service::DIRECTORY_GRANT_KIND,
+            export_all(
+                &mut reporter,
+                DIRECTORY_EXPORT,
                 &mut directory_senders[..entries],
             );
             published_directory = true;
@@ -709,9 +655,9 @@ pub(crate) fn run(mailbox: Mailbox, startup: Startup) {
             && !published_management
             && management_senders[..entries].iter().all(Option::is_some)
         {
-            publish(
-                &bootstrap,
-                libfs::route::MANAGEMENT_GRANT_KIND,
+            export_all(
+                &mut reporter,
+                MANAGEMENT_EXPORT,
                 &mut management_senders[..entries],
             );
             published_management = true;
@@ -721,9 +667,9 @@ pub(crate) fn run(mailbox: Mailbox, startup: Startup) {
             && !published_authority
             && authority_senders[..entries].iter().all(Option::is_some)
         {
-            publish(
-                &bootstrap,
-                service::AUTHORITY_GRANT_KIND,
+            export_all(
+                &mut reporter,
+                AUTHORITY_EXPORT,
                 &mut authority_senders[..entries],
             );
             published_authority = true;
@@ -744,7 +690,7 @@ pub(crate) fn run(mailbox: Mailbox, startup: Startup) {
             )
             .expect("registration descriptor invariant");
             let request = Command::Register {
-                name: "fs.secondary",
+                name: publish_name,
                 mode: RegisterMode::CreateOnly,
                 descriptors: Descriptors::decode(&descriptors[..used])
                     .expect("registration descriptor invariant"),
@@ -799,8 +745,8 @@ pub(crate) fn run(mailbox: Mailbox, startup: Startup) {
             && published_management
             && (with_registry || registration_control.is_some())
         {
-            bootstrap
-                .send(libfs::protocol::PROVIDER_READY_KIND, &[])
+            reporter
+                .ready(&[], Deadline::INFINITE)
                 .expect("provider ready publication failed");
             ready = true;
         }
@@ -850,7 +796,7 @@ pub(crate) fn run(mailbox: Mailbox, startup: Startup) {
         "provider budget remained after owner retirement"
     );
     libkernel::debug!("FS1 provider budget empty after owner retirement");
-    bootstrap
-        .send(libfs::protocol::PROVIDER_STOPPED_KIND, &[])
+    reporter
+        .stopped(Deadline::INFINITE)
         .expect("provider stopped publication failed");
 }

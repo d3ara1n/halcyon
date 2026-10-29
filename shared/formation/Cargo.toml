@@ -1,0 +1,22 @@
+[package]
+name = "formation"
+authors = ["Dearain (d3ara1n@outlook.com)"]
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# host 侧组态编译器：读取组态源 TOML，校验后写出 initfs 根的二进制组态文件。
+host = ["dep:toml", "settings/encode"]
+
+[dependencies]
+erhino_shared = { path = "../erhino_shared" }
+settings = { path = "../settings" }
+toml = { version = "=0.8.23", optional = true, features = ["preserve_order"] }
+
+[[bin]]
+name = "formation"
+path = "src/main.rs"
+required-features = ["host"]
+
+[dev-dependencies]
+settings = { path = "../settings", features = ["encode"] }

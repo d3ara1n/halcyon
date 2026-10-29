@@ -5,6 +5,7 @@ edition = "2024"
 description = "Driver declarations, selection, and activation protocol"
 
 [dependencies]
+settings = { path = "../../../shared/settings" }
 erhino_shared = { path = "../../../shared/erhino_shared" }
 libdevice = { path = "../libdevice" }
 libkernel = { path = "../libkernel" }
@@ -12,3 +13,6 @@ librpc = { path = "../librpc" }
 liboal = { path = "../liboal" }
 libbudget = { path = "../libbudget" }
 libexecution = { path = "../libexecution" }
+
+[dev-dependencies]
+settings = { path = "../../../shared/settings", features = ["encode"] }
