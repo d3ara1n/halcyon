@@ -25,7 +25,6 @@ const POOL: &str = "memory.pool";
 const JOB: &str = "kernel.job";
 const RETENTION: &str = "kernel.retention";
 const DMA_ROOT: &str = "kernel.dma";
-const IMAGE_PM: &str = "kernel.image.srv_pm";
 const IMAGE_TARGET: &str = "kernel.image.test_target";
 const IMAGE_HAMMER: &str = "kernel.image.test_hammer";
 const IMAGE_SELF: &str = "kernel.image.test_kernel";
@@ -36,22 +35,14 @@ pub(super) struct Mode(u32);
 impl Mode {
     pub const STRESS: u32 = 1;
     pub const MEMORY: u32 = 1 << 1;
-    pub const MMIO_PUBLICATION: u32 = 1 << 2;
-    pub const MMIO_FORCED: u32 = 1 << 3;
-    pub const DMA_RACES: u32 = 1 << 4;
     pub const DMA_SHARED: u32 = 1 << 5;
     pub const DMA_QUOTA: u32 = 1 << 6;
-    pub const DMA_INSTALL_FAILURE: u32 = 1 << 7;
     pub const IRQ_EXIT: u32 = 1 << 8;
-    const NAMES: [(&'static str, u32); 9] = [
+    const NAMES: [(&'static str, u32); 5] = [
         ("stress", Self::STRESS),
         ("memory", Self::MEMORY | Self::STRESS),
-        ("mmio_publication", Self::MMIO_PUBLICATION),
-        ("mmio_forced", Self::MMIO_FORCED),
-        ("dma_races", Self::DMA_RACES),
         ("dma_shared", Self::DMA_SHARED),
         ("dma_quota", Self::DMA_QUOTA),
-        ("dma_install_failure", Self::DMA_INSTALL_FAILURE),
         ("irq_exit", Self::IRQ_EXIT),
     ];
     pub fn has(self, flag: u32) -> bool {
@@ -118,7 +109,7 @@ fn parse_settings(bytes: &[u8]) -> Settings {
         Some(Ok("memory")) => "memory",
         Some(Ok("ipc")) => "ipc",
         Some(Ok("process")) => "process",
-        Some(Ok("transport")) => "transport",
+        Some(Ok("tunnel")) => "tunnel",
         Some(Ok("mmio")) => "mmio",
         Some(Ok("irq")) => "irq",
         Some(Ok("dma")) => "dma",
@@ -129,10 +120,9 @@ fn parse_settings(bytes: &[u8]) -> Settings {
     };
     let allowed = match suite {
         "memory" => Mode::MEMORY | Mode::STRESS,
-        "ipc" | "process" | "transport" => Mode::STRESS,
-        "mmio" => Mode::MMIO_PUBLICATION | Mode::MMIO_FORCED,
+        "ipc" | "process" | "tunnel" => Mode::STRESS,
         "irq" => Mode::IRQ_EXIT,
-        "dma" => Mode::DMA_RACES | Mode::DMA_SHARED | Mode::DMA_QUOTA | Mode::DMA_INSTALL_FAILURE,
+        "dma" => Mode::DMA_SHARED | Mode::DMA_QUOTA,
         _ => 0,
     };
     assert_eq!(
@@ -252,7 +242,6 @@ pub(super) fn run() {
         .take(RETENTION, ObjectKind::MemoryPool, RETENTION_POOL_RIGHTS)
         .expect("kernel acceptance retention input invalid");
     let self_image = image(&mut birth, IMAGE_SELF);
-    let pm = image(&mut birth, IMAGE_PM);
     let target = image(&mut birth, IMAGE_TARGET);
     let hammer = image(&mut birth, IMAGE_HAMMER);
     // 主进程按平台描述识别 ECAM/IRQ/DMA 根；保留子进程只收 DMA 根别名。
@@ -338,7 +327,6 @@ pub(super) fn run() {
     if let Err(message) = super::run(
         &mut harness,
         job.as_handle(),
-        pm.as_ref().map_or(&[], |(_, view)| view.bytes()),
         target.as_ref().map_or(&[], |(_, view)| view.bytes()),
         hammer.as_ref().map(|(_, view)| view.bytes()),
     ) {

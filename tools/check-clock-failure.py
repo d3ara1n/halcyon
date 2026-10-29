@@ -14,6 +14,7 @@ import sys
 import time
 
 import qemu_gdb as debug
+import qemu_support as support
 
 
 def program(kernel, logs, port):
@@ -163,7 +164,7 @@ def main():
     parser.add_argument('command',nargs=argparse.REMAINDER)
     args=parser.parse_args();command=args.command[1:] if args.command[:1]==['--'] else args.command
     if not command:parser.error('QEMU command missing')
-    logs=debug.fresh_logs(Path('artifacts/clock-first-cause'))
+    logs=support.fresh_logs(Path('artifacts/clock-first-cause'))
     with socket.socket() as listener:listener.bind(('127.0.0.1',0));port=listener.getsockname()[1]
     script=program(args.kernel,logs,port);(logs/'clock.gdb').write_text(script)
     run={'status':'running','command':command,'timeout':args.timeout,
@@ -208,7 +209,7 @@ def main():
                     previous=signal.signal(signum,signal.SIG_IGN)
                     cleanup.callback(signal.signal,signum,previous)
                 if debugger:cleanup.callback(stop_debugger,debugger)
-                if process:cleanup.callback(debug.stop_group,process)
+                if process:cleanup.callback(support.stop_group,process)
         except BaseException as error:
             run['cleanup_error']=str(error)
             if original is None:original=error

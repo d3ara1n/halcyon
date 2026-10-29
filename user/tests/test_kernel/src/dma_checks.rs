@@ -221,19 +221,10 @@ pub(super) fn process_retirement(
     job: Handle,
     image: &[u8],
 ) -> Result<(), &'static str> {
-    let modes: &[&[u8]] = if crate::mode().has(crate::Mode::DMA_INSTALL_FAILURE) {
-        &[b"dma-pin-install-failure"]
-    } else if crate::mode().has(crate::Mode::DMA_QUOTA) {
+    let modes: &[&[u8]] = if crate::mode().has(crate::Mode::DMA_QUOTA) {
         &[b"dma-pin-quota"]
     } else if crate::mode().has(crate::Mode::DMA_SHARED) {
         &[b"dma-shared"]
-    } else if crate::mode().has(crate::Mode::DMA_RACES) {
-        &[
-            b"dma-pin-before",
-            b"dma-pin-after",
-            b"dma-pin-exit",
-            b"dma-reader-retire",
-        ]
     } else {
         &[b"dma-unexposed", b"dma-exposed", b"dma-output-fault"]
     };
@@ -263,17 +254,8 @@ pub(super) fn process_fixture(
     use libkernel::{ipc::notification, process};
     use libprocess::{GrantOutcome, SpawnRequest, spawn};
     let root = root(handle)?;
-    let race = matches!(
-        mode,
-        b"dma-pin-before"
-            | b"dma-pin-after"
-            | b"dma-pin-exit"
-            | b"dma-reader-retire"
-            | b"dma-shared"
-            | b"dma-pin-quota"
-            | b"dma-pin-install-failure"
-    );
-    let pool = if race {
+    let isolated = matches!(mode, b"dma-shared" | b"dma-pin-quota");
+    let pool = if isolated {
         Some(
             libkernel::memory_pool::derive(
                 super::memory_pool(),
@@ -284,7 +266,7 @@ pub(super) fn process_fixture(
                     Rights::READ | Rights::CREATE
                 },
             )
-            .map_err(|_| "DMA race Pool admission failed")?,
+            .map_err(|_| "DMA fixture Pool admission failed")?,
         )
     } else {
         None
@@ -309,10 +291,10 @@ pub(super) fn process_fixture(
     observer
         .register(MemberRequest::new(usage.handle(), ObjectSignals::DONE, 1))
         .map_err(|_| "DMA process registration failed")?;
-    let (mut gate_owner, gate_signaler) = if race {
+    let (mut gate_owner, gate_signaler) = if isolated {
         let gate =
             notification::create(Rights::READ | Rights::WAIT | Rights::GRANT, Rights::SIGNAL)
-                .map_err(|_| "DMA race gate create failed")?;
+                .map_err(|_| "DMA fixture gate create failed")?;
         (Some(gate.owner), Some(gate.peer))
     } else {
         (None, None)
@@ -393,29 +375,18 @@ pub(super) fn process_fixture(
         }
     };
     let label = core::str::from_utf8(mode).map_err(|_| "DMA target mode is invalid")?;
-    if race {
+    if isolated {
         libkernel::debug!(
-            "DMA race target admitted: mode={}, pid={}, scope={}, memory={}, identity={}",
+            "DMA fixture target admitted: mode={}, pid={}, scope={}, memory={}, identity={}",
             label,
             started.pid,
             scope.handle().raw(),
             memory.handle().raw(),
             memory
                 .query()
-                .map_err(|_| "DMA race identity query failed")?
+                .map_err(|_| "DMA fixture identity query failed")?
                 .identity
         );
-        if mode == b"dma-pin-install-failure" {
-            libkernel::debug!(
-                "DMA install target Pool: pid={}, pool={}",
-                started.pid,
-                pool.as_ref()
-                    .ok_or("DMA install Pool missing")?
-                    .query()
-                    .map_err(|_| "DMA install Pool identity query failed")?
-                    .identity
-            );
-        }
     }
     let mut shared_parent = None;
     let result = (|| {
@@ -431,43 +402,24 @@ pub(super) fn process_fixture(
             ready
                 .owner
                 .take(1)
-                .map_err(|_| "DMA race readiness consume failed")?;
+                .map_err(|_| "DMA fixture readiness consume failed")?;
             log_pool(label, "before-pin", pool)?;
             gate_signaler
                 .as_ref()
-                .ok_or("DMA race gate is absent")?
+                .ok_or("DMA fixture gate is absent")?
                 .signal(1)
-                .map_err(|_| "DMA race start signal failed")?;
-            if matches!(mode, b"dma-pin-before" | b"dma-pin-after") {
-                memory.seal().map_err(|_| "DMA race Seal failed")?;
-                let snapshot = memory.query().map_err(|_| "DMA race sealed query failed")?;
-                let expected = if mode == b"dma-pin-before" {
-                    (MemoryObjectState::Executable, 0)
-                } else {
-                    (MemoryObjectState::Sealing, 1)
-                };
-                if snapshot.state != expected.0 as u32 || snapshot.write_permits != expected.1 {
-                    return Err("DMA Pin/Seal ordering window was missed");
-                }
-                libkernel::debug!(
-                    "DMA race Seal committed: mode={}, state={}, writers={}",
-                    label,
-                    snapshot.state,
-                    snapshot.write_permits
-                );
-            }
-            if mode != b"dma-pin-exit" {
-                let result = wait::wait_one(ready.owner.as_handle(), ObjectSignals::READABLE, 0)
-                    .map_err(|_| "DMA race result wait failed")?;
-                if !result.observed.contains(ObjectSignals::READABLE)
-                    || ready
-                        .owner
-                        .take(2)
-                        .map_err(|_| "DMA race result consume failed")?
-                        != 2
-                {
-                    return Err("DMA race result is missing");
-                }
+                .map_err(|_| "DMA fixture start signal failed")?;
+
+            let result = wait::wait_one(ready.owner.as_handle(), ObjectSignals::READABLE, 0)
+                .map_err(|_| "DMA fixture result wait failed")?;
+            if !result.observed.contains(ObjectSignals::READABLE)
+                || ready
+                    .owner
+                    .take(2)
+                    .map_err(|_| "DMA fixture result consume failed")?
+                    != 2
+            {
+                return Err("DMA fixture result is missing");
             }
             if mode == b"dma-shared" {
                 let end = libkernel::time::timeout_millis(REFUND_MILLIS)
@@ -566,7 +518,7 @@ pub(super) fn process_fixture(
             {
                 return Err("DMA target exited before parent Kill");
             }
-            if !race
+            if !isolated
                 && memory
                     .query()
                     .map_err(|_| "DMA live write count failed")?
@@ -599,7 +551,7 @@ pub(super) fn process_fixture(
         scope
             .seal()
             .map_err(|_| "DMA post-exit domain Seal failed")?;
-        if mode == b"dma-unexposed" || race {
+        if mode == b"dma-unexposed" || isolated {
             observer
                 .wait(libkernel::time::Deadline::INFINITE)
                 .map_err(|_| "DMA unexposed exit cleanup failed")?;
@@ -611,17 +563,22 @@ pub(super) fn process_fixture(
             {
                 return Err("DMA unexposed exit retained a writer");
             }
-            if race {
-                let snapshot = scope.query().map_err(|_| "DMA race domain query failed")?;
+            if isolated {
+                let snapshot = scope
+                    .query()
+                    .map_err(|_| "DMA fixture domain query failed")?;
                 if snapshot.flags & DONE == 0 || snapshot.members != 0 {
-                    return Err("DMA race domain retained an unfinished mapping");
+                    return Err("DMA fixture domain retained an unfinished mapping");
                 }
                 log_pool(
                     label,
                     "cpu-done",
-                    pool.as_ref().ok_or("DMA race Pool is absent")?,
+                    pool.as_ref().ok_or("DMA fixture Pool is absent")?,
                 )?;
-                libkernel::debug!("DMA race scope DONE: mode={}, members=0, writer=0", label);
+                libkernel::debug!(
+                    "DMA fixture scope DONE: mode={}, members=0, writer=0",
+                    label
+                );
             }
         } else {
             let snapshot = memory
@@ -640,7 +597,7 @@ pub(super) fn process_fixture(
                 return Err("DMA retained domain reported DONE");
             }
             libkernel::debug!(
-                "DMA isolated retention confirmed: mode={}, pages={}, writer=1",
+                "DMA fixture retention confirmed: mode={}, pages={}, writer=1",
                 if fault {
                     "output-fault"
                 } else {
@@ -662,9 +619,11 @@ pub(super) fn process_fixture(
     drop(memory);
     if let Some(pool) = &pool {
         let end = libkernel::time::timeout_millis(REFUND_MILLIS)
-            .map_err(|_| "DMA race refund deadline failed")?;
+            .map_err(|_| "DMA fixture refund deadline failed")?;
         loop {
-            let snapshot = pool.query().map_err(|_| "DMA race refund query failed")?;
+            let snapshot = pool
+                .query()
+                .map_err(|_| "DMA fixture refund query failed")?;
             if snapshot.allocated == 0
                 && snapshot.delegated == 0
                 && snapshot.reserved == 0
@@ -674,10 +633,10 @@ pub(super) fn process_fixture(
             {
                 break;
             }
-            if libkernel::time::expired(end).map_err(|_| "DMA race refund clock failed")? {
-                return Err("DMA race Pool did not refund");
+            if libkernel::time::expired(end).map_err(|_| "DMA fixture refund clock failed")? {
+                return Err("DMA fixture Pool did not refund");
             }
-            libkernel::thread::yield_now().map_err(|_| "DMA race refund yield failed")?;
+            libkernel::thread::yield_now().map_err(|_| "DMA fixture refund yield failed")?;
         }
         log_pool(label, "closed", pool)?;
     }
@@ -730,9 +689,9 @@ fn log_pool(
     phase: &str,
     pool: &libkernel::memory_pool::MemoryPool,
 ) -> Result<(), &'static str> {
-    let snapshot = pool.query().map_err(|_| "DMA race Pool query failed")?;
+    let snapshot = pool.query().map_err(|_| "DMA fixture Pool query failed")?;
     libkernel::debug!(
-        "DMA race Pool: mode={}, phase={}, id={}, pages={}/{}/{}, metadata={}/{}/{}",
+        "DMA fixture Pool: mode={}, phase={}, id={}, pages={}/{}/{}, metadata={}/{}/{}",
         mode,
         phase,
         snapshot.identity,

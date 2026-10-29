@@ -1,12 +1,6 @@
 //! 消息面：badge 与 affine owner、WaitSet 退休、一次性投递、WRITABLE 流控与控制面压力。
 use super::*;
 
-/// 与 pm 约定的流控验证消息号：请求携带 [目标邮箱 sender、确认 signaler、
-/// 虚假唤醒 signaler]；pm 填满目标邮箱后回样确认，末尾补发 WRITABLE_WAKE_TAIL。
-pub(super) const WRITABLE_WAKE_REQUEST: u64 = 640;
-pub(super) const WRITABLE_WAKE_FILL: u64 = 641;
-pub(super) const WRITABLE_WAKE_TAIL: u64 = 642;
-
 /// badged sender 的来源盖章，以及 owner 的 GRANT/TRANSIT 运输边界。
 pub(super) fn test_capability_badges_and_affine_owners() {
     const BADGE: u64 = 0x51a7_0bad_f00d;
@@ -401,96 +395,6 @@ pub(super) fn test_writable_level() {
 /// 跨进程流控唤醒：pm 填满目标邮箱后在 WRITABLE 上阻塞，本进程腾出一个
 /// 位置唤醒它。pm 侧内联检测虚假唤醒（醒来后再撞满箱即置 spin 位），
 /// 末尾校验 spin 为空——唤醒只能由腾位引起，证明等待路径真实走过。
-pub(super) fn test_writable_wake(
-    harness: &mut Harness,
-    pm_mailbox: Handle,
-) -> Result<(), &'static str> {
-    let target = harness
-        .create_mailbox(
-            Rights::READ | Rights::WAIT | Rights::MANAGE,
-            Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
-        )
-        .map_err(|_| "wake target mailbox create failed")?;
-    let done = harness
-        .create_notification(
-            Rights::READ | Rights::WAIT | Rights::MANAGE,
-            Rights::SIGNAL | Rights::TRANSIT,
-        )
-        .map_err(|_| "wake done notification create failed")?;
-    let spin = harness
-        .create_notification(
-            Rights::READ | Rights::WAIT | Rights::MANAGE,
-            Rights::SIGNAL | Rights::TRANSIT,
-        )
-        .map_err(|_| "wake spin notification create failed")?;
-    let moves = [
-        HandleMove {
-            handle: target.peer,
-            rights: Rights::WRITE | Rights::WAIT,
-        },
-        HandleMove {
-            handle: done.peer,
-            rights: Rights::SIGNAL,
-        },
-        HandleMove {
-            handle: spin.peer,
-            rights: Rights::SIGNAL,
-        },
-    ];
-    unsafe { send_raw(pm_mailbox, WRITABLE_WAKE_REQUEST, &[], &moves) }
-        .map_err(|_| "wake request send failed")?;
-    harness.transferred(target.peer);
-    harness.transferred(done.peer);
-    harness.transferred(spin.peer);
-
-    // pm 确认已满后置位通知，此时它正阻塞在 WRITABLE 上。
-    let deadline = libkernel::time::timeout_millis(5_000).map_err(|_| "wake deadline failed")?;
-    let done_wait = libkernel::ipc::wait::wait_until(done.owner, ObjectSignals::READABLE, deadline)
-        .map_err(|_| "wake notification wait failed")?;
-    if WaitReason::from_u32(done_wait.reason) == Some(WaitReason::Timeout) {
-        return Err("pm writable wake confirmation timed out");
-    }
-    harness
-        .notification_owner(done.owner)
-        .take(u64::MAX)
-        .map_err(|_| "wake notification take failed")?;
-    discard(target.owner).map_err(|_| "wake make-room failed")?;
-
-    // 队列：15 × FILL + TAIL。逐条校验，末尾必然是被唤醒后补发的 TAIL。
-    for index in 0..MAILBOX_CAPACITY {
-        let ready = libkernel::ipc::wait::wait_until(
-            target.owner,
-            ObjectSignals::READABLE | ObjectSignals::CLOSED,
-            deadline,
-        )
-        .map_err(|_| "writable tail wait failed")?;
-        if WaitReason::from_u32(ready.reason) == Some(WaitReason::Timeout) {
-            return Err("pm writable tail timed out");
-        }
-        let message = receive(target.owner).map_err(|_| "writable tail receive failed")?;
-        let expected = if index + 1 == MAILBOX_CAPACITY {
-            WRITABLE_WAKE_TAIL
-        } else {
-            WRITABLE_WAKE_FILL
-        };
-        if message.header.kind != expected {
-            return Err("unexpected writable wake message");
-        }
-    }
-    // TAIL 已入队即 pm 已退出循环；此前的任何虚假唤醒都会留下 spin 位。
-    if !matches!(
-        harness.notification_owner(spin.owner).take(u64::MAX),
-        Err(SystemCallError::ObjectNotAvailable)
-    ) {
-        return Err("writable wake reported a spurious completion");
-    }
-    harness.close_control(done.owner)?;
-    harness.close_control(spin.owner)?;
-    harness.close_control(target.owner)?;
-    debug!("writable wake passed");
-    Ok(())
-}
-
 pub(super) fn stress_control_plane() {
     for index in 0..CONTROL_STRESS {
         let mailbox = create(

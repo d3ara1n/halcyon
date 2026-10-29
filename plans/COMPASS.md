@@ -9,7 +9,8 @@
 1. [全项目重构总纲：剩余切面与接续顺序](todo-2026-09-29-system-redesign.md#剩余切面与接续顺序)。本轮整理范围见[活跃资料清理](todo-2026-09-29-system-redesign.md#活跃资料清理2026-10-27)，后续代码/Review按各自记录接手；主线设计入口如下。
 2. [OAL、fs 与服务目录改造](todo-2026-10-07-fal-service-redesign.md#当前接力)：本轮实施已提交；[固定交付独立 Review](archived/todo-2026-10-11-oal-fs-service-review.md)已完成，报告记录的证据缺口继续由主计划和既有 owner 承接；通用等待与付款前置分别由 [Notification 观察角色](todo-2026-10-10-notification-observer-roles.md#当前接力与范围)和[执行付款](archived/todo-2026-10-10-execution-funding.md#当前接力与范围)拥有。
 3. [initfs 组态与统一服务契约](todo-2026-10-28-init-formation.md#当前接力)：出生与普通运行修复从[原阻塞处置](todo-2026-10-28-init-formation.md#首次运行阻塞2026-10-29)追溯；其余运行边界从主计划接续。
-4. [验收分组与失效设施清理](todo-2026-10-29-acceptance-groups.md)：按影响领域选择验证，接续组态迁移后的验收设施。
+
+自动内核验收按[构建与验证手册](BUILD-AND-TEST.md)选择；分组、专项清理与公开契约范围的收口见[验收归档](archived/todo-2026-10-29-acceptance-groups.md#公开行为验收替代2026-10-29)。
 
 对象链已交付范围和[内存/hart兼容完成边界](todo-2026-10-01-memory-redesign.md#完成边界与-hart-兼容性复核)从各记录接手，不恢复旧内核拼装；运行时分层/线程生命周期见[复核档案](archived/review-2026-09-28-runtime-layering.md)。五批 Review 的当前有效性与后续责任统一从[总报告](review-2026-10-12-consolidated.md)接手；测量触发的[锁评估](todo-2026-10-01-lock-performance.md)按自身条件推进。
 

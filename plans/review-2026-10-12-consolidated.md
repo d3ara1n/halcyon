@@ -55,7 +55,7 @@
 
 - **合法 WaitSet Remove 的真实 Busy/Quota 注入不适用。** [WaitSet::remove](../os/kernel/src/task/wait_set.rs)（250—260）有锁摘 token、锁外 Drop/kick，不分配且没有 Busy/Quota 分支；未知 token 为 ObjectNotFound，Runtime 按已退休处理。通用 SourceOps 的失败保 owner/回执/费用已有 host 边界；不能要求当前内核制造不存在的资源拒绝。对应 FAL F-01、执行 E-02 的这一部分退出；真实映射撤销失败与异步回执组合仍归 E03。
 - **独占、合法、非映射 Handle/Delivery Close 的资源性失败不适用。** [FAL 主计划再核](todo-2026-10-07-fal-service-redesign.md#提交前机制收敛)第 1674—1678 行、C08/C10 已区分叶能力 Close 与映射 Unmap。旧 close-retry 暂存删除不能被旧报告恢复为施工要求；错误 raw handle 与进程已经退出是另一失败合同。
-- **Copy 的非零目标 accepted 后取消有历史实现及运行记录。** 当时的 `srv_init/src/filesystem/copy.rs` 消费者经真实 ReadAt 确认非零前缀，再取消并核最终前缀、并发隔离和退款；该消费者在组态切面 B 已删，旧验收锚点由[验收清理](todo-2026-10-29-acceptance-groups.md)删除，不再作为当前可运行覆盖。[主计划第二轮验证与第三轮最终收口](archived/ref-2026-10-27-oal-fs-delivery-history.md#第三轮最终收口)记录最终 C10/C11 聚合覆盖该门，原证据路径为 `artifacts/convergence3/acceptance-summary.json`。该原始产物当前不在工作区，运行结果按已交付工作记录取证，未重新逐 guest 验证。FAL F-05 中“未接通/未运行”的表述不适用于其主固定目标 `a1ca124`；不因此宣称所有取消交错已覆盖。坏帧/Delivery 特定失败仍归 E04。
+- **Copy 的非零目标 accepted 后取消有历史实现及运行记录。** 当时的 `srv_init/src/filesystem/copy.rs` 消费者经真实 ReadAt 确认非零前缀，再取消并核最终前缀、并发隔离和退款；该消费者在组态切面 B 已删，旧验收锚点由[验收清理](archived/todo-2026-10-29-acceptance-groups.md)删除，不再作为当前可运行覆盖。[主计划第二轮验证与第三轮最终收口](archived/ref-2026-10-27-oal-fs-delivery-history.md#第三轮最终收口)记录最终 C10/C11 聚合覆盖该门，原证据路径为 `artifacts/convergence3/acceptance-summary.json`。该原始产物当前不在工作区，运行结果按已交付工作记录取证，未重新逐 guest 验证。FAL F-05 中“未接通/未运行”的表述不适用于其主固定目标 `a1ca124`；不因此宣称所有取消交错已覆盖。坏帧/Delivery 特定失败仍归 E04。
 - **普通 RPC queued/sent unknown、迟到旧 txid 和 sealed live waiter 不能笼统记成“没有组合证据”。** 当前消费者/主计划已有实际场景；旧执行 E-01、运输 E-03 仅保留尚未定位到证据的精确 Wake 拒绝、异常输出及平台边界，见 E04/E07。后续不能为了重验已覆盖部分扩大任务。
 
 ## 仍影响未来施工的设计闭合责任

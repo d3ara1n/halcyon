@@ -1,71 +1,17 @@
 //! 验收本地 owner；子进程失败升级为本进程失败，由 init 原 services 收集兜底。
-use super::tunnel_checks::{ReadWorld, StreamReadTask};
 use super::*;
 use alloc::vec::Vec;
-use libexecution::assembly::Assembly;
 use libprocess::{CollectedProcess, Collector};
 
 pub(super) struct Harness {
-    capabilities: Vec<Owner>,
+    capabilities: Vec<Capability>,
     processes: Vec<Supervised>,
-    read: Option<ReadWorld>,
-    failed_capability: Option<Capability>,
-    failed_endpoint: Option<librunnel::MappedEndpoint>,
-    failed_create: Option<libkernel::ipc::tunnel::Endpoint>,
-    failed_invitation: Option<libkernel::ipc::invitation::Invitation>,
-}
-enum Owner {
-    Plain(Capability),
-    Sender(MailboxSender),
-    Notification(notification::NotificationOwner),
-    Signaler(notification::NotificationSignaler),
-}
-impl Owner {
-    fn handle(&self) -> Handle {
-        match self {
-            Self::Plain(cap) => cap.as_handle(),
-            Self::Sender(cap) => cap.as_handle(),
-            Self::Notification(cap) => cap.as_handle(),
-            Self::Signaler(cap) => cap.as_handle(),
-        }
-    }
-    fn transferred(self) {
-        match self {
-            Self::Plain(cap) => {
-                cap.into_raw();
-            }
-            Self::Sender(cap) => {
-                cap.into_capability().into_raw();
-            }
-            Self::Notification(cap) => {
-                cap.into_raw();
-            }
-            Self::Signaler(cap) => {
-                cap.into_raw();
-            }
-        }
-    }
-    fn close(self) {
-        let result = match self {
-            Self::Plain(cap) => cap.close().map_err(|(_, error)| error),
-            Self::Sender(cap) => cap.close().map_err(|(_, error)| error),
-            Self::Notification(cap) => cap.close().map_err(|(_, error)| error),
-            Self::Signaler(cap) => cap.close().map_err(|(_, error)| error),
-        };
-        // 关闭失败不能继续报告验收成功；init 持有本进程与整棵验收 Job。
-        result.expect("kernel acceptance capability close failed");
-    }
 }
 impl Harness {
     pub(super) fn new() -> Self {
         Self {
             capabilities: Vec::new(),
             processes: Vec::new(),
-            read: None,
-            failed_capability: None,
-            failed_endpoint: None,
-            failed_create: None,
-            failed_invitation: None,
         }
     }
     fn reserve(&mut self, count: usize) -> Result<(), SystemCallError> {
@@ -76,7 +22,7 @@ impl Harness {
     fn adopt(&mut self, handle: Handle) {
         // SAFETY: 调用方仅移交本次 create/duplicate 返回的唯一新表项。
         self.capabilities
-            .push(Owner::Plain(unsafe { Capability::from_raw(handle) }));
+            .push(unsafe { Capability::from_raw(handle) });
     }
     pub(super) fn create_job(
         &mut self,
@@ -110,68 +56,22 @@ impl Harness {
         self.adopt(handle);
         Ok(handle)
     }
-    pub(super) fn create_mailbox(
-        &mut self,
-        owner: Rights,
-        sender: Rights,
-    ) -> Result<libkernel::shared::object::HandlePair, SystemCallError> {
-        self.reserve(2)?;
-        let pair = create(owner, sender)?;
-        self.adopt(pair.owner);
-        // SAFETY: 工厂刚返回的 sender 表项在此唯一采用。
-        let cap = unsafe { Capability::from_raw(pair.peer) };
-        let sender = MailboxSender::from_capability(cap)
-            .map_err(|failure| failure.error)?
-            .0;
-        self.capabilities.push(Owner::Sender(sender));
-        Ok(pair)
-    }
-    pub(super) fn create_notification(
-        &mut self,
-        owner: Rights,
-        signaler: Rights,
-    ) -> Result<libkernel::shared::object::HandlePair, SystemCallError> {
-        self.reserve(2)?;
-        let pair = notification::create(owner, signaler)?;
-        let handles = libkernel::shared::object::HandlePair::new(
-            pair.owner.as_handle(),
-            pair.peer.as_handle(),
-        );
-        self.capabilities.push(Owner::Notification(pair.owner));
-        self.capabilities.push(Owner::Signaler(pair.peer));
-        Ok(handles)
-    }
-    pub(super) fn notification_owner(&self, handle: Handle) -> &notification::NotificationOwner {
-        self.capabilities
-            .iter()
-            .find_map(|owner| match owner {
-                Owner::Notification(cap) if cap.as_handle() == handle => Some(cap),
-                _ => None,
-            })
-            .expect("notification remains owned")
-    }
-    pub(super) fn sender(&self, handle: Handle) -> &MailboxSender {
-        self.capabilities
-            .iter()
-            .find_map(|owner| match owner {
-                Owner::Sender(cap) if cap.as_handle() == handle => Some(cap),
-                _ => None,
-            })
-            .expect("sender remains owned")
-    }
-    fn take(&mut self, handle: Handle) -> Owner {
+    fn take(&mut self, handle: Handle) -> Capability {
         let index = self
             .capabilities
             .iter()
-            .position(|owner| owner.handle() == handle)
+            .position(|owner| owner.as_handle() == handle)
             .expect("capability remains owned");
         self.capabilities.swap_remove(index)
     }
     pub(super) fn transferred(&mut self, handle: Handle) {
-        self.take(handle).transferred();
+        self.take(handle).into_raw();
     }
     pub(super) fn close_control(&mut self, handle: Handle) -> Result<(), &'static str> {
-        self.take(handle).close();
+        self.take(handle)
+            .close()
+            .map_err(|(_, error)| error)
+            .expect("kernel acceptance capability close failed");
         Ok(())
     }
     pub(super) fn reserve_process(&mut self) -> Result<(), SystemCallError> {
@@ -250,92 +150,5 @@ impl Harness {
                 return Err(SystemCallError::DeadlineExpired);
             }
         }
-    }
-    pub(super) fn retain_capability(&mut self, capability: Capability) {
-        self.failed_capability = Some(capability);
-    }
-    pub(super) fn retain_transport(
-        &mut self,
-        endpoint: librunnel::MappedEndpoint,
-        invitation: libkernel::ipc::invitation::Invitation,
-    ) {
-        self.failed_endpoint = Some(endpoint);
-        self.failed_invitation = Some(invitation);
-    }
-    pub(super) fn retain_failed_create(
-        &mut self,
-        endpoint: Option<libkernel::ipc::tunnel::Endpoint>,
-        invitation: Option<libkernel::ipc::invitation::Invitation>,
-    ) {
-        self.failed_create = endpoint;
-        self.failed_invitation = invitation;
-    }
-    pub(super) fn start_read(&mut self, tunnel: blocking::Consumer, buffer: Vec<u8>) {
-        assert!(
-            self.read.is_none(),
-            "kernel acceptance stream already owned"
-        );
-        self.read = Some(ReadWorld {
-            tunnel: Some(tunnel),
-            buffer,
-            ..ReadWorld::default()
-        });
-    }
-    pub(super) fn read_world(&mut self) -> &mut ReadWorld {
-        self.read
-            .as_mut()
-            .expect("kernel acceptance stream remains owned")
-    }
-    pub(super) fn await_read(&mut self) -> Result<(), &'static str> {
-        let budget = Budget::new(&[1, 64 * 1024], 1).expect("stream budget failed");
-        let account = budget
-            .account(&[1, 64 * 1024])
-            .unwrap()
-            .view::<ExecutionResource>(&[budget.slot(0).unwrap(), budget.slot(1).unwrap()])
-            .unwrap();
-        let mut assembly =
-            Assembly::new(WaitSet::create(2).expect("stream WaitSet failed"), &account)
-                .map_err(|(_, error)| error)
-                .expect("stream Assembly failed");
-        let mut runtime =
-            Runtime::new(assembly.bind().unwrap(), 1, 2, &account).expect("stream Runtime failed");
-        runtime
-            .spawn(libexecution::TaskSubmission::new(
-                StreamReadTask::new(),
-                2,
-                account,
-            ))
-            .map_err(|failure| failure.error)
-            .expect("stream task failed");
-        let world = self.read_world();
-        world.buffer.resize(STREAM_LEN + 1, 0);
-        assembly
-            .run(&mut runtime, world, 1)
-            .expect("stream execution failed");
-        runtime
-            .close()
-            .map_err(|(_, error)| error)
-            .expect("stream Runtime close failed");
-        assembly
-            .close()
-            .map_err(|(_, error)| error)
-            .expect("stream Assembly close failed");
-        if world.failed {
-            return Err("stream read failed");
-        }
-        Ok(())
-    }
-    pub(super) fn close_read(&mut self) -> Result<(), &'static str> {
-        let mut world = self
-            .read
-            .take()
-            .expect("kernel acceptance stream remains owned");
-        if let Some(tunnel) = world.tunnel.take() {
-            tunnel
-                .close()
-                .map_err(|(_, error)| error)
-                .expect("stream close failed");
-        }
-        Ok(())
     }
 }

@@ -1,3 +1,0 @@
-# 资源专项：在所属资源组上选择 dma_races 模式。
-[instance.kernel]
-settings.mode = ["dma_races"]

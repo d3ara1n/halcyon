@@ -1,5 +1,7 @@
 # 验收分组与失效设施清理
 
+状态：已完成。用户已授权整理提交；按最终内核公开契约范围归档，后续依据构建手册按实际改动选择验证。
+
 ## 范围与基线
 
 用户于 2026-10-29 确认实施：按影响领域选择测试，失败后依据现场扩大范围，删除失效与无独立价值的历史设施。基线 `ec121a5`，分支 `refactor/system-redesign`，接手时工作树干净。
@@ -31,7 +33,7 @@
 
 ## 当前状态与交付边界
 
-分组实施已提交为 `2314f40`。首次实跑暴露的 Bash 空数组与 init 出生授权问题已修复；用户随后要求逐条运行，本轮十个普通组分别执行并全部通过，FP 配额失败及单条复验也已保留。当前入口为 `just acceptance`，33 条目录路线中其余压力、GDB、故障注入和额外平台未在本轮选择，不能一并标为通过。结果见[逐条运行与修复](#逐条运行与修复2026-10-29)。
+已提交基线为 `78d7da8`（分组 `2314f40`、出生修复 `fe0ed70`）。用户进一步明确自动验收限于内核公开契约：GDB自动路线与跨服务业务消费者已移除，当前目录20条，普通集合9条。新结构下9条普通及IRQ退出/DMA共享/额度3条专项逐条通过，工具与清理合同14项通过；其余压力和额外平台不在本轮运行声明内。清理、证据与边界由[公开行为验收替代](#公开行为验收替代2026-10-29)拥有；此前两轮结果按当时范围保留为历史。本轮实现、验证与文档已收口，按用户授权整理提交并归档。
 
 - test_kernel 按 suite 分派；通用 Job 检查不再调用资源退休。MMIO/DMA 专项也不再重复普通平台自检或不相关保留 fixture。普通 suite 只装配自身及必需映像。
 - `just check/clippy` 无参数只列选择；按 package/分面执行，`all` 显式全仓。host tests 自动从 rustc 获取并显式传 host target。
@@ -79,9 +81,9 @@
 
 ## 后续运行边界
 
-十个普通组已分别通过，正常出生、领域完成、服务就绪与正常停止取得运行证据。同版本同输入通过的组不重跑；压力、GDB、额外平台和故障注入仍按具体影响与用户选择执行，不能据普通组通过推断这些专项窗口已覆盖。
+自动验收当前只覆盖内核公开契约，按本篇最后一轮的目录与证据接手。此前服务启停、GDB与故障注入的运行结果保留当时事实，不恢复到自动验收目录。压力与额外平台按具体风险显式选择，同版本同输入通过的检查不重跑。
 
-组态切面 B 的系统运行期责任继续由[原计划](todo-2026-10-28-init-formation.md#当前接力)拥有，本记录只拥有分组工具的运行取证边界。
+组态切面 B 的系统运行期责任继续由[原计划](../todo-2026-10-28-init-formation.md#当前接力)拥有，本记录只拥有分组工具的运行取证边界。
 
 ## 首次运行取证（2026-10-29）
 
@@ -94,7 +96,7 @@
 
 入口修复将普通与 retention 分支的可选参数数组改为从完整 Python 命令开始的非空 `runner` 数组，不改变参数、超时或判据。普通、sifive_u reset、两条 retention 分支的 just dry-run 生成脚本经 `/bin/bash -n` 通过；普通分支另有实际 QEMU 启动证据，其他分支仅做语法检查。没有为这处低影响脚本修复新增测试或重复运行已通过的 Rust 检查。
 
-正式阻塞由[init 计划的首次运行阻塞](todo-2026-10-28-init-formation.md#首次运行阻塞2026-10-29)唯一拥有。本轮只修入口，不改产品出生权限；静态核实生命周期输入缺少 ProcessGrant 必需的 GRANT，运行日志尚未标出 Preparation 具体失败阶段，不把静态定位冒充断点取证。后续从该责任链接续修复，再验证 memory/basic 与其余普通路线。
+正式阻塞由[init 计划的首次运行阻塞](../todo-2026-10-28-init-formation.md#首次运行阻塞2026-10-29)唯一拥有。本轮只修入口，不改产品出生权限；静态核实生命周期输入缺少 ProcessGrant 必需的 GRANT，运行日志尚未标出 Preparation 具体失败阶段，不把静态定位冒充断点取证。后续从该责任链接续修复，再验证 memory/basic 与其余普通路线。
 
 交付前检查：修复只涉及命令组装，runner 日志、失败拒绝、独立进程组与清理合同保持；退出后核无本轮 launcher 或 QEMU 残留。普通领域通过数为 0，失败 1，未运行 9；不能由本次失败判断这些领域自身已执行或存在缺陷。构建与验收完整日志保留，未提交改动。
 
@@ -130,3 +132,70 @@ FP 首次运行在 Start 前报 `System(QuotaExceeded)`，现场为 `artifacts/a
 ### 后续测试接力
 
 用户于本轮提交后要求交给另一 agent 继续测试；沿用逐条执行、逐条核对、首错定位的方式，不批量启动整个目录。十个普通组的已有结果继续有效。后续优先选择尚未验证的平台变体，再按风险选择压力或资源专项；历史 clock 调查仍只按复发条件启动。新结果追加在本记录，产品问题回到所属计划，不另建重复验收计划。
+
+## 后续五条取证与 MMIO 观察修复（2026-10-29）
+
+RubyCreek 转交用户的继续测试指示后，在 `78d7da8`、干净工作树接手并独占共享构建产物。先选择尚缺运行证据的三种平台变体，再用 process stress 覆盖 debug/mode 与竞态矩阵入口、mmio-publication 覆盖新 PID 下的 GDB 精确窗口。每条结束后核 result、guest/观察事实与进程清理，再启动下一条；没有调用 all、用循环批量运行或重跑前十条普通组。
+
+| 单条命令 | 已核事实 | QEMU/观察段 / 含构建 | 原始证据目录 |
+|---|---|---|---|
+| `just acceptance platform nofd` | 四 hart Base64 域，startup 出生、完成、正常收集与 Shutdown，runner_exit=0 | 0.290s / 3.966s | `artifacts/acceptance/20261029T102048.214653Z-96959/` |
+| `just acceptance platform hetero` | hart0 Base64、hart1–3 Base64+D64；真实 FP 验证、正常收集与 Shutdown，runner_exit=0 | 0.294s / 2.993s | `artifacts/acceptance/20261029T102122.578123Z-97242/` |
+| `just acceptance platform sifive_u` | startup 完成、全部收集、Requested Shutdown 后才出现 NotSupported；按平台合同主动收割，harvested_after_reset_failure=true、runner_exit=null | 0.700s / 3.100s | `artifacts/acceptance/20261029T102144.098106Z-97499/` |
+| `just acceptance process stress` | debug/mode=1，注册表回收、线程压力和16/16竞态矩阵，正常收集与 Shutdown，runner_exit=0 | 78.963s / 83.633s | `artifacts/acceptance/20261029T102220.318238Z-97788/` |
+| `just acceptance resources mmio-publication`（修复后） | 原 controller PID=2、目标PID=3/4；Preparing/PublishGranted 两窗口、Revoke返回、目标存活时scope DONE/members0、32页IO PTE均移除、两个Pool双维零；正式完成及Shutdown，runner_exit=0 | 3.972s / 7.240s | `artifacts/acceptance/20261029T102541.761364Z-98842/`；窗口证据 `artifacts/mmio-publication/20261029T102541.818048Z-98845/evidence.json` |
+
+全部 result 的 exit_code=0 且无 cleanup_error；virt 四条与观察器成功退出，sifive_u 只按明确成功后 reset 不支持的例外通过。每条之后均核无 QEMU 残留；MMIO 结束另核无 GDB 残留。五次成功调用含增量构建合计100.932s，运行/观察段84.219s，三平台与process使用THROTTLE=50，精确MMIO观察为100；不含人工核对、修复和首次失败，不作性能承诺。汇总、源码hash与工具修复patch在 `artifacts/acceptance-sequential/20261029T102627Z-followup-summary/`。
+
+### MMIO 首败与观察器处置
+
+首轮 `mmio-publication` 的真实 Map 返回 ObjectClosed，目标随后因预期 ObjectBusy 触发断言；原始现场 `artifacts/acceptance/20261029T102354.463811Z-98422/`，运行段2.977s、含构建7.239s。对应 `artifacts/mmio-publication/20261029T102356.678918Z-98424/` 中 publication.log 为空、windows=[]，说明没有建立目标许可交错，不能据此认定内核 MMIO 发布契约错误。
+
+工具此前在读取 `formation instance started` 后才做离线GDB/机器码核验并连接客体，期间客体继续运行，父Revoke与子Map可先完成。修复仅涉及 `tools/check-resources.py`、`tools/qemu_mmio_gdb.py`：该路线以 -S 冷启动，先核代码窗口、连接GDB并安装原硬件断点，再由GDB恢复；controller PID 随实际出生记录与目标准入记录传入，断点处核其真实owner和原scope。原目标rights、Map结果、PTE/DONE/退款判据及产品代码保持。单条复验的两个完整窗口证明该启动顺序能够建立原交错。
+
+### 本轮结构检查与边界
+
+主代理核对冷启动、离线准备失败、GDB失败和guest失败均沿原 finally 收专属进程组；没有新增控制线程、测试框架或产品同步协议。修改Python经AST语法检查、实际GDB脚本执行和diff检查；其余已通过的Rust/host检查不因工具改动重跑。按REVIEW的验收工具维护口径，不新增可选系统Review。
+
+这五条是当时33条目录中的通过事实，剩余18条当时未运行。用户随后取消GDB自动验收并收缩为内核契约测试，目录、未提交工具修复及后续范围由下一节取代；不继续补跑旧目录。clock没有复发，不重开调查。
+
+## 公开行为验收替代（2026-10-29）
+
+用户明确决定移除依赖 GDB 内部状态/断点的自动验收，改用其他方法。此前 mmio-forced 首轮中 guest 两场完成退款与正常 Shutdown，但调试器晚连接超时、windows=[]，原现场 `artifacts/acceptance/20261029T103742.322669Z-99780/`，不能记为专项通过。为该观察器进行的未验证冷启动修改随工具删除，不作为交付能力。
+
+本轮范围：用户随后进一步明确自动测试只覆盖内核，不接受跨模块组合与两小时级验收。删除13条GDB自动路线及专用脚本/组态/guest阶段假设，移出services与pm/RPC跨服务组合；transport收缩为tunnel，仅验证内核能力、映射几何、失败owner和生命周期。保留现有普通领域及显式压力，DMA共享/额度与IRQ退出改走普通runner。取消尚未实施的MMIO新竞态方案，复用普通MMIO检查。手动clock调查与离线栈分析不作为自动验收入口。产品代码、公共ABI与权限不修改。
+
+替代合同：host按独立纯机制选择单测；QEMU按内核公开系统调用契约检查正常、拒绝、撤销、退出与资源收束。MMIO保留授权冲突、Seal/Revoke、RAM洞保值/旧VA复用、最后use关闭与进程退休；IRQ保留WaitOne/WaitSet使用者退出、原generation/来源DONE及退款，不宣称命中内部Waiting；DMA共享和额度的guest断言保持。旧精确阶段、内部借用/快照、强制分配/IPI/VM修复/reset拒绝注入及跨服务RPC/业务流不再由当前自动验收提供，历史结果保持当时事实。普通目录包含9条有限路线，压力与平台变体显式选择，不设置全目录必跑门，也不为未覆盖内部窗口新增产品hook或测试框架。
+
+验证顺序：脚本/目录与guest check/clippy，分组/清理合同沿用既有runner测试；随后逐条运行受本次guest收缩与runner变更影响的普通内核路线，以及IRQ退出、DMA共享和额度，核结果后再下一条。通过后不重复，失败只修当前路线；不自动追加长压力/故障调查，历史clock不运行。本节拥有本轮清理与替代的进度、证据及剩余边界。
+
+### 最终实施与验证
+
+当前20条目录均配置为普通runner：9条普通内核、4条显式压力、4条额外平台与3条公开资源专项。删除13条GDB自动路线及14个专用宿主脚本/模块，移除其组态和指定阶段guest分支；services退出自动目录，transport改为tunnel，删除pm/RPC业务流、异构流读取任务及其测试侧owner/依赖。手动clock与离线栈分析保留，自动runner不导入GDB模块。新的 `qemu_support.py` 只拥有目录与进程组清理。
+
+原mmio-forced失败还暴露macOS清理误报：直接子进程已成为zombie时，对只含它的组发信号返回EPERM。以独立短命进程复现后，在公共清理入口先poll回收直接子进程，再按原合同收组/核后代。复现前后证据 `artifacts/acceptance-sequential/cleanup-reap-check/{before.log,after.log}`；既有runner超时、中断、错误拒绝等14项测试通过。未新增测试框架或产品注入hook。
+
+guest最终clippy：test_kernel通过（`artifacts/checks/20261029T104912.938299Z-2005/test_kernel.log`），test_target通过（`artifacts/checks/20261029T104952.235295Z-2189/test_target.log`）。期间check/clippy发现的旧流读取常量、已删owner/导入及残留注释均随清理消除，原失败日志保留。运行后仅统一测试诊断措辞和文档，没有改变判定或控制流。
+
+| 单条选择 | 运行段 / 含增量构建 | result.json 所在目录 |
+|---|---|---|
+| tunnel | 0.292s / 4.794s | `artifacts/acceptance/20261029T105127.751946Z-2712/` |
+| resources mmio | 0.855s / 4.158s | `artifacts/acceptance/20261029T105201.939009Z-2995/` |
+| memory | 0.866s / 3.561s | `artifacts/acceptance/20261029T105310.958328Z-4007/` |
+| ipc | 0.849s / 3.474s | `artifacts/acceptance/20261029T105326.582666Z-4275/` |
+| process | 0.845s / 3.724s | `artifacts/acceptance/20261029T105347.713682Z-4563/` |
+| time | 1.372s / 3.997s | `artifacts/acceptance/20261029T105359.935504Z-4805/` |
+| resources irq | 0.295s / 2.940s | `artifacts/acceptance/20261029T105412.819178Z-5051/` |
+| resources dma | 0.838s / 3.479s | `artifacts/acceptance/20261029T105424.421039Z-5288/` |
+| platform fp | 0.297s / 3.207s | `artifacts/acceptance/20261029T105438.179448Z-5557/` |
+| resources irq-exit | 0.295s / 2.932s | `artifacts/acceptance/20261029T105222.311801Z-3257/` |
+| resources dma-shared | 0.846s / 3.509s | `artifacts/acceptance/20261029T105235.953570Z-3502/` |
+| resources dma-quota | 0.862s / 3.648s | `artifacts/acceptance/20261029T105249.691810Z-3740/` |
+
+以上均为release、默认THROTTLE=50，各条核领域完成、全部收集、Requested Shutdown、exit_code/runner_exit=0且无cleanup_error，之后核无QEMU/GDB残留。先核当前条再启动下一条，没有调用all或批量运行。9条普通调用含增量构建合计33.334s，QEMU段6.509s；3条资源专项另用10.089s/2.003s。统计不含人工核对、静态检查和编辑，缓存条件及覆盖均与旧两小时混合集合不同，不作等价性能比较。完整命令、逐条结果、汇总及差异在 `artifacts/kernel-acceptance-migration/`。
+
+### 收口与覆盖限制
+
+主代理按REVIEW检查最终边界、owner、失败/取消清理、过时入口及文档：自动链只调用普通runner，旧GDB目录、单一时序假设和RPC/服务消费路径已删；手动调查与自动清理分属各自模块；未改内核/正式服务、共享ABI或产品锁序。实现说明和构建手册已回填，文档引用、Python语法、Rust格式及diff核对通过。该交付是验收设施维护，不新增系统机制或设计Review登记。
+
+当前承诺为有限的内核公开契约验收，上表12条通过；其余4条压力和4条额外平台未在本轮运行，也不要求为日常门补齐。已取消的精确内部窗口、故障注入和跨服务行为覆盖不以其他成功用例代替；业务能力按需人工验证。没有待接通的GDB替代设施或产品正确性修复；后续按实际内核改动选领域，本轮不继续追加运行。本轮已获用户授权整理提交，记录归档。

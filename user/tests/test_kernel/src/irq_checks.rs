@@ -277,7 +277,7 @@ pub(super) fn process_retirement(
             {
                 return Err("IRQ exit target terminated before the controlled Kill");
             }
-            // readiness不证明park；Kill前按变体核Waiting/source或真实Set/Line成员。
+            // 就绪后可处于准备等待或已等待；两种公开交错均须正确收束。
             if process::kill(started.control).map_err(|_| "IRQ exit target Kill failed")?
                 != process::KillOutcome::Accepted
             {

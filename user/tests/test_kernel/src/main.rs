@@ -6,24 +6,12 @@ extern crate libruntime;
 
 use erhino_shared::sync::spin::SimpleLock;
 use erhino_shared::time::Deadline;
-use libbudget::Budget;
-use libexecution::{
-    ExecutionResource,
-    runtime::{
-        Advance, Input, RequestFailure, Requests, Runtime, SourceId, SourceKind, Step, Task,
-    },
-};
-use libkernel::ipc::wait_set::WaitSet;
-use libkernel::ipc::{
-    capability::Capability,
-    message::{MailboxSender, SendOnce},
-    packet::Packet,
-};
+use libkernel::ipc::capability::Capability;
 use libkernel::memory_pool::MemoryPool;
 use libkernel::shared::proc::Pid;
 use libkernel::{
     ipc::{
-        message::{create, discard, make_send_once, mint_sender, receive, send_raw, wait_message},
+        message::{create, discard, make_send_once, mint_sender, receive, send_raw},
         notification,
         object::{close, duplicate},
         wait::wait_until,
@@ -39,7 +27,6 @@ use libkernel::{
         message::{HandleMove, MAILBOX_CAPACITY},
         object::{Handle, ObjectSignals, Rights},
         proc::{HandleGrant, JobMemberKind, JobState, ProcessState, TerminationCause},
-        wait::WaitReason,
         wait_set::MemberRequest,
     },
 };
@@ -47,11 +34,6 @@ use libprocess::{
     DEFAULT_SUPERVISION_POLICY, DERIVED_CONTROL_RIGHTS, SpawnRequest, SupervisionCause,
     SupervisionStage, SupervisionTarget, collect_process, enumerate_members, spawn,
 };
-use librpc::{
-    CallCause, CallError, CallPhase, Caller, FrameRejection, Outbox, OutboxResult, Request,
-    RequestContext, RpcMessageKind, RpcPrefix,
-};
-use librunnel::{ConsumerReady, blocking};
 use libthread::ThreadOutcome;
 use lock_api::Mutex;
 
@@ -70,7 +52,6 @@ mod memory_checks;
 mod mmio_checks;
 mod once_checks;
 mod race_checks;
-mod rpc_checks;
 mod time_checks;
 mod tunnel_checks;
 use building::build_spin_building;
@@ -101,10 +82,6 @@ const JOB_FULL_RIGHTS: Rights = Rights::from_raw(
         | Rights::GRANT.raw(),
 );
 
-/// 多页流与生命周期 fixture 各自使用正式自动选址。
-const TUNNEL_BYTES: usize = 3 * 4096;
-/// 超过多倍环容量，覆盖真实背压、分页与回绕。
-const STREAM_LEN: usize = 65536;
 const CONTROL_STRESS: usize = 128;
 
 const TUNNEL_STRESS: usize = 64;
@@ -130,75 +107,9 @@ fn kill_and_collect(
     harness.collect_targets(supervised)
 }
 
-fn launch_children(
-    harness: &mut Harness,
-    services: Handle,
-    pm_domain: Handle,
-    pm_image: &[u8],
-    target_image: &[u8],
-) -> Result<Handle, &'static str> {
-    let mailbox = harness
-        .create_mailbox(
-            Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
-            Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::GRANT | Rights::DUPLICATE,
-        )
-        .map_err(|_| "pm mailbox failed")?;
-    let delegated = harness
-        .duplicate(pm_domain, JOB_FULL_RIGHTS)
-        .map_err(|_| "pm domain delegation failed")?;
-    let target = spawn(SpawnRequest {
-        memory_pool: memory_pool(),
-        parent: current_process(),
-        job: pm_domain,
-        image: target_image,
-        payload: &[],
-        grants: &[],
-        control_rights: SUPERVISOR_RIGHTS,
-    })
-    .map_err(|_| "pm target spawn failed")?;
-    // SAFETY: spawn 交付的唯一 Control 尚未进入账本；pm 持真实域管理权。
-    unsafe { close(target.control) }.map_err(|_| "pm target control close failed")?;
-    let grants = [
-        HandleGrant {
-            handle: mailbox.owner,
-            rights: Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
-        },
-        HandleGrant {
-            handle: delegated,
-            rights: DERIVED_CONTROL_RIGHTS,
-        },
-    ];
-    harness
-        .reserve_process()
-        .map_err(|_| "pm supervision admission failed")?;
-    let pm = spawn(SpawnRequest {
-        memory_pool: memory_pool(),
-        parent: current_process(),
-        job: services,
-        image: pm_image,
-        payload: &[],
-        grants: &grants,
-        control_rights: SUPERVISOR_RIGHTS,
-    });
-    if pm.is_ok()
-        || matches!(&pm, Err(failure) if failure.grants == libprocess::GrantOutcome::Consumed)
-    {
-        for grant in grants {
-            harness.transferred(grant.handle);
-        }
-    }
-    let pm = pm.map_err(|_| "pm spawn failed")?;
-    harness.track_process(Supervised {
-        pid: pm.pid,
-        control: pm.control,
-    });
-    Ok(mailbox.peer)
-}
-
 fn run(
     harness: &mut Harness,
     services: Handle,
-    pm_image: &[u8],
     target: &[u8],
     hammer: Option<&[u8]>,
 ) -> Result<(), &'static str> {
@@ -269,7 +180,13 @@ fn run(
             harness.collect_job(job)?;
             harness.close_control(job)?;
         }
-        "transport" => run_transport(harness, services, pm_image, target)?,
+        "tunnel" => {
+            tunnel_checks::test_tunnel_failure_owners();
+            tunnel_checks::test_tunnel_geometry();
+            if mode().stress() {
+                tunnel_checks::test_tunnel_lifecycle();
+            }
+        }
         "mmio" => {
             let root = startup::ecam_handle().ok_or("MMIO platform root missing")?;
             if mode().ordinary() {
@@ -299,180 +216,6 @@ fn run(
         _ => return Err("kernel acceptance suite unknown"),
     }
     harness.collect_services()?;
-    Ok(())
-}
-
-fn run_transport(
-    harness: &mut Harness,
-    services: Handle,
-    pm_image: &[u8],
-    target: &[u8],
-) -> Result<(), &'static str> {
-    tunnel_checks::test_tunnel_failure_owners();
-    tunnel_checks::test_tunnel_geometry();
-    rpc_checks::test_rpc_reject_cleanup();
-    if mode().stress() {
-        tunnel_checks::test_tunnel_lifecycle();
-    }
-    let pm_domain = harness
-        .create_job(services, memory_pool(), JOB_FULL_RIGHTS)
-        .map_err(|_| "pm domain job create failed")?;
-    let pm_mailbox = launch_children(harness, services, pm_domain, pm_image, target)?;
-    // —— 数据面：建隧道 → Invitation 经消息面转移 → 阻塞读流 ——
-    let (tunnel, invitation) = match blocking::Consumer::create(
-        memory_pool(),
-        TUNNEL_BYTES,
-        libkernel::mm::Placement::Anywhere,
-    ) {
-        Ok((consumer, invitation)) => (consumer, invitation),
-        Err(blocking::CreateFailure::Tunnel(
-            libkernel::ipc::invitation::CreateFailure::System(error),
-        )) => {
-            debug!("tunnel create failed: {:?}", error);
-            return Err("tunnel create failed");
-        }
-        Err(blocking::CreateFailure::Tunnel(
-            libkernel::ipc::invitation::CreateFailure::Published {
-                endpoint,
-                invitation,
-                error,
-            },
-        )) => {
-            harness.retain_failed_create(endpoint, invitation);
-            debug!("tunnel create output invalid: {:?}", error);
-            return Err("tunnel create output invalid");
-        }
-        Err(blocking::CreateFailure::Map {
-            failure,
-            invitation,
-        }) => {
-            harness.retain_failed_create(Some(failure.endpoint), Some(invitation));
-            return Err("tunnel mapping failed");
-        }
-        Err(blocking::CreateFailure::Protocol {
-            endpoint,
-            invitation,
-            error,
-        }) => {
-            harness.retain_transport(endpoint, invitation);
-            debug!("tunnel protocol init failed: {:?}", error);
-            return Err("tunnel init failed");
-        }
-    };
-    harness.start_read(tunnel, alloc::vec::Vec::new());
-    debug!("tunnel created");
-    // 生产侧以 typed Packet 转移 Invitation：失败完整返还 owner，
-    // 不再以裸 HandleMove 表达（原失败路径承载直接丢失）。
-    let mut packet =
-        Packet::new(514, &[]).map_err(|_| "tunnel invitation packet allocation failed")?;
-    if let Err(failure) = packet.push(
-        invitation.into_capability(),
-        Rights::READ | Rights::WRITE | Rights::WAIT | Rights::SIGNAL | Rights::MANAGE,
-    ) {
-        harness.retain_capability(failure.capability);
-        return Err("tunnel invitation push failed");
-    }
-    if let Err(mut failure) = packet.try_send(
-        harness.sender(pm_mailbox),
-        libkernel::time::Deadline::INFINITE,
-    ) {
-        let (invitation, _) = failure
-            .packet
-            .pop()
-            .expect("tunnel invitation transfer disappeared");
-        harness.retain_capability(invitation);
-        debug!("send tunnel invitation failed: {:?}", failure.error);
-        return Err("send tunnel invitation failed");
-    }
-
-    harness.await_read()?;
-    let read = harness.read_world();
-    let n = read.filled;
-    if n != STREAM_LEN
-        || !read.buffer[..n]
-            .iter()
-            .enumerate()
-            .all(|(i, &byte)| byte == (i % 251 + 1) as u8)
-    {
-        return Err("stream pattern or length mismatch");
-    }
-    debug!("stream received {} bytes, pattern ok", n);
-    debug!(
-        "RNL2 multi-page stream passed: bytes={}, capacity={}",
-        n,
-        read.tunnel
-            .as_ref()
-            .expect("read duty owns its tunnel")
-            .capacity()
-    );
-
-    // —— 流控唤醒面：pm 填满目标邮箱后在 WRITABLE 上阻塞，腾位唤醒 ——
-    ipc_checks::test_writable_wake(harness, pm_mailbox)?;
-    harness.close_control(pm_mailbox)?;
-
-    // —— 事件面：自动退休已发布对端终态，电平等待立即返回 ——
-    let peer_closed = tunnel_checks::wait_supervision_signal(
-        harness
-            .read_world()
-            .tunnel
-            .as_mut()
-            .expect("root owns the tunnel"),
-        "peer-closed",
-    )?;
-    debug!(
-        "peer closed observed: bits={:#x}",
-        peer_closed.observed.raw()
-    );
-    let tunnel_pool_before_close = if mode().stress() {
-        None
-    } else {
-        Some(memory_checks::pool_allocated().map_err(|_| "tunnel Pool pre-close query failed")?)
-    };
-    harness.close_read()?;
-
-    let tunnel_pool_after_close = if mode().stress() {
-        None
-    } else {
-        Some(memory_checks::pool_allocated().map_err(|_| "tunnel Pool post-close query failed")?)
-    };
-    if !mode().stress() {
-        let tunnel_pool_before_close =
-            tunnel_pool_before_close.expect("non-stress baseline was queried");
-        let tunnel_pool_after_close =
-            tunnel_pool_after_close.expect("non-stress final balance was queried");
-        let refunded = tunnel_pool_before_close.saturating_sub(tunnel_pool_after_close);
-        if refunded == 0 {
-            debug!(
-                "tunnel Pool charge did not decrease after close: before={}, after={}",
-                tunnel_pool_before_close, tunnel_pool_after_close
-            );
-            return Err("tunnel Pool charge did not refund after close");
-        }
-        debug!(
-            "tunnel Pool conservation after close passed: before={}, after={}, refunded={}",
-            tunnel_pool_before_close, tunnel_pool_after_close, refunded
-        );
-    }
-
-    // —— 委托域终局：pm 的管理段应已把 pm_domain 收束到 Dead；降级时
-    // test_kernel 以保留的直接收束权兜底（job_kill = seal + 枚举派生 kill +
-    // drain + CLOSED 屏障）。 ——
-    let domain_state = process::query_job(pm_domain);
-    if !matches!(&domain_state, Ok(s) if s.state == JobState::Dead as u32) {
-        debug!("pm delegated domain not collected by pm; test_kernel collecting");
-        harness.collect_job(pm_domain)?;
-    }
-    let domain_state = process::query_job(pm_domain).map_err(|error| {
-        debug!("pm delegated domain final query failed: {:?}", error);
-        "pm delegated domain final query failed"
-    })?;
-    if domain_state.state != JobState::Dead as u32 {
-        return Err("pm delegated domain did not reach Dead");
-    }
-    debug!("pm delegated domain confirmed Dead");
-
-    harness.close_control(pm_domain)?;
-    rpc_checks::exercise_cancellable_rpc(harness)?;
     Ok(())
 }
 

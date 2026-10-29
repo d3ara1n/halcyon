@@ -45,23 +45,16 @@ QEMU_DEVICE := if MODEL == "virt" { "-nic none -device qemu-xhci,id=xhci,bus=pci
 QEMU_LAUNCH := "qemu-system-riscv64 -M "+MODEL+" -m "+QEMU_MEMORY+" -nographic -kernel '"+KERNEL_BIN+"' -dtb '"+DTB+"' -device loader,file="+BOOT_PACKAGE+",addr="+BOOT_PACKAGE_ADDR+" " + QEMU_CPU+" "+QEMU_DEVICE
 # CPU 节流百分比（tools/qemu-throttle.sh）：保留为跑飞/panic 或异常忙循环时
 # 的宿主资源保护；stress 也默认节流，不把它当作全速性能基准。
-# 1-99 按比例节流；100 = 全速。默认 50。常规验证保持默认节流，只有需要固定
-# 全速条件的专项诊断才显式使用 `THROTTLE=100 just virt-stress`。
+# 1-99 按比例节流；100 = 全速。默认 50，手动调试按需显式使用 THROTTLE=100。
 # 环境变量会穿透嵌套 just 调用；recipe 参数与 --set 不穿透嵌套子进程。
 THROTTLE := env_var_or_default("THROTTLE", "50")
 # 各路线 QEMU 运行超时只在本处维护，可用同名环境变量覆盖；调整政策见 plans/BUILD-AND-TEST.md。
 VIRT_TIMEOUT := env_var_or_default("VIRT_TIMEOUT", "360")
 VIRT_RELEASE_TIMEOUT := env_var_or_default("VIRT_RELEASE_TIMEOUT", "70")
-# 资源观察沿用原专项预算；只防挂死，不是性能要求。
-VIRT_DEVICE_TIMEOUT := env_var_or_default("VIRT_DEVICE_TIMEOUT", "1120")
 VIRT_STRESS_TIMEOUT := env_var_or_default("VIRT_STRESS_TIMEOUT", "420")
 VIRT_HETERO_TIMEOUT := env_var_or_default("VIRT_HETERO_TIMEOUT", "90")
 VIRT_NOFD_TIMEOUT := env_var_or_default("VIRT_NOFD_TIMEOUT", "180")
 SIFIVE_U_TIMEOUT := env_var_or_default("SIFIVE_U_TIMEOUT", "240")
-VIRT_BOOT_FAILURE_TIMEOUT := env_var_or_default("VIRT_BOOT_FAILURE_TIMEOUT", "45")
-VIRT_IPI_FAILURE_TIMEOUT := env_var_or_default("VIRT_IPI_FAILURE_TIMEOUT", "60")
-VIRT_VM_FAULT_TIMEOUT := env_var_or_default("VIRT_VM_FAULT_TIMEOUT", "420")
-VIRT_DMA_RETENTION_TIMEOUT := env_var_or_default("VIRT_DMA_RETENTION_TIMEOUT", "720")
 
 alias b := build_kernel
 alias c := clean
@@ -188,7 +181,7 @@ acceptance *selection:
     @python3 tools/acceptance.py {{selection}}
 
 [private]
-run_acceptance observer: make_dtb make_boot_package build_kernel
+run_acceptance: make_dtb make_boot_package build_kernel
     #!/usr/bin/env bash
     set -euo pipefail
     export ERHINO_KERNEL_ELF="{{KERNEL_ELF}}" ERHINO_BOOT_PACKAGE="{{BOOT_PACKAGE}}"
@@ -206,30 +199,6 @@ run_acceptance observer: make_dtb make_boot_package build_kernel
     command=(tools/qemu-throttle.sh {{THROTTLE}} qemu-system-riscv64 -M {{MODEL}} -m {{QEMU_MEMORY}} -nographic -kernel "{{KERNEL_BIN}}" -dtb "$dtb" -device loader,file={{BOOT_PACKAGE}},addr={{BOOT_PACKAGE_ADDR}} {{QEMU_CPU}} {{QEMU_DEVICE}} -smp cores=$cores)
     budget={{if MODE == "release" { VIRT_RELEASE_TIMEOUT } else { VIRT_TIMEOUT }}}
     if [[ "${ERHINO_ACCEPTANCE_MODE:-0}" != 0 ]]; then budget={{VIRT_STRESS_TIMEOUT}}; fi
-    case "{{observer}}" in
-        normal) ;;
-        vm-fault)
-            budget={{VIRT_VM_FAULT_TIMEOUT}}
-            command=(python3 tools/check-vm-fault.py --kernel "{{KERNEL_ELF}}" --timeout "$budget" -- "${command[@]}") ;;
-        irq-exit|mmio-publication|mmio-forced|dma-races|dma-shared|dma-quota|dma-install-failure)
-            budget={{VIRT_DEVICE_TIMEOUT}}
-            command=(python3 tools/check-resources.py --{{observer}} --timeout "$budget" -- "${command[@]}") ;;
-        boot-failure)
-            exec python3 tools/check-boot-failure.py --kernel "{{KERNEL_ELF}}" --timeout {{VIRT_BOOT_FAILURE_TIMEOUT}} -- "${command[@]}" ;;
-        platform-funding)
-            exec python3 tools/check-boot-failure.py --platform-funding --funding-case all --kernel "{{KERNEL_ELF}}" --boot-package "{{BOOT_PACKAGE}}" --timeout {{VIRT_BOOT_FAILURE_TIMEOUT}} -- "${command[@]}" ;;
-        ipi-failure)
-            exec python3 tools/check-ipi-failure.py --kernel "{{KERNEL_ELF}}" --timeout {{VIRT_IPI_FAILURE_TIMEOUT}} -- "${command[@]}" ;;
-        clock)
-            exec python3 tools/check-clock-failure.py --kernel "{{KERNEL_ELF}}" --init "{{TARGET_DIR}}/build/srv_init" --boot-package "{{BOOT_PACKAGE}}" --timeout {{VIRT_DEVICE_TIMEOUT}} -- "${command[@]}" ;;
-        vm-repair)
-            exec python3 tools/check-vm-repair.py --kernel "{{KERNEL_ELF}}" --timeout {{VIRT_VM_FAULT_TIMEOUT}} -- "${command[@]}" ;;
-        dma-retention|dma-ipi-retention)
-            runner=(python3 tools/check-dma-retention.py --kernel "{{KERNEL_ELF}}" --boot-package "{{BOOT_PACKAGE}}" --timeout {{VIRT_DMA_RETENTION_TIMEOUT}})
-            if [[ "{{observer}}" == dma-ipi-retention ]]; then runner+=(--ipi-failure); fi
-            exec "${runner[@]}" -- "${command[@]}" ;;
-        *) echo "Unknown acceptance observer: {{observer}}" >&2; exit 2 ;;
-    esac
     runner=(python3 tools/qemu-acceptance.py)
     if [[ "{{MODEL}}" == sifive_u ]]; then budget={{SIFIVE_U_TIMEOUT}}; runner+=(--allow-reset-failure); fi
     if [[ "$variant" == hetero ]]; then budget={{VIRT_HETERO_TIMEOUT}}; fi

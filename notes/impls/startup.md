@@ -129,16 +129,16 @@ Executor 持具名 Pool/Job、映像 owner、实例 Record 和路由。实例 Po
 
 ### 验收装配
 
-[`test_kernel`](../../user/tests/test_kernel/src/main.rs) 的 `settings.suite` 只选择 memory、ipc、process、transport、mmio、irq、dma、time 中一项；startup 分支只运行出生采用与 task/Job 收集。`settings.mode` 选择所属压力或资源场景，未知领域和不属于该领域的模式在运行前拒绝。普通领域组态只装配一个 kernel task；其映像输入按实际需求选择 target、pm、hammer、自身映像。仅资源组获得平台描述/根，不启动 System 三宿主。
+[`test_kernel`](../../user/tests/test_kernel/src/main.rs) 的 `settings.suite` 选择 memory、ipc、process、tunnel、mmio、irq、dma、time；startup 分支仅采用出生输入并收集 task/Job。`settings.mode` 选择所属压力或公开资源场景，未知领域和模式在运行前拒绝。每组只装配一个 kernel task 及所需 target、hammer、自身映像；资源组取得平台根，不装配业务服务。
 
-memory 普通路径检查映射、进程付款和 Pool，压力路径只运行既有线程/映射套件。ipc 检查消息、通知、Once 与等待；process 检查出生、Job、Kill 和退出，压力时运行自动退休与竞态矩阵。transport 保留原 pm 的流、背压及受托域收束；MMIO/IRQ/DMA 的进程退休直接属于各自资源组，不再从通用 Job 检查间接进入。time 独立检查公共期限。
+memory 检查映射、进程付款和 Pool；ipc 检查消息、通知、Once 与等待；process 检查出生、Job、Kill 和退出。tunnel 只检查内核 Invitation/Endpoint、独立映射、几何、失败 owner 与生命周期。MMIO/IRQ/DMA 各自验证公开授权、撤销、退出和收束；DMA 另有共享 backing 与额度恢复，IRQ 另有 WaitOne/WaitSet 使用者退出。它们不依赖调试器建立内部状态窗口。time 检查公共期限。
 
-[`startup`](../../user/tests/test_kernel/src/startup.rs) 用 `libprocess::birth::Birth` 采用命名输入、映像和组态 settings。测试以自身 CurrentProcessInfo 启动子进程，只持 services 下验收 Job 的子树；pm 获得原 `DERIVED_CONTROL_RIGHTS` 的委托域 JobControl。[`Harness`](../../user/tests/test_kernel/src/harness.rs) 持 capability、子进程和流读取 owner，复用正式 Collector/Job 收束与执行器。正常路径收集子进程和验收 Job 后输出领域完成；失败使 test_kernel panic，由 init 的实例监督和 services 终局接管。
+[`startup`](../../user/tests/test_kernel/src/startup.rs) 通过 `libprocess::birth::Birth` 采用输入、映像和设定，以自身 CurrentProcessInfo 启动子进程，只持 services 下验收 Job 的子树。[`Harness`](../../user/tests/test_kernel/src/harness.rs) 持能力与子进程，复用正式 Collector/Job 收束。正常路径收集后报告完成；失败使 test_kernel panic，由 init 的正式实例监督接管。
 
-普通组沿用原 core 四份工作集上限，压力组沿用五份，组态明确数值；这不是精确峰值证明。DMA exposed/output-fault 的跨 reset 计费独立使用具名 retention Pool；test_kernel 通过自身封存映像启动保留角色子进程，在该 Pool 内建立 fixture，并核最后收集后的保留页数等于 fixture 数乘每项两页。init 持有具名 Pool 至结束，不解释 DMA 专属报告；当前没有旧私有 held Pool 快照跨进程比对。
+普通组沿用四份工作集，压力组沿用五份，数值由组态声明，不代表精确峰值。DMA exposed/output-fault 的保留 fixture 在独立 retention Pool 付款；test_kernel 以封存映像启动保留角色，核收集后的页数等于 fixture 数乘每项两页。该公开 Pool 观察仅证明进程退出后的保留，不声称验证 reset 拒绝或 hart 停驻后的内部责任。
 
-services 验收使用 System 和独立 startup task；该 task 依赖三宿主 Ready，正常完成后驱动有限组态的正式停止。它只观察装配、Ready、停止、撤销与实例正常退出，没有旧 FS/设备业务 task。FP 独立组态运行 test_fp；nofd 不装入 FP，核 Base64 域和出生/收集 task，不声称覆盖了 FP 启动拒绝。验收使用同一 BootPackage/出生 ABI，组态编译器选择实际引用映像，strip 仅处理归档副本。
+FP 组运行 test_fp；nofd 核 Base64 域与最小出生/收集，hetero 核域划分和浮点消费者。验收使用正式 BootPackage/出生 ABI，组态编译器选择引用映像，strip 只处理归档副本。System 业务服务的运行由演示与人工验证承担。
 
 ## 验证入口与边界
 
-编译、host 测试、按领域 QEMU 及外部观察的选择由[构建与验证手册](../../plans/BUILD-AND-TEST.md)拥有。guest 完成、init 收束与正常 reset 共同组成普通组成功判据；专项观察还需其真实窗口和退款证据。QEMU 未运行的组不具备运行通过证据，编译检查不能替代它。失效消费者的覆盖与迁移验证状态由[验收分组记录](../../plans/todo-2026-10-29-acceptance-groups.md)和[组态计划](../../plans/todo-2026-10-28-init-formation.md)分别拥有。
+检查与自动内核验收的选择由[构建与验证手册](../../plans/BUILD-AND-TEST.md)拥有。guest 完成、init 收束与正常 reset 共同组成成功判据。自动验收不连接 GDB，不注入内核内部状态，不宣称特定内部阶段或完整业务组合已经覆盖。当前范围和验证证据由[验收记录](../../plans/archived/todo-2026-10-29-acceptance-groups.md)拥有。

@@ -53,13 +53,12 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(acceptance.select("memory", None), [("memory", "basic")])
         for key in acceptance.select("all", None):
             route = acceptance.ROUTES[key]
-            self.assertEqual(route.observer, "normal")
             self.assertEqual(route.mode, 0)
             self.assertEqual(route.model, "virt")
         with self.assertRaises(ValueError):
             acceptance.select("memory", "misspelled")
         with self.assertRaises(ValueError):
-            acceptance.command(("memory", "fault"), "release")
+            acceptance.select("memory", "fault")
 
     def test_no_selection_only_lists(self):
         result = subprocess.run([sys.executable, str(ROOT / "tools/acceptance.py")],
@@ -104,12 +103,6 @@ class AcceptanceTests(unittest.TestCase):
         result, evidence = self.run_guest(SUCCESS + "enumerate convergence FAILED: pid not monotonic\n")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("guest failure", evidence["error"])
-
-    def test_transport_requires_pm_cleanup(self):
-        self.env["ERHINO_ACCEPTANCE_SUITE"] = "transport"
-        result, evidence = self.run_guest(SUCCESS.replace("memory", "transport"))
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("pm: active mailbox stop and refund passed", evidence["error"])
 
     def test_nonzero_exit_fails(self):
         result, evidence = self.run_guest(SUCCESS, 7)

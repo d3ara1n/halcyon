@@ -32,7 +32,7 @@
 
 ## CPU 节流（tools/qemu-throttle.sh）
 
-路线、workload、默认节流、超时重校和终态判定统一见 [构建与验证手册](BUILD-AND-TEST.md#判定日志与清理)。本节只说明调试时的工具行为。
+自动验收不接入 GDB；本篇的断点、物理内存读取与注入只用于手动调查。路线、默认节流、超时和终态判定统一见 [构建与验证手册](BUILD-AND-TEST.md#判定日志与清理)。本节只说明调试时的工具行为。
 
 - `tools/qemu-throttle.sh` 通过 OS 层 SIGSTOP/SIGCONT 控制 QEMU 宿主占用；`-icount` 不能替代 CPU 使用限制。
 - **调试（gdb -s）务必 `THROTTLE=100` 全速**：节流会周期性冻结整个 QEMU，使 gdb 交互卡顿并改变 `-icount` 复现时序。

@@ -328,7 +328,7 @@ srv_init 约 17.3k 行，直接依赖 `srv_fs`、`test_fs`、`libdevice`、`libd
 
 切面 A（内核级验收移出 init）已提交为 `413f384`，经提交前整体整理，在冻结点 A-F4 全部路线重跑，结果见[最终验证](#a-f4-最终验证)。retry-race 为既有观察器缺陷，已[移交设备计划](todo-2026-09-device-system-design.md#retry-观察器缺陷2026-10-29)，不计通过。
 
-切面 B 已实施并提交。首次实跑暴露的生命周期输入转授阻塞已按[原条目](#首次运行阻塞2026-10-29)修复；后续 memory 与 services 独立通过，取得 task 出生/正常退出及三宿主 Ready、Stopped/DONE、撤销链与关机证据。其余普通组结果由[验收记录](todo-2026-10-29-acceptance-groups.md#逐条运行与修复2026-10-29)拥有。下一步仅按实际需求补充未覆盖的组态负路径与专项，不恢复已删消费者或固定全量验收。
+切面 B 已实施并提交。首次实跑暴露的生命周期输入转授阻塞已按[原条目](#首次运行阻塞2026-10-29)修复；后续 memory 与 services 独立通过，取得 task 出生/正常退出及三宿主 Ready、Stopped/DONE、撤销链与关机证据。其余普通组结果由[验收记录](archived/todo-2026-10-29-acceptance-groups.md#逐条运行与修复2026-10-29)拥有。下一步仅按实际需求补充未覆盖的组态负路径与专项，不恢复已删消费者或固定全量验收。
 
 最终结构：
 
@@ -340,9 +340,9 @@ srv_init 约 17.3k 行，直接依赖 `srv_fs`、`test_fs`、`libdevice`、`libd
 - **test_kernel**：经 `Birth` 采用命名输入，部署模式来自设定 `mode`；保留子进程角色经设定 `role` 传递；私有 `lib.rs` 出生帧删除。
 - **组态与构建**：`user/formations/` 下 `system`、`acceptance`、`fp`、`stress`、`memory` 与各 `mode-*` 源；Justfile 以 `ERHINO_FORMATION` 选组态，`make_initfs` 编译组态并只装入其引用映像，根目录为 `formation` 与 `image/<组件>`。
 
-失去的覆盖（按 AGENTS 过渡设施口径删除，不登记债务）：`test_fs`、`test_device` 与 init 内服务级验收（fs/registry/copy/secondary 生命周期、device/driver 自检、function-session、reuse/candidates/retry-race、manager/controller fault、reset-rejection、fs-stop-order）；init 根监督的 failure-isolation、dispatcher funding、startup capture、idle ownership 自检；test_kernel 的 SystemReset 负路径与 held Pool 跨进程报告比对。失效宿主观察器、旧锚点和分组重建由[验收清理](todo-2026-10-29-acceptance-groups.md)统一承接；本篇不再要求恢复已删除消费者。
+失去的覆盖（按 AGENTS 过渡设施口径删除，不登记债务）：`test_fs`、`test_device` 与 init 内服务级验收（fs/registry/copy/secondary 生命周期、device/driver 自检、function-session、reuse/candidates/retry-race、manager/controller fault、reset-rejection、fs-stop-order）；init 根监督的 failure-isolation、dispatcher funding、startup capture、idle ownership 自检；test_kernel 的 SystemReset 负路径与 held Pool 跨进程报告比对。失效宿主观察器、旧锚点和分组重建由[验收清理](archived/todo-2026-10-29-acceptance-groups.md)统一承接；本篇不再要求恢复已删除消费者。
 
-未闭合：正常出生与停止已有本轮证据；完成门中同一 init ELF 的 System/验收身份比对、多 fs 实例与运行期负路径仍未在本轮验证。验收工具的当前入口与删除范围见[验收清理](todo-2026-10-29-acceptance-groups.md)；后续按影响选择 services/平台/领域组，不重跑历史路线清单。
+未闭合：正常出生与停止已有本轮证据；完成门中同一 init ELF 的 System/验收身份比对、多 fs 实例与运行期负路径仍未在本轮验证。验收工具的当前入口与删除范围见[验收清理](archived/todo-2026-10-29-acceptance-groups.md)；后续按具体需求人工验证组态负路径；自动内核验收按构建手册选择领域，不恢复旧服务验收或重跑历史清单。
 
 ### 接线与责任
 
@@ -448,7 +448,7 @@ srv_init 约 17.3k 行，直接依赖 `srv_fs`、`test_fs`、`libdevice`、`libd
 
 ## 首次运行阻塞（2026-10-29）
 
-运行入口与脚本修复证据由[验收分组记录](todo-2026-10-29-acceptance-groups.md#首次运行取证2026-10-29)拥有。正式代码基线 `2314f40`，本轮未改产品代码。memory/basic 的原始日志 `artifacts/acceptance/20261029T094343.227369Z-91322/guest.log` 显示：init 开始准备实例 kernel 后打印 `instance preparation failed: kernel, System(RightsDenied)`，随即进入系统失败终局、封 services/平台根并提交 SystemFailure Reboot；尚无 test_kernel Start。runner 判失败并清理，无超时或清理错误。
+运行入口与脚本修复证据由[验收分组记录](archived/todo-2026-10-29-acceptance-groups.md#首次运行取证2026-10-29)拥有。正式代码基线 `2314f40`，本轮未改产品代码。memory/basic 的原始日志 `artifacts/acceptance/20261029T094343.227369Z-91322/guest.log` 显示：init 开始准备实例 kernel 后打印 `instance preparation failed: kernel, System(RightsDenied)`，随即进入系统失败终局、封 services/平台根并提交 SystemFailure Reboot；尚无 test_kernel Start。runner 判失败并清理，无超时或清理错误。
 
 静态核实的确定性权限矛盾：
 
@@ -458,6 +458,6 @@ srv_init 约 17.3k 行，直接依赖 `srv_fs`、`test_fs`、`libdevice`、`libd
 
 责任 owner 为本计划的 srv_init 出生装配。用户后续授权修复并逐条运行：report sender 与 stop owner 的源权利补 GRANT，HandleGrant 目标仍为现有 REPORT_RIGHTS/STOP_RIGHTS；失败时 owners 自动关闭，Consumed 后仍按原代码移交唯一 owner，不放宽内核检查。
 
-修复后 `just check srv_init`、`just clippy srv_init` 通过，日志分别为 `artifacts/checks/20261029T095211.461840Z-92539/srv_init.log`、`20261029T095211.960153Z-92578/srv_init.log`。独立运行 memory/basic 取得 PID 2 Start、领域完成、正常 DONE、全部收集和 Requested Shutdown；随后 services/basic 的 device/driver/fs 全部 Ready，再按 fs→driver→device 正常 Stopped/DONE 后关机。该出生阻塞已关闭，逐条运行结果由[验收记录](todo-2026-10-29-acceptance-groups.md#逐条运行与修复2026-10-29)拥有；这些正路径不替代组态完成门中的负路径证据。
+修复后 `just check srv_init`、`just clippy srv_init` 通过，日志分别为 `artifacts/checks/20261029T095211.461840Z-92539/srv_init.log`、`20261029T095211.960153Z-92578/srv_init.log`。独立运行 memory/basic 取得 PID 2 Start、领域完成、正常 DONE、全部收集和 Requested Shutdown；随后 services/basic 的 device/driver/fs 全部 Ready，再按 fs→driver→device 正常 Stopped/DONE 后关机。该出生阻塞已关闭，逐条运行结果由[验收记录](archived/todo-2026-10-29-acceptance-groups.md#逐条运行与修复2026-10-29)拥有；这些正路径不替代组态完成门中的负路径证据。
 
 交付前结构核查：改动只增加源能力的转授权，HandleGrant 目标权限、所有权移交、Consumed 处理、Preparation 失败收束和内核检查均保持；未新增 unsafe、锁或回调，impls 已回填。任务/常驻两类真实消费者验证通过，不为两处权限表达式补镜像单测。本次产品修复已提交为 `fe0ed70`；[可选独立 Review](todo-2026-10-29-init-grant-fix-review.md)已登记，未执行。

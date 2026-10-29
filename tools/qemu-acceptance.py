@@ -10,25 +10,20 @@ import subprocess
 import sys
 import time
 
-from qemu_gdb import fresh_logs, stop_group
+from qemu_support import fresh_logs, stop_group
 
 SHUTDOWN = "system reset accepted: action Shutdown, reason Requested"
 FAILED = ("panicking", "system failure terminal entered:", "init formation rejected:",
           "system reset accepted: action reboot,", "kernel acceptance failed:")
-SUITES = ("memory", "ipc", "process", "transport", "mmio", "irq", "dma", "time", "startup")
+SUITES = ("memory", "ipc", "process", "tunnel", "mmio", "irq", "dma", "time", "startup")
 
 
-def requirements(suite, mode, services, fp):
+def requirements(suite, mode, fp):
     anchors = ["formation tasks complete", "formation stopped: all instances collected",
                "init: formation complete, submitting Shutdown", SHUTDOWN]
     if suite:
         anchors += [f"acceptance suite: {suite}, mode={mode}",
                     f"kernel acceptance completed: {suite}"]
-    if suite == "transport":
-        anchors.append("pm: active mailbox stop and refund passed")
-    if services:
-        for service in ("device", "driver", "fs"):
-            anchors += [f"formation instance ready: {service}", f"formation instance stopped: {service}"]
     if fp:
         anchors.append("fp verification passed")
     return anchors
@@ -44,11 +39,10 @@ def main():
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     suite = os.environ.get("ERHINO_ACCEPTANCE_SUITE", "")
     mode = int(os.environ.get("ERHINO_ACCEPTANCE_MODE", "0"))
-    services = os.environ.get("ERHINO_ACCEPTANCE_SERVICES") == "1"
     fp = os.environ.get("ERHINO_ACCEPTANCE_FP") == "1"
-    if not command or args.timeout <= 0 or suite not in ("", *SUITES) or not (suite or services or fp):
+    if not command or args.timeout <= 0 or suite not in ("", *SUITES) or not (suite or fp):
         parser.error("a valid workload, positive timeout and command are required")
-    required = requirements(suite, mode, services, fp)
+    required = requirements(suite, mode, fp)
     platform = os.environ.get("ERHINO_ACCEPTANCE_PLATFORM", "")
     if platform == "nofd":
         required += ["domain 0 [Base64] -> harts [0, 1, 2, 3]"]
@@ -56,7 +50,7 @@ def main():
         required += ["domain 0 [Base64] -> harts [0]", "domain 1 [Base64+D64] -> harts [1, 2, 3]"]
     logs = fresh_logs(args.logs)
     log = logs / "guest.log"
-    evidence = {"command": command, "suite": suite, "mode": mode, "services": services,
+    evidence = {"command": command, "suite": suite, "mode": mode,
                 "fp": fp, "formation": os.environ.get("ERHINO_FORMATION_SOURCES"),
                 "status": "running", "timeout": args.timeout}
     for key in ("ERHINO_KERNEL_ELF", "ERHINO_BOOT_PACKAGE"):

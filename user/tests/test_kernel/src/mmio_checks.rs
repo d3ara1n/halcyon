@@ -3,7 +3,7 @@ use erhino_shared::{
     call::{SystemCall, SystemCallError},
     mem::{MemoryMapRequest, MemoryMapResult, MemoryPlacement, MemoryProtection},
     object::{Handle, ObjectSignals, Rights},
-    proc::PROCESS_PAGE_SIZE as PAGE,
+    proc::{HandleGrant, PROCESS_PAGE_SIZE as PAGE},
 };
 use libkernel::{
     ipc::{object, wait},
@@ -165,7 +165,6 @@ pub(super) fn process_retirement(
     job: Handle,
     image: &[u8],
 ) -> Result<(), &'static str> {
-    use erhino_shared::proc::HandleGrant;
     use libkernel::{ipc::notification, process};
     use libprocess::{GrantOutcome, SpawnRequest, spawn};
     let full = Rights::READ
@@ -176,129 +175,59 @@ pub(super) fn process_retirement(
         | Rights::DUPLICATE
         | Rights::TRANSIT
         | Rights::GRANT;
-    let handle =
-        object::duplicate(root, full).map_err(|_| "MMIO retirement root duplicate failed")?;
-    // SAFETY: 已核验 root 的新副本，由本作用域唯一关闭。
+    let handle = object::duplicate(root, full).map_err(|_| "MMIO root alias failed")?;
+    // SAFETY: 调用方持有已核验的平台 MMIO 根，新 alias 由此唯一接管。
     let root = unsafe { MmioControl::from_handle(handle) };
-    let modes: &[&str] = if crate::mode().has(crate::Mode::MMIO_FORCED) {
-        &["mmio-forced-queued", "mmio-forced-publishing"]
-    } else if crate::mode().has(crate::Mode::MMIO_PUBLICATION) {
-        &["mmio-before", "mmio-after"]
-    } else {
-        &["mmio-close", "mmio-live"]
-    };
-    for &mode in modes {
-        let close_use = mode == "mmio-close";
-        let publication = matches!(mode, "mmio-before" | "mmio-after");
-        let forced = mode.starts_with("mmio-forced-");
-        let pool = if publication || forced {
-            Some(
-                libkernel::memory_pool::derive(
-                    super::memory_pool(),
-                    libdriver::boot::WORKER_POOL,
-                    Rights::READ | Rights::CREATE,
-                )
-                .map_err(|_| "MMIO publication Pool admission failed")?,
-            )
-        } else {
-            None
-        };
+    for mode in ["mmio-close", "mmio-live"] {
         let scope = root
             .create_control(0, 32 * PAGE, full)
             .map_err(|_| "MMIO retirement scope failed")?;
-        let rights = Rights::READ | Rights::WAIT | Rights::GRANT;
         let usage = scope
-            .create_use(0, 32 * PAGE, rights)
+            .create_use(0, 32 * PAGE, Rights::READ | Rights::WAIT | Rights::GRANT)
             .map_err(|_| "MMIO retirement use failed")?;
         let ready =
             notification::create(Rights::READ | Rights::WAIT, Rights::SIGNAL | Rights::GRANT)
                 .map_err(|_| "MMIO retirement readiness creation failed")?;
-        let (mut gate_owner, gate_signaler) = if publication {
-            let gate =
-                notification::create(Rights::READ | Rights::WAIT | Rights::GRANT, Rights::SIGNAL)
-                    .map_err(|_| "MMIO publication gate failed")?;
-            (Some(gate.owner), Some(gate.peer))
-        } else {
-            (None, None)
-        };
-        let mut grants = alloc::vec![
-            HandleGrant {
-                handle: usage.handle(),
-                rights: Rights::READ | Rights::WAIT,
-            },
-            HandleGrant {
-                handle: ready.peer.as_handle(),
-                rights: Rights::SIGNAL,
-            },
-        ];
-        if let Some(gate) = &gate_owner {
-            grants.push(HandleGrant {
-                handle: gate.as_handle(),
-                rights: Rights::READ | Rights::WAIT,
-            });
-        }
         let launched = spawn(SpawnRequest {
-            memory_pool: pool
-                .as_ref()
-                .map_or(super::memory_pool(), |pool| pool.as_handle()),
+            memory_pool: super::memory_pool(),
             parent: super::current_process(),
             job,
             image,
             payload: mode.as_bytes(),
-            grants: &grants,
+            grants: &[
+                HandleGrant {
+                    handle: usage.handle(),
+                    rights: Rights::READ | Rights::WAIT,
+                },
+                HandleGrant {
+                    handle: ready.peer.as_handle(),
+                    rights: Rights::SIGNAL,
+                },
+            ],
             control_rights: super::SUPERVISOR_RIGHTS,
         });
         let started = match launched {
             Ok(started) => {
                 usage.into_handle();
                 ready.peer.into_raw();
-                if let Some(gate) = gate_owner.take() {
-                    gate.into_raw();
-                }
                 started
             }
             Err(failure) => {
                 if failure.grants == GrantOutcome::Consumed {
                     usage.into_handle();
                     ready.peer.into_raw();
-                    if let Some(gate) = gate_owner.take() {
-                        gate.into_raw();
-                    }
                 }
                 return Err("MMIO retirement target spawn failed");
             }
         };
-        if publication || forced {
-            libkernel::debug!(
-                "MMIO publication target admitted: mode={}, pid={}, scope={}",
-                mode,
-                started.pid,
-                scope.handle().raw()
-            );
-        }
         let result = (|| {
             let observed = wait::wait_one(ready.owner.as_handle(), ObjectSignals::READABLE, 0)
                 .map_err(|_| "MMIO target readiness wait failed")?;
             if !observed.observed.contains(ObjectSignals::READABLE) {
                 return Err("MMIO target did not become ready");
             }
-            if let Some(pool) = &pool {
-                ready
-                    .owner
-                    .take(1)
-                    .map_err(|_| "MMIO publication readiness consume failed")?;
-                log_pool(
-                    mode,
-                    if forced {
-                        "mapped-before-revoke"
-                    } else {
-                        "before-map"
-                    },
-                    pool,
-                )?;
-            }
-            if close_use {
-                // 子进程仍存活；没有父 Revoke 帮它完成。范围可重新派生证明最后 Close 已退休。
+            if mode == "mmio-close" {
+                // 母本仍在；可重新派生同范围证明最后 use 已自主退休。
                 loop {
                     match scope.create_use(
                         0,
@@ -326,52 +255,7 @@ pub(super) fn process_retirement(
             {
                 return Err("MMIO target exited before the parent Kill");
             }
-            if let Some(gate) = &gate_signaler {
-                gate.signal(1)
-                    .map_err(|_| "MMIO publication start signal failed")?;
-            }
             scope.revoke().map_err(|_| "MMIO parent Revoke failed")?;
-            if forced {
-                libkernel::debug!(
-                    "MMIO forced Revoke returned before Kill: mode={}, pid={}",
-                    mode,
-                    started.pid
-                );
-            }
-            if publication {
-                let pool = pool.as_ref().ok_or("MMIO publication Pool missing")?;
-                let observed = wait::wait_one(ready.owner.as_handle(), ObjectSignals::READABLE, 0)
-                    .map_err(|_| "MMIO publication result wait failed")?;
-                if !observed.observed.contains(ObjectSignals::READABLE)
-                    || ready
-                        .owner
-                        .take(2)
-                        .map_err(|_| "MMIO publication result consume failed")?
-                        != 2
-                {
-                    return Err("MMIO publication result missing");
-                }
-                done(scope.handle())?;
-                let snapshot = scope
-                    .query()
-                    .map_err(|_| "MMIO publication DONE query failed")?;
-                if snapshot.flags & erhino_shared::mmio::MmioSnapshot::DONE == 0
-                    || snapshot.members != 0
-                {
-                    return Err("MMIO publication scope not retired");
-                }
-                let status = process::query(started.control)
-                    .map_err(|_| "MMIO publication live query failed")?;
-                if status.state != erhino_shared::proc::ProcessState::Running as u32 {
-                    return Err("MMIO publication completed after target death");
-                }
-                log_pool(mode, "after-revoke", pool)?;
-                libkernel::debug!(
-                    "MMIO publication scope DONE while target Running: mode={}, pid={}, members=0",
-                    mode,
-                    started.pid
-                );
-            }
             process::kill(started.control).map_err(|_| "MMIO target Kill failed")?;
             process::wait_done(started.control).map_err(|_| "MMIO target DONE wait failed")?;
             done(scope.handle())?;
@@ -382,24 +266,6 @@ pub(super) fn process_retirement(
                 || status.detail != erhino_shared::proc::TerminationDetail::PROCESS_CONTROL_KILL
             {
                 return Err("MMIO target did not terminate through the parent Kill");
-            }
-            if forced {
-                let snapshot = scope
-                    .query()
-                    .map_err(|_| "MMIO forced scope query failed")?;
-                if snapshot.members != 0
-                    || snapshot.flags & erhino_shared::mmio::MmioSnapshot::DONE == 0
-                {
-                    return Err("MMIO forced exit retained a mapping responsibility");
-                }
-                libkernel::debug!(
-                    "MMIO forced Frozen retirement passed: mode={}, pid={}, members=0, cpu=Killed",
-                    mode,
-                    started.pid
-                );
-            }
-            if let Some(pool) = &pool {
-                log_pool(mode, "cpu-done", pool)?;
             }
             Ok(())
         })();
@@ -412,56 +278,9 @@ pub(super) fn process_retirement(
         unsafe { object::close(started.control) }
             .map_err(|_| "MMIO target control close failed")?;
         result?;
-        if let Some(pool) = &pool {
-            let end = libkernel::time::timeout_millis(60_000)
-                .map_err(|_| "MMIO publication refund deadline failed")?;
-            loop {
-                let snapshot = pool
-                    .query()
-                    .map_err(|_| "MMIO publication refund query failed")?;
-                if snapshot.allocated == 0
-                    && snapshot.delegated == 0
-                    && snapshot.reserved == 0
-                    && snapshot.metadata.allocated == 0
-                    && snapshot.metadata.delegated == 0
-                    && snapshot.metadata.reserved == 0
-                {
-                    break;
-                }
-                if libkernel::time::expired(end)
-                    .map_err(|_| "MMIO publication refund clock failed")?
-                {
-                    return Err("MMIO publication Pool did not refund");
-                }
-                libkernel::thread::yield_now()
-                    .map_err(|_| "MMIO publication refund yield failed")?;
-            }
-            log_pool(mode, "closed", pool)?;
-        }
     }
     libkernel::debug!(
         "MMIO process retirement acceptance passed: last use Close and Revoke/exit submissions"
-    );
-    Ok(())
-}
-
-fn log_pool(
-    mode: &str,
-    phase: &str,
-    pool: &libkernel::memory_pool::MemoryPool,
-) -> Result<(), &'static str> {
-    let snapshot = pool
-        .query()
-        .map_err(|_| "MMIO publication Pool query failed")?;
-    libkernel::debug!(
-        "MMIO publication Pool: mode={}, phase={}, id={}, pages_allocated={}, pages_delegated={}, metadata_allocated={}, metadata_delegated={}",
-        mode,
-        phase,
-        snapshot.identity,
-        snapshot.allocated,
-        snapshot.delegated,
-        snapshot.metadata.allocated,
-        snapshot.metadata.delegated
     );
     Ok(())
 }

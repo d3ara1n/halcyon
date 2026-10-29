@@ -6,7 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-from qemu_gdb import fresh_logs
+from qemu_support import fresh_logs
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD_STD = ["-Z", "build-std=core,alloc", "-Z", "build-std-features=compiler-builtins-mem"]

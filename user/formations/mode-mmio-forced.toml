@@ -1,3 +1,0 @@
-# 资源专项：在所属资源组上选择 mmio_forced 模式。
-[instance.kernel]
-settings.mode = ["mmio_forced"]

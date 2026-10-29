@@ -27,28 +27,11 @@ fn main() {
     }
     if matches!(
         payload.as_bytes(),
-        b"dma-unexposed"
-            | b"dma-exposed"
-            | b"dma-output-fault"
-            | b"dma-pin-before"
-            | b"dma-pin-after"
-            | b"dma-pin-exit"
-            | b"dma-reader-retire"
-            | b"dma-shared"
-            | b"dma-pin-quota"
-            | b"dma-pin-install-failure"
+        b"dma-unexposed" | b"dma-exposed" | b"dma-output-fault" | b"dma-shared" | b"dma-pin-quota"
     ) {
         dma_target(&mut grants, payload.as_bytes());
     }
-    if matches!(
-        payload.as_bytes(),
-        b"mmio-live"
-            | b"mmio-close"
-            | b"mmio-before"
-            | b"mmio-after"
-            | b"mmio-forced-queued"
-            | b"mmio-forced-publishing"
-    ) {
+    if matches!(payload.as_bytes(), b"mmio-live" | b"mmio-close") {
         mmio_target(&mut grants, payload.as_bytes());
     }
     if payload.as_bytes() == b"ipc-kill" {
@@ -143,71 +126,6 @@ fn mmio_target(startup: &mut libruntime::startup::InitialGrants, mode: &[u8]) ->
     .expect("MMIO target ready role invalid")
     .0;
     let bytes = 32 * libkernel::shared::proc::PROCESS_PAGE_SIZE;
-    if matches!(mode, b"mmio-before" | b"mmio-after") {
-        let gate = notification::NotificationOwner::from_capability(
-            startup.take(2).expect("MMIO publication gate missing"),
-        )
-        .map_err(|failure| failure.error)
-        .expect("MMIO publication gate role invalid")
-        .0;
-        ready.signal(1).expect("MMIO publication readiness failed");
-        let observed = libkernel::ipc::wait::wait_one(gate.as_handle(), ObjectSignals::READABLE, 0)
-            .expect("MMIO publication gate wait failed");
-        assert!(
-            observed.observed.contains(ObjectSignals::READABLE),
-            "MMIO publication gate missing"
-        );
-        let mapped = usage.map(0, bytes, false, libkernel::mm::Placement::Anywhere);
-        if mode == b"mmio-before" {
-            match &mapped {
-                Ok(region) => debug!(
-                    "MMIO publication before result observed: error=None, start={:#x}",
-                    region.range().start
-                ),
-                Err(error) => debug!("MMIO publication before result observed: error={:?}", error),
-            }
-            assert!(
-                matches!(
-                    mapped,
-                    Err(libkernel::shared::call::SystemCallError::ObjectBusy)
-                ),
-                "MMIO publication before permission did not reject Map"
-            );
-            let completed = libkernel::ipc::wait::wait_one(usage.handle(), ObjectSignals::DONE, 0)
-                .expect("MMIO invalidated publication did not retire");
-            assert!(
-                completed.observed.contains(ObjectSignals::DONE),
-                "MMIO invalidated use omitted DONE"
-            );
-            assert!(
-                matches!(
-                    usage.map(0, bytes, false, libkernel::mm::Placement::Anywhere),
-                    Err(libkernel::shared::call::SystemCallError::ObjectClosed)
-                ),
-                "MMIO retired source accepted new Map"
-            );
-            debug!(
-                "MMIO publication result: mode=before, error=ObjectBusy, fresh_after_done=ObjectClosed"
-            );
-        } else {
-            let region = mapped.expect("MMIO accepted publication failed");
-            debug!(
-                "MMIO publication result: mode=after, error=None, start={:#x}, bytes={}",
-                region.range().start,
-                region.range().end - region.range().start
-            );
-            // 不再访问已撤销的IO，也不对可能已被强制退休的VA提交显式Unmap。
-            core::hint::black_box(region);
-        }
-        ready
-            .signal(2)
-            .expect("MMIO publication result signal failed");
-        loop {
-            core::hint::black_box(&usage);
-            // SAFETY: 无借用指针；父方先核真实Revoke DONE，再沿原Kill收束。
-            unsafe { sys_sleep(1000).expect("MMIO publication target sleep failed") };
-        }
-    }
     let first = usage
         .map(0, bytes, false, libkernel::mm::Placement::Anywhere)
         .expect("MMIO target first Map failed");
@@ -263,17 +181,8 @@ fn dma_target(startup: &mut libruntime::startup::InitialGrants, mode: &[u8]) -> 
     .map_err(|failure| failure.error)
     .expect("DMA readiness role invalid")
     .0;
-    if matches!(
-        mode,
-        b"dma-pin-before"
-            | b"dma-pin-after"
-            | b"dma-pin-exit"
-            | b"dma-reader-retire"
-            | b"dma-shared"
-            | b"dma-pin-quota"
-            | b"dma-pin-install-failure"
-    ) {
-        dma_race_target(startup, mode, usage, memory, ready);
+    if matches!(mode, b"dma-shared" | b"dma-pin-quota") {
+        dma_fixture_target(startup, mode, usage, memory, ready);
     }
     let bytes = 2 * libkernel::shared::proc::PROCESS_PAGE_SIZE;
     let cpu = MappedRegion::map_object(
@@ -314,8 +223,8 @@ fn dma_target(startup: &mut libruntime::startup::InitialGrants, mode: &[u8]) -> 
         // SAFETY: 输入请求存活；故意非法的输出只传整数，不构造无效 Rust 引用。
         unsafe {
             core::arch::asm!("ecall", in("a7") SystemCall::DmaReadSegments as usize,
-                inlateout("a0") mapping.handle().raw() as usize => _, inlateout("a1") &request as *const _ as usize => _,
-                in("a2") 0usize, in("a3") 0usize, in("a4") 0usize, in("a5") 0usize);
+    inlateout("a0") mapping.handle().raw() as usize => _, inlateout("a1") &request as *const _ as usize => _,
+    in("a2") 0usize, in("a3") 0usize, in("a4") 0usize, in("a5") 0usize);
         }
         panic!("DMA output fault returned to user execution");
     }
@@ -326,8 +235,8 @@ fn dma_target(startup: &mut libruntime::startup::InitialGrants, mode: &[u8]) -> 
     }
 }
 
-/// 沿原Pin/Read/Retire owner验证锁外交错；地址只被本测试读取，不交任何硬件。
-fn dma_race_target(
+/// 通过公开 Pin/Retire 与 Pool 查询验证共享 backing 和额度恢复。
+fn dma_fixture_target(
     startup: &mut libruntime::startup::InitialGrants,
     mode: &[u8],
     usage: libkernel::dma::DmaUse,
@@ -335,22 +244,15 @@ fn dma_race_target(
     ready: notification::NotificationSignaler,
 ) -> ! {
     use libkernel::{
-        dma::DmaMapping,
         ipc::wait,
         mm::{MappedRegion, Placement},
-        shared::{
-            call::SystemCallError,
-            dma::{DEVICE_WRITES, MappingPhase, Segment},
-            mem::MemoryProtection,
-            object::Rights,
-            proc::PROCESS_PAGE_SIZE as PAGE,
-        },
+        shared::{mem::MemoryProtection, object::Rights, proc::PROCESS_PAGE_SIZE as PAGE},
     };
     let gate = notification::NotificationOwner::from_capability(
-        startup.take(3).expect("DMA race gate missing"),
+        startup.take(3).expect("DMA fixture gate missing"),
     )
     .map_err(|failure| failure.error)
-    .expect("DMA race gate role invalid")
+    .expect("DMA fixture gate role invalid")
     .0;
     let caller_pool = if mode == b"dma-pin-quota" {
         let cap = startup.take(4).expect("DMA quota Pool observer missing");
@@ -365,7 +267,11 @@ fn dma_race_target(
     } else {
         None
     };
-    assert_eq!(startup.remaining(), 0, "DMA race grants have extra slots");
+    assert_eq!(
+        startup.remaining(),
+        0,
+        "DMA fixture grants have extra slots"
+    );
     // 首页面的只读use为同一Backing制造真实切界，使两页Pin存在非空、未完成前缀。
     let cpu = MappedRegion::map_object(
         &memory,
@@ -376,15 +282,15 @@ fn dma_race_target(
         MemoryProtection::ReadOnly,
         Placement::Anywhere,
     )
-    .expect("DMA race CPU readonly Map failed");
-    ready.signal(1).expect("DMA race readiness failed");
-    let observed =
-        wait::wait_one(gate.as_handle(), ObjectSignals::READABLE, 0).expect("DMA race gate failed");
+    .expect("DMA fixture CPU readonly Map failed");
+    ready.signal(1).expect("DMA fixture readiness failed");
+    let observed = wait::wait_one(gate.as_handle(), ObjectSignals::READABLE, 0)
+        .expect("DMA fixture gate failed");
     assert!(
         observed.observed.contains(ObjectSignals::READABLE),
-        "DMA race gate omitted readiness"
+        "DMA fixture gate omitted readiness"
     );
-    assert_eq!(gate.take(1).expect("DMA race start consume failed"), 1);
+    assert_eq!(gate.take(1).expect("DMA fixture start consume failed"), 1);
     if let Some(pool) = &caller_pool {
         let verified = dma_quota_target(&usage, &memory, pool);
         ready
@@ -396,188 +302,15 @@ fn dma_race_target(
             unsafe { sys_sleep(1000).expect("DMA quota target sleep failed") };
         }
     }
-    if mode == b"dma-shared" {
-        dma_shared_target(&usage, &memory, &ready, &gate);
-        ready
-            .signal(2)
-            .expect("DMA shared final result signal failed");
-        loop {
-            core::hint::black_box((&usage, &memory, &cpu));
-            // SAFETY: 两份DMA责任均已真实退休，父方仅以正常Kill收CPU/View尾部。
-            unsafe { sys_sleep(1000).expect("DMA shared target sleep failed") };
-        }
-    }
-    let pinned = usage.pin(
-        &memory,
-        0,
-        2 * PAGE,
-        DEVICE_WRITES,
-        Rights::READ | Rights::WAIT,
-    );
-    if mode == b"dma-pin-install-failure" {
-        assert!(
-            matches!(pinned, Err(SystemCallError::OutOfMemory)),
-            "DMA final installation did not return the specified allocation failure"
-        );
-        let end = libkernel::time::timeout_millis(60_000)
-            .expect("DMA installation cleanup deadline failed");
-        while usage
-            .query()
-            .expect("DMA installation cleanup query failed")
-            .members
-            != 0
-        {
-            assert!(
-                !libkernel::time::expired(end).expect("DMA installation cleanup clock failed"),
-                "DMA rejected installation retained a member"
-            );
-            libkernel::thread::yield_now().expect("DMA installation cleanup yield failed");
-        }
-        assert_eq!(
-            memory
-                .query()
-                .expect("DMA installation writer query failed")
-                .write_permits,
-            0
-        );
-        debug!(
-            "DMA installation failure collected: error=OutOfMemory, handle=false, exposed=false, members=0, writer=0"
-        );
-        ready
-            .signal(2)
-            .expect("DMA installation result signal failed");
-        loop {
-            core::hint::black_box((&usage, &memory, &cpu));
-            // SAFETY: Pin未交出handle或设备地址，原Work已退use/write；父方收CPU/View尾部。
-            unsafe { sys_sleep(1000).expect("DMA installation target sleep failed") };
-        }
-    }
-    let mapping: Option<alloc::sync::Arc<DmaMapping>> = if mode == b"dma-pin-before" {
-        assert!(
-            matches!(pinned, Err(SystemCallError::ObjectBusy)),
-            "DMA Pin accepted a writer after Seal"
-        );
-        debug!("DMA race Pin result: mode=before, error=ObjectBusy");
-        None
-    } else {
-        let mapping = alloc::sync::Arc::new(pinned.expect("DMA race Pin failed"));
-        assert_ne!(
-            mode, b"dma-pin-exit",
-            "DMA preparing-exit window was missed"
-        );
-        assert_eq!(
-            mapping
-                .query()
-                .expect("DMA race mapping query failed")
-                .phase,
-            MappingPhase::ReadyUnexposed as u32,
-            "DMA race Pin exposed addresses"
-        );
-        if mode == b"dma-reader-retire" {
-            let read_gate = notification::create(Rights::READ | Rights::WAIT, Rights::SIGNAL)
-                .expect("DMA reader gate create failed");
-            let reader_mapping = mapping.clone();
-            let reader = libruntime::thread::Builder::new()
-                .spawn(move || {
-                    let observed =
-                        wait::wait_one(read_gate.owner.as_handle(), ObjectSignals::READABLE, 0)
-                            .expect("DMA reader gate wait failed");
-                    assert!(
-                        observed.observed.contains(ObjectSignals::READABLE),
-                        "DMA reader gate omitted readiness"
-                    );
-                    read_gate
-                        .owner
-                        .take(1)
-                        .expect("DMA reader start consume failed");
-                    let mut segments = [Segment::default(); 1];
-                    let result = reader_mapping
-                        .read_segments(0, &mut segments)
-                        .expect("DMA accepted reader failed");
-                    assert_eq!(result.count, 1, "DMA reader returned no actual segment");
-                    assert_ne!(
-                        segments[0].address, 0,
-                        "DMA reader returned an empty address"
-                    );
-                    assert_eq!(segments[0].bytes, PAGE as u64, "DMA cut boundary changed");
-                    debug!(
-                        "DMA race accepted reader completed: bytes={}",
-                        segments[0].bytes
-                    );
-                    let observed =
-                        wait::wait_one(read_gate.owner.as_handle(), ObjectSignals::READABLE, 0)
-                            .expect("DMA reader completion gate failed");
-                    assert!(observed.observed.contains(ObjectSignals::READABLE));
-                    assert_eq!(
-                        read_gate
-                            .owner
-                            .take(2)
-                            .expect("DMA reader completion consume failed"),
-                        2,
-                        "DMA reader completion permission missing"
-                    );
-                })
-                .expect("DMA reader thread spawn failed");
-            read_gate.peer.signal(1).expect("DMA reader start failed");
-            // SAFETY: 地址只在本测试的Read输出中出现，未交硬件，也不再提交；与在途
-            // 地址读取的安全次序由原Exposure计数保证，Retire本身不能提前退use/许可。
-            unsafe { usage.retire(&mapping) }.expect("DMA reader Retire failed");
-            let snapshot = mapping.query().expect("DMA reader retiring query failed");
-            assert_eq!(snapshot.phase, MappingPhase::Retiring as u32);
-            assert_eq!(snapshot.readers, 1, "DMA reader/Retire window was missed");
-            assert_eq!(
-                memory
-                    .query()
-                    .expect("DMA reader writer query failed")
-                    .write_permits,
-                1,
-                "DMA Retire released a writer before its accepted reader"
-            );
-            assert!(
-                !wait::probe(mapping.handle(), ObjectSignals::DONE)
-                    .expect("DMA reader DONE probe failed")
-                    .contains(ObjectSignals::DONE),
-                "DMA Retire completed before its accepted reader"
-            );
-            debug!("DMA race Retire waits for accepted reader: readers=1, writer=1, done=false");
-            read_gate
-                .peer
-                .signal(2)
-                .expect("DMA reader completion release failed");
-            assert!(
-                matches!(
-                    reader.join(),
-                    libthread::ThreadOutcome::Returned {
-                        value: (),
-                        leave: Ok(())
-                    }
-                ),
-                "DMA reader thread did not return normally"
-            );
-            let observed = wait::wait_one(mapping.handle(), ObjectSignals::DONE, 0)
-                .expect("DMA reader retirement wait failed");
-            assert!(observed.observed.contains(ObjectSignals::DONE));
-            let snapshot = mapping.query().expect("DMA reader retired query failed");
-            assert_eq!(snapshot.phase, MappingPhase::Retired as u32);
-            assert_eq!(snapshot.readers, 0);
-            assert_eq!(
-                memory
-                    .query()
-                    .expect("DMA reader final writer query failed")
-                    .write_permits,
-                0
-            );
-            debug!("DMA race reader retired: readers=0, writer=0, done=true");
-        } else {
-            debug!("DMA race Pin result: mode=after, phase=ReadyUnexposed");
-        }
-        Some(mapping)
-    };
-    ready.signal(2).expect("DMA race result signal failed");
+    assert_eq!(mode, b"dma-shared", "DMA fixture mode invalid");
+    dma_shared_target(&usage, &memory, &ready, &gate);
+    ready
+        .signal(2)
+        .expect("DMA shared final result signal failed");
     loop {
-        core::hint::black_box((&usage, &memory, &cpu, &mapping));
-        // SAFETY: 父方在核原结果后沿正常Kill收束，没有未交付设备的访问责任。
-        unsafe { sys_sleep(1000).expect("DMA race target sleep failed") };
+        core::hint::black_box((&usage, &memory, &cpu));
+        // SAFETY: 两份 DMA 责任均已退休，父方以正常 Kill 收 CPU View 尾部。
+        unsafe { sys_sleep(1000).expect("DMA shared target sleep failed") };
     }
 }
 
