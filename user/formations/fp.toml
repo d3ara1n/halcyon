@@ -2,4 +2,6 @@
 [instance.fp]
 image = "test_fp"
 kind = "task"
-pool = { work_pages = 256, metadata_bytes = 262144 }
+# metadata 采用既有单实例 1 MiB 工作集；还须支付地址空间账本及进程/线程出生。
+# 映像、主栈与出生页由 init 另计；FP 任务的额外 RAM 保留为 256 页。
+pool = { work_pages = 256, metadata_bytes = 1048576 }

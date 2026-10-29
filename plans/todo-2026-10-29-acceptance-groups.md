@@ -31,7 +31,7 @@
 
 ## 当前状态与交付边界
 
-实施与离线验证已完成，用户于 2026-10-29 授权整理与提交。没有剩余代码拆分步骤；QEMU 未运行，以下运行边界保持开放，不能归档为全套验收通过。当前入口为 `just acceptance`，选择与命令真值由 `tools/acceptance.py` 拥有；33 个可选路线，包括普通、压力、资源观察、平台与历史时钟诊断。
+分组实施已提交为 `2314f40`。首次实跑暴露的 Bash 空数组与 init 出生授权问题已修复；用户随后要求逐条运行，本轮十个普通组分别执行并全部通过，FP 配额失败及单条复验也已保留。当前入口为 `just acceptance`，33 条目录路线中其余压力、GDB、故障注入和额外平台未在本轮选择，不能一并标为通过。结果见[逐条运行与修复](#逐条运行与修复2026-10-29)。
 
 - test_kernel 按 suite 分派；通用 Job 检查不再调用资源退休。MMIO/DMA 专项也不再重复普通平台自检或不相关保留 fixture。普通 suite 只装配自身及必需映像。
 - `just check/clippy` 无参数只列选择；按 package/分面执行，`all` 显式全仓。host tests 自动从 rustc 获取并显式传 host target。
@@ -79,6 +79,50 @@
 
 ## 后续运行边界
 
-用户选择 QEMU 后，先运行所关心领域，检查实际启动/收束与耗时；资源 GDB 路线还需核真实断点与窗口是否命中。当前没有运行速度、硬件行为、平台变体或组态迁移运行期正确性的通过证据。服务组的 Ready/Stopped/撤销、startup task 的实际完成及新PID触发下的资源观察窗口均需运行取证；如失败先查工具/组态/guest首因，不自动运行 all。
+十个普通组已分别通过，正常出生、领域完成、服务就绪与正常停止取得运行证据。同版本同输入通过的组不重跑；压力、GDB、额外平台和故障注入仍按具体影响与用户选择执行，不能据普通组通过推断这些专项窗口已覆盖。
 
 组态切面 B 的系统运行期责任继续由[原计划](todo-2026-10-28-init-formation.md#当前接力)拥有，本记录只拥有分组工具的运行取证边界。
+
+## 首次运行取证（2026-10-29）
+
+基线 `2314f40`，接手时工作树干净。用户选择先实跑新组织的验收流程，执行 `just acceptance all`（10 条普通 release 路线，默认 THROTTLE=50；首错停止）。未选择 stress、GDB、故障注入或额外平台。
+
+| 轮次 | 结果 | 证据 |
+|---|---|---|
+| 首轮 | 选择性构建、组态编码、boot package 与用户/内核 ELF 审计通过；尚未启动 QEMU，`run_acceptance` 的空 `options` 数组在 Bash 3.2.57、`set -u` 下展开报 `unbound variable`，exit 1，聚合约 3.5s | `artifacts/acceptance/20261029T094252Z-ordinary-run/summary.json`；完整构建日志 `artifacts/run/20261029-174253-90809-acceptance-memory-basic.log` |
+| 修复后 | 入口成功启动 QEMU；memory/basic 在 test_kernel Start 前收到 `instance preparation failed: kernel, System(RightsDenied)`，init 随即进入系统失败终局；runner 正确判失败并清理进程组，exit 1，运行段 0.694s、聚合约 3.1s | `artifacts/acceptance/20261029T094343.227369Z-91322/{guest.log,result.json}`；聚合 `artifacts/acceptance/20261029T094340Z-ordinary-run/{console.log,summary.json}` |
+
+入口修复将普通与 retention 分支的可选参数数组改为从完整 Python 命令开始的非空 `runner` 数组，不改变参数、超时或判据。普通、sifive_u reset、两条 retention 分支的 just dry-run 生成脚本经 `/bin/bash -n` 通过；普通分支另有实际 QEMU 启动证据，其他分支仅做语法检查。没有为这处低影响脚本修复新增测试或重复运行已通过的 Rust 检查。
+
+正式阻塞由[init 计划的首次运行阻塞](todo-2026-10-28-init-formation.md#首次运行阻塞2026-10-29)唯一拥有。本轮只修入口，不改产品出生权限；静态核实生命周期输入缺少 ProcessGrant 必需的 GRANT，运行日志尚未标出 Preparation 具体失败阶段，不把静态定位冒充断点取证。后续从该责任链接续修复，再验证 memory/basic 与其余普通路线。
+
+交付前检查：修复只涉及命令组装，runner 日志、失败拒绝、独立进程组与清理合同保持；退出后核无本轮 launcher 或 QEMU 残留。普通领域通过数为 0，失败 1，未运行 9；不能由本次失败判断这些领域自身已执行或存在缺陷。构建与验收完整日志保留，未提交改动。
+
+## 逐条运行与修复（2026-10-29）
+
+用户明确授权完善流程并逐条运行、逐条确认，禁止一次性运行整个集合。本轮保留前一轮四份未提交修改；正式出生权限修复由 init 原阻塞条目拥有。每次只执行单组，先检查 result/guest 完成事实与清理结果，再选择下一组。普通组之外的压力、GDB、故障注入和额外平台不自动扩大。
+
+| 单条命令 | 已核事实（均含正常收集/Shutdown、无清理错误） | QEMU 段 / 含构建 | 原始证据目录 |
+|---|---|---|---|
+| `just acceptance memory` | Start、内存完成、正常 DONE | 0.862s / 4.8s | `artifacts/acceptance/20261029T095220.171407Z-92827/` |
+| `just acceptance services` | 三宿主 Ready，fs→driver→device Stopped/DONE | 1.330s / 4.0s | `artifacts/acceptance/20261029T095246.622626Z-93096/` |
+| `just acceptance ipc` | Sender、Once 跨 Pool 运输与退款 | 0.847s / 3.3s | `artifacts/acceptance/20261029T095329.862153Z-93382/` |
+| `just acceptance process` | Kill、Job、封口与枚举检查，无 FAILED | 0.844s / 3.5s | `artifacts/acceptance/20261029T095349.923023Z-93656/` |
+| `just acceptance transport` | 真实流、pm 收尾退款、RPC 取消 | 0.841s / 3.4s | `artifacts/acceptance/20261029T095406.851193Z-93908/` |
+| `just acceptance time` | 公共期限、到期与因果读 | 1.378s / 3.9s | `artifacts/acceptance/20261029T095421.180035Z-94146/` |
+| `just acceptance resources mmio` | 映射、撤销及进程退休 | 0.285s / 2.9s | `artifacts/acceptance/20261029T095440.864270Z-94390/` |
+| `just acceptance resources irq` | 独占来源、Seal/Revoke、WaitSet 与关闭 | 0.293s / 2.8s | `artifacts/acceptance/20261029T095456.091923Z-94626/` |
+| `just acceptance resources dma` | Pin/SG/退休；两保留 fixture 共 4 页 | 0.846s / 3.6s | `artifacts/acceptance/20261029T095510.981868Z-94869/` |
+| `just acceptance platform fp` | D64 运算、FPR/fcsr 跨 trap 校验 | 0.295s / 2.2s | `artifacts/acceptance/20261029T095641.471031Z-95464/` |
+
+FP 首次运行在 Start 前报 `System(QuotaExceeded)`，现场为 `artifacts/acceptance/20261029T095530.772212Z-95123/`。组态仅给 262144 字节 metadata，而当前 ELF 的启动诊断已给出地址空间账本最低存储 394624 字节；`AnySpace::empty` 以目标 Pool 的 MetadataFunding 创建该账本，尚不计其他进程/线程元数据，静态可确认原预算不足。FP 改用既有单实例 1 MiB metadata 工作集，work_pages 仍为 256，映像/主栈/出生页仍由 init 另计；不改内核限额、不自动扩额、不放宽浮点判据。只重跑 FP 后通过，其余九组结果继续有效。
+
+十条成功调用含增量构建合计约 **34.4 秒**，QEMU 运行段合计 **7.821 秒**；不含人工逐条核对、静态检查和 FP 首次失败的 3.3 秒。此为当前缓存、release、THROTTLE=50 条件下的记录，覆盖范围与旧全量不同，不能声称是相同测试集合的等价加速。统计、每轮 ELF/boot package 身份与修复差异快照在 `artifacts/acceptance-sequential/20261029T095802.960248Z-95550/`。没有调用 all 或用循环批量启动测试。
+
+### 本轮收口
+
+- init 的源 GRANT 修复与 owner/失败责任核查由原 init 记录拥有；check/clippy 通过，task 与 resident 的实际正路径均通过。公共接收权限与内核授权规则保持。
+- FP 配额只改验收组态，依据实际地址空间账本下界及已有单实例工作集；没有为跑通旧测试增加产品旁路或删除判据。
+- 原 Bash 3.2 非空 runner 修复保留，普通分支已有十次成功运行；未运行的 retention/sifive 等分支仍仅有原静态检查证据。
+- 最终核无 QEMU 进程残留；每条 result 都为 runner_exit=0、exit_code=0 且无 cleanup_error。源码格式、差异与当前文档链接在收尾检查。已有通过测试不因文档回填重跑。
+- 当前交付为十个普通组的逐条运行及相关修复，改动尚未提交。init 全部负路径、压力和精确故障窗口不在本轮通过声明内；后续按具体需求选择，不把33条目录自动变成每次提交的门。

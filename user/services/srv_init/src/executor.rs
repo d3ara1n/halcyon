@@ -409,12 +409,12 @@ impl<'a> Executor<'a> {
         let report = Mailbox::create(Rights::READ | Rights::WAIT | Rights::MANAGE)
             .map_err(|_| "instance report mailbox failed")?;
         let sender = report
-            .mint(0, instance::REPORT_RIGHTS)
+            .mint(0, instance::REPORT_RIGHTS | Rights::GRANT)
             .map_err(|_| "instance report sender failed")?
             .sender;
-        let stop = notification::create(instance::STOP_RIGHTS, Rights::SIGNAL)
+        let stop = notification::create(instance::STOP_RIGHTS | Rights::GRANT, Rights::SIGNAL)
             .map_err(|_| "instance stop notification failed")?;
-        // 生命周期输入直接移交；其余输入以带 GRANT 的别名移交，出生时衰减为声明权利。
+        // 源能力持 GRANT 供出生转授；目标仅收到生命周期契约或组态声明的权利。
         let mut owners: Vec<(String, Capability, Rights)> = Vec::new();
         owners.push((
             instance::REPORT.into(),

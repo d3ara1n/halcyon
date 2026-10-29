@@ -119,7 +119,7 @@ Preparation 首次失败后冻结状态，重复 advance 返回同一错误。�
 
 `user/formations/system.toml` 声明设备管理者、驱动管理者、文件/registry 宿主及按需驱动映像。`finish=stay` 持续监督，不因空闲退出。有限组态用 `finish=shutdown`，等待所有 task 正常完成后停止 resident。task 的 `after` 依赖要求其 DONE，resident 依赖由拓扑与 Ready 导出满足。
 
-Executor 持具名 Pool/Job、映像 owner、实例 Record 和路由。实例 Pool 的页数包括 ELF load runs、主栈、出生页与组态 `work_pages`，metadata 按槽换算。实例经 `libprocess::birth` 收命名输入和 settings，经 `libservice::instance` 报告命名导出、Ready/Stopped；init 按真实 PID/context、声明名字、种类与权利验证报告。Control、报告 receiver、停止 signaler、导出及等待登记由同一实例 Record 持有，准备/出生失败仍按 Preparation 和 GrantOutcome 处理。
+Executor 持具名 Pool/Job、映像 owner、实例 Record 和路由。实例 Pool 的页数包括 ELF load runs、主栈、出生页与组态 `work_pages`，metadata 按槽换算。实例经 `libprocess::birth` 收命名输入和 settings，经 `libservice::instance` 报告命名导出、Ready/Stopped；init 按真实 PID/context、声明名字、种类与权利验证报告。报告 sender、停止 owner 和普通输入的源能力持有 GRANT，供 ProcessGrant 转授；目标权利仍衰减为生命周期契约或组态声明，服务不额外取得 GRANT。Control、报告 receiver、停止 signaler、导出及等待登记由同一实例 Record 持有，准备/出生失败仍按 Preparation 和 GrantOutcome 处理。
 
 ### 停止与终局
 

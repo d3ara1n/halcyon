@@ -225,16 +225,16 @@ run_acceptance observer: make_dtb make_boot_package build_kernel
         vm-repair)
             exec python3 tools/check-vm-repair.py --kernel "{{KERNEL_ELF}}" --timeout {{VIRT_VM_FAULT_TIMEOUT}} -- "${command[@]}" ;;
         dma-retention|dma-ipi-retention)
-            options=()
-            if [[ "{{observer}}" == dma-ipi-retention ]]; then options+=(--ipi-failure); fi
-            exec python3 tools/check-dma-retention.py --kernel "{{KERNEL_ELF}}" --boot-package "{{BOOT_PACKAGE}}" --timeout {{VIRT_DMA_RETENTION_TIMEOUT}} "${options[@]}" -- "${command[@]}" ;;
+            runner=(python3 tools/check-dma-retention.py --kernel "{{KERNEL_ELF}}" --boot-package "{{BOOT_PACKAGE}}" --timeout {{VIRT_DMA_RETENTION_TIMEOUT}})
+            if [[ "{{observer}}" == dma-ipi-retention ]]; then runner+=(--ipi-failure); fi
+            exec "${runner[@]}" -- "${command[@]}" ;;
         *) echo "Unknown acceptance observer: {{observer}}" >&2; exit 2 ;;
     esac
-    options=()
-    if [[ "{{MODEL}}" == sifive_u ]]; then budget={{SIFIVE_U_TIMEOUT}}; options+=(--allow-reset-failure); fi
+    runner=(python3 tools/qemu-acceptance.py)
+    if [[ "{{MODEL}}" == sifive_u ]]; then budget={{SIFIVE_U_TIMEOUT}}; runner+=(--allow-reset-failure); fi
     if [[ "$variant" == hetero ]]; then budget={{VIRT_HETERO_TIMEOUT}}; fi
     if [[ "$variant" == nofd ]]; then budget={{VIRT_NOFD_TIMEOUT}}; fi
-    exec python3 tools/qemu-acceptance.py --timeout "$budget" "${options[@]}" -- "${command[@]}"
+    exec "${runner[@]}" --timeout "$budget" -- "${command[@]}"
 
 clean-qemu *args:
     @./tools/clean-qemu.sh {{if args == "" { "-y" } else { args }}}
