@@ -1,4 +1,0 @@
-# ipc/process/transport 的压力覆盖层；不隐含其他领域。
-[instance.kernel]
-pool = { work_pages = 20480, metadata_bytes = 5242880 }
-settings.mode = ["stress"]

@@ -23,7 +23,6 @@ static GEOMETRY: GeometryCell = GeometryCell {
     state: AtomicU8::new(0),
     value: UnsafeCell::new(MaybeUninit::uninit()),
 };
-pub(crate) mod selftest;
 
 struct ClockState {
     high_ticks: AtomicU64,

@@ -62,7 +62,7 @@ BindingControl/Use 的 OAL 根由 [`resource/oal`](../../user/libraries/libdevic
 
 不可恢复的来源/运输或绑定安全故障使管理进程显式失败。init 的 [`supervision`](../../user/services/srv_init/src/supervision.rs) 在 RootSupervisor 的同一 Assembly 上按部署预付本地 InstanceTask（设备两项，文件另计）。每个任务观察 World 中对应的 Record；记录通过 ProcessOwner 独占未启动 PreparedProcess 或运行期 ProcessControl，并持真实 SourceAdmin、停止期限与 DONE 快照。DONE 来源实际附着之后才消费 Start。srv_driver 的 SourceAdmin 在准备进程之前移入，srv_device 的根 admin 在认证私有 bootstrap 后移入。Job/Pool 的关闭权继续由 root 原能力账本持有，领域装配记录只借用其 handle。
 
-root 每次统一接收后先推进管理 DONE 和故障判断，再推进装配、等待和其它 Runtime。业务报告、设备/功能消费者和并发 Retry 主线的等待同样经过 root；具体接点和来源借用由[执行与监督](runtime.md#顺序装配的等待与推进)拥有，loader/映像复制由[启动实现](startup.md#用户态公共-loader)拥有。独立内核 ABI 创建自检在基础宿主出生前执行；全局停止 Seal 后不再启动验收进程。文件与系统终局的共同持有见[启动实现](startup.md#init-的静态部署与根监督)。
+init 的组态执行器在实例装载步骤之间消费已经登记的 DONE/报告观察，并在常驻阶段通过同一 WaitSet 等待。设备与驱动作为 resident 按统一出生、Ready/Stopped 和撤销契约接入；具体持有与停止边界由[启动实现](startup.md#init-的组态装配与根监督)拥有。
 
 正常停止在第一个可使管理者退出的请求之前提交原实例意图和绝对期限。SourceAdmin 的 QuerySourceStop 确认 Closed 后，由同一 root 直接关闭原 admin；DONE 必须核验 Completed/无异常 detail，先到时保留快照等来源证明。两项事实齐全后实际注销 DONE 来源，将原 Control 交原 Collector，再关闭对应 Job/Pool。全部管理任务退休后关闭其 Runtime 和终局预备资源，不存在 release_admin/disarm/ACK/join 握手。
 
@@ -113,10 +113,6 @@ PCI/xHCI 的 Get、子登记以及 xHCI Master 若收到形状合法的 Closed�
 Device 停止先等待原定向命令完成；有 TD 时只从该 TD 选择真实 dci 执行 Stop/SetDequeue，没有 TD 的空闲端点集合直接 Disable Slot，不从描述符推断配置完成。Disable 后把待交付的结果消费为独立字节回执；逐页退休等待 DMA DONE，再显式 Unmap CPU 映射，失败保留 Page 并交原 Engine 的故障政策。所有页收尾完成后才 Closed，迟到 USB 结果从回执读取，不回读已解除的页。Page Drop 仅作构造失败兜底，Unmap 失败会终止进程交 VM 回收，不静默丢 owner。
 
 Engine原pending的Call::Master携带一次绝对期限。Sent且cause为ServiceClosed/Timeout时，先退原RPC/Delivery，再以同Controller.function/ref/context与同deadline重发；不重建Controller、环或DMA域。已观察Stopping时不新发Master，下一步进入原halt/Retire；Frame、取消、shutdown和其他错误不自动重发。期限耗尽或清理失败按原故障保留，成功回复仍严格核opcode/error/空正文/零cap；硬件halt/reset的规范限值独立。
-
-[`srv_init::function_checks`](../../user/services/srv_init/src/function_checks.rs) 是显式验收配置的真实控制器消费者：只自动装配 PCI，init 另持限定 Subtree 的 OBSERVE/CLAIM/REPORT_STOPPED 来源，无 CHILD_REGISTER。每轮先 IssueUse，再由该 Use Get/ReportQuiescent；Control 只控制停止和观察。实际 Controller 完成 HCH、残事件、ring DMA DONE 和 Unmap 后才报告。旧 function、Control 和 Use 跨轮保留，旧 Use 验证 Get Closed，旧 Control 验证原 Released；新 Prepared 仍拒旧 function context。
-
-该消费者的IRQ变体在真实插入返回READABLE后保留原电平，先由原BindingControl完成认证QueryBinding并核原轮ResourcesReady，再probe原use仍READABLE才Take/Ack。两侧都不由观察调用消费token，后续停止及旧generation检查继续同一路径；这不为其他actor增加IRQ能力，也不从一次请求推导长期/同hart公平性。
 
 [`libhid`](../../user/libraries/libhid/src/lib.rs) 拥有 boot keyboard 八字节报告、有效/不确定/断开状态及单调序号。有效报告将 usage 排序去重；ErrorRollOver、错误保留字节和断开保留最后有效键集并使状态无效，真实全零报告才表示全部释放。[`drv_usb_hid`](../../user/drivers/drv_usb_hid/src/server.rs) 组合原 Runtime/Dispatcher 与统一 Activate，SET_PROTOCOL(0) 完成才 Ready，随后用同一接口会话序号消费 Interrupt IN；生命周期由独立 Binding Watch 传递。HID 在首个 Transfer 前预付并挂好完成通知 Owner，首 seq 向 provider 交 SIGNAL；结果提交后提示，HID 先 drain 再 Query 同一 seq，无输入时不按 2ms 查询。只读 USB Query 不唤醒硬件 Engine。provider 在真实供应关闭后释放该 session 的完成 Signaler；HID 在终态且本地来源注销后释放通知 pair，旧观察别名不保活该业务通知。每个 Binding 的 Instance 独占 ActivationSlot、Keys、USB seq 和 Engine；同一 Runtime/Dispatcher 共享进程，不保留单激活分派。它不取得 Registrar、MMIO、IRQ 或 DMA。功能 Query/Watch/Ack 只交状态，独立 Watch 持自己的确认游标、Notification 和控制 Lifetime；旧 Ack 不清后来报告的 pending。停止封功能新取得并取消原传输，断开终态不生成伪报告。认证/旧轮/拒绝错误仅结束本地提交并保存错误，原 provider 仍持 TD；它们不置 consumer_stopped，实际中央 Released 仍等待供应安全结果。Instance 的原任务继续持有付费终态尾部与真实 Watch Lifetime 来源，按最后关闭事件注销退款；已 Released 尾部不持 Use/Registrar 或活跃额度。最多三十二条实例记录，每实例键盘 Watch 与激活观察各至多八个；满额明确拒绝新准入，不驱逐既有责任。
 
@@ -198,9 +194,7 @@ Seal 只封新准入；Revoke 或最后 capability 消散提交封口，并初�
 
 ## 用户态 IO owner
 
-Map原Admission已遍历完成后发生根sequence变化，最终grant复核返回ObjectBusy，原预约和Preparing成员沿回滚归还；新准入遇已封节点返回ObjectClosed。发布许可成功后即使Revoke到达，仍由原已接受操作完成PTE发布，再经同一ForcedRetirement删除，不能撤回原提交。显式验收沿原32页test_target消费者暂停许可两侧；子进程独立Pool区分活VM页表/容量与CPU DONE后Control观察壳费用，最后关闭才归零。
-
-原`mmio_checks::process_retirement`的Frozen变体仍由同一test_target持两份32页Map、父方提交Revoke后Kill，目标独立Pool，真实scope DONE/members0及Killed/Control关闭后要求原账归还。外部工具分别选择原ForcedRetirement栈上的Idle/非空FIFO及Publishing/原active，不要求另一映射同时排队；step已take的Execution在此期间属于原Work栈，不因self.execution暂空而丢失。实际活VM以既有identity区分，held Execution跨Frozen窗口保存后即停止跟踪旧地址，最终由同PID/scope的原消费者回执核收束。父Kill封口后立即恢复Work，已提交事务先完成，未开始部分交整VM退休；不用等待DONE来安排恢复，不改VM字段或增加通知接口。
+Map原Admission已遍历完成后发生根sequence变化，最终grant复核返回ObjectBusy，原预约和Preparing成员沿回滚归还；新准入遇已封节点返回ObjectClosed。发布许可成功后即使Revoke到达，仍由原已接受操作完成PTE发布，再经同一ForcedRetirement删除，不能撤回原提交。
 
 [`libkernel::mmio`](../../user/libraries/libkernel/src/mmio.rs) 提供 typed control/use、派生、查询、Seal/Revoke，以及复用普通 Map 提交协议的 MmioRegion<U>。map借用use，map_owned由region直接持use；私有字段只由这两个原Map入口构造，共用范围/对齐/写权限检查及volatile 8/16/32/64位访问，分片Unmap只开放借用形态，不产生普通Rust引用。
 
@@ -226,8 +220,6 @@ Line 内嵌 WaitQueue，其电平、订阅链与 Service 同受 PLIC 锁保护�
 
 [`libkernel::irq`](../../user/libraries/libkernel/src/irq.rs) 提供 typed control/use。Query 的 use generation 固定，Take 只经 a1 返回 sequence，封装组合为 IrqToken；不在消费后向用户缓冲写结果。Ack 通过寄存器交完整 token。READ 用于 Query，Take 要求 READ|WRITE，Ack 要求 WRITE，WAIT 观察，CREATE 派生，MANAGE 停止。内核 IRQ 停止不证明设备或 DMA 静止，驱动的协作停止仍由设备协议负责。
 
-[`irq_checks`](../../user/tests/test_kernel/src/irq_checks.rs)的显式退出消费者把真实use的READ|WAIT别名与就绪信号交给原test_target；直接变体等待Line，集合变体挂一个真实Line成员后在持续观察作用域中持有WaitSet，以Receive复检候选，空提示后等待再复检。注册产生的初始候选不等同真实Line就绪；本消费者不预期硬件事件，非空记录、意外集合状态及API错误均失败。父方保留use母本，按原ProcessKill/终因/DONE关闭唯一Control，等目标实际Pool全部归还后才再Query原use、显式Revoke并等来源DONE；不以目标CPU完成或最后use Close代替观察loan的退休。就绪信号只交接阶段：直接变体另核实际Waiting/Line来源，集合变体另核真实子cap所持Set与Line成员，宿主恰好Waiting时再核两层来源；不新增产品线程查询接口。
-
 ## DMA 稳定 pin 与地址交付
 
 [`resource/dma`](../../os/kernel/src/resource/dma/mod.rs) 的 DmaDomainControl 派生子 control/use；DmaUse 的 CREATE 接受 Pin，DmaMapping 只提供查询、地址读取和 DONE 观察。mode/coherency 固定为显式 TrustedPhysical/Coherent，根只由 board 已验证的 QEMU 无 IOMMU、恒等 PCI DMA 平台发行。真实设备地址不具撤销性，取得它的驱动必须属于受信主控基座；不提供 raw VA→PA 或 MMIO→DMA 旁路。
@@ -247,8 +239,6 @@ Retire 接受创建该 mapping 的原 DmaUse 或同根真实上级 control 的 M
 [`Node::root`](../../os/kernel/src/resource/dma/mod.rs) 的 NODES 保留条目成功后才发布根；条目失败仍属于上文的未发布空根回滚。Root Work 继续负责真实已发布派生树的逐项身份回收，不接管出生期没有成员或子项的局部失败。
 
 Retire 先封新 reader，既有 Exposure 退出后原 mapping Work 才释放。取消时把未完成 acquisition 收束成实际前缀；退休时按 coherent 平台合同排序，再归还原 MemoryObject 写许可、逐段推进 BackingRelease。全部实物责任归还后同门移除成员/回执、摘稳定保留条目，最后发布 DONE。独立 CPU/DMA use 可继续保有同页，不要求整份 backing 归零；观察壳仍按自身存储寿命付款。
-
-[`dma_checks`](../../user/tests/test_kernel/src/dma_checks.rs)与[`test_target`](../../user/tests/test_target/src/main.rs)的显式竞争消费者复用上述Pin/Seal/Read/Retire/退出路径。子进程只读View为同一Backing保留第一页切界，Pin可取得非空未完成前缀；读取变体用原线程库的第二线程持真实Exposure，主线程Retire后沿原Query/许可/DONE观察再交接读取完成。地址只被测试读取，不交硬件。各目标使用独立Pool，父方继续拥有原MemoryObject；CPU完成后仍存在的原Control/Backing切界存储按真实寿命付款，父对象及相关能力关闭后才要求子账归零。
 
 共享变体对同一MemoryObject取得两份独立mapping，核完整SG相同后逐份Retire、等待DONE并关闭角色；原Notification只交接有限观察阶段。第一份完成时第二份仍持地址与写许可，父MemoryObject的root use继续持物理页。父/子Pool分别观察RAM来源和新增mapping/切界元数据，最后原父对象关闭才释放其实际物理份额。额度变体仅把目标实际付款Pool的READ观察角色交给目标；目标持真实Notification角色制造Quota，再释放压力沿同一DmaUse重新Pin/取消。原成员/write及最终账务仍由同一资源机制决定，不以测试余额替代安全状态，不新增资金或资源账本。
 

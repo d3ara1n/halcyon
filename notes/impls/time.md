@@ -12,6 +12,4 @@
 
 Thread出生内嵌TimerNode，per-hart队列载荷为强Thread/epoch；service_expired锁外只提示，由执行owner复检并提交Timeout。正常续体/Frozen reap共用detach注销，旧消息不能取消新epoch。WorkQueue的业务deadline与执行退避节点共用一份稳定TaskTimers分配，仍各自登记/取消；Runtime来源退休与RPC Dispatcher各持预付pin节点，先取消/弹出所有登记再释放存储；Runtime来源费用包含实际timer布局。非Gate stop/unregistered回调前兑现已到期责任、回调后同步同一预付业务timer；Finalizing只继续来源退休，不重新武装业务期限。
 
-`clock/selftest.rs` 使用独立 ClockState 和编排的 raw 样本，验证 origin/skew、已采旧值迟到发布、真正回退、不可逆失败、epoch 末端与并发失败复检，不污染正式 STATE。Ready 前启动调用已接入，正常验收要求 Clock state anchor；这些不是实际多 hart 弱序的全面验证。
-
 当前时间只覆盖一个硬件epoch内可读且可编程的有限范围，不提供跨epoch连续时钟。ClockState失败/范围尽头锁存不可恢复事实，runtime_stop令继续运行或随后唤醒的hart在安全点停止；不靠周期timer掩盖失败。公共时钟不拥有RPC offer/阶段/迟到回复政策；这些绝对期限由实际消费者拥有。

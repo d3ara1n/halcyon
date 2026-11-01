@@ -21,8 +21,6 @@ use crate::{
     task::memory_pool::{MemoryCharge, MemoryPool, PreparedMemoryCharge},
 };
 
-pub(crate) mod selftest;
-
 const PAGE_SIZE: usize = 1 << PAGE_BITS;
 const MAX_PERMANENT_RESERVATIONS: usize = MAX_PLATFORM_RESERVATIONS + 2;
 const MAX_BOOT_HOLDS: usize = 3;
@@ -580,18 +578,8 @@ impl FundedFrames {
         self.inner.credit().is_from(pool)
     }
 
-    pub(crate) fn pages(&self) -> usize {
-        self.inner.pages()
-    }
-
     pub(crate) fn extent_count(&self) -> usize {
         self.inner.extent_count()
-    }
-
-    pub(crate) fn extents(&self) -> impl ExactSizeIterator<Item = (FrameNumber, usize)> {
-        self.inner
-            .claims()
-            .map(|claim| (claim.geometry().base(), claim.geometry().count()))
     }
 
     /// 输出数组由调用者预付；抽取自身有界声明时不分配临时容器。

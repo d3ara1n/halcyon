@@ -127,18 +127,6 @@ Executor 持具名 Pool/Job、映像 owner、实例 Record 和路由。实例 Po
 
 [`terminal`](../../user/services/srv_init/src/terminal.rs) 持 services、平台根与 reset 的借用和管理端集合，封 services、请求来源撤销、封平台根并有界收集，最后提交系统失败复位。正常链在所有实例收束后提交 Requested reset；reset 拒绝时终止 init，由内核原 DONE 观察者承担停驻。正式 init 不链接验收 crate，也不包含 FS/设备专用测试编排。
 
-### 验收装配
-
-[`test_kernel`](../../user/tests/test_kernel/src/main.rs) 的 `settings.suite` 选择 memory、ipc、process、tunnel、mmio、irq、dma、time；startup 分支仅采用出生输入并收集 task/Job。`settings.mode` 选择所属压力或公开资源场景，未知领域和模式在运行前拒绝。每组只装配一个 kernel task 及所需 target、hammer、自身映像；资源组取得平台根，不装配业务服务。
-
-memory 检查映射、进程付款和 Pool；ipc 检查消息、通知、Once 与等待；process 检查出生、Job、Kill 和退出。tunnel 只检查内核 Invitation/Endpoint、独立映射、几何、失败 owner 与生命周期。MMIO/IRQ/DMA 各自验证公开授权、撤销、退出和收束；DMA 另有共享 backing 与额度恢复，IRQ 另有 WaitOne/WaitSet 使用者退出。它们不依赖调试器建立内部状态窗口。time 检查公共期限。
-
-[`startup`](../../user/tests/test_kernel/src/startup.rs) 通过 `libprocess::birth::Birth` 采用输入、映像和设定，以自身 CurrentProcessInfo 启动子进程，只持 services 下验收 Job 的子树。[`Harness`](../../user/tests/test_kernel/src/harness.rs) 持能力与子进程，复用正式 Collector/Job 收束。正常路径收集后报告完成；失败使 test_kernel panic，由 init 的正式实例监督接管。
-
-普通组沿用四份工作集，压力组沿用五份，数值由组态声明，不代表精确峰值。DMA exposed/output-fault 的保留 fixture 在独立 retention Pool 付款；test_kernel 以封存映像启动保留角色，核收集后的页数等于 fixture 数乘每项两页。该公开 Pool 观察仅证明进程退出后的保留，不声称验证 reset 拒绝或 hart 停驻后的内部责任。
-
-FP 组运行 test_fp；nofd 核 Base64 域与最小出生/收集，hetero 核域划分和浮点消费者。验收使用正式 BootPackage/出生 ABI，组态编译器选择引用映像，strip 只处理归档副本。System 业务服务的运行由演示与人工验证承担。
-
 ## 验证入口与边界
 
-检查与自动内核验收的选择由[构建与验证手册](../../plans/BUILD-AND-TEST.md)拥有。guest 完成、init 收束与正常 reset 共同组成成功判据。自动验收不连接 GDB，不注入内核内部状态，不宣称特定内部阶段或完整业务组合已经覆盖。当前范围和验证证据由[验收记录](../../plans/archived/todo-2026-10-29-acceptance-groups.md)拥有。
+编译、ELF 审计与 host 测试由[构建与验证手册](../../plans/BUILD-AND-TEST.md)拥有。正式 System 通过同一组态编译与映像打包链启动；运行证据来自实际服务、应用和设备使用。host 测试不覆盖真实进程出生、调度、停止与硬件访问。

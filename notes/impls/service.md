@@ -34,12 +34,10 @@ OAL Lookup/Enumerate 直接借用这些实际表。根是 Directory，注册叶�
 
 ## 进程装配与行为限制
 
-[srv_fs boot](../../user/services/srv_fs/src/server/boot.rs) 把文件与独立 registry 放在同一 Runtime/Assembly。私有 [Profile](../../user/services/srv_fs/src/startup.rs) 选择 System 单入口、AcceptancePrimary A/B 入口或 AcceptanceSecondary 文件宿主；同一 [Capacity](../../user/services/srv_fs/src/deployment.rs) 推导 task/source 与各入口额度。Ingress、退休、释放、维护及 Dispatcher 共享 reply 由基础设施 H 支付，各入口根角色、Root task/观察与业务请求由可信配对支付。每种根报文都为空正文，按 profile 交一或两个真实 sender；Ready/Stopped 分别为零能力报文。
+[srv_fs boot](../../user/services/srv_fs/src/server/boot.rs) 按 [Config](../../user/services/srv_fs/src/startup.rs) 在同一 Runtime/Assembly 装配文件与可选 registry；`entries` 指定入口份额，`registry` 决定本地目录角色，非 registry 实例由 `publish` 指定外部发布名。Capacity 按实际配置推导 task/source。Ingress、退休、释放、维护及 Dispatcher 共享 reply 由基础设施账户支付，各入口根角色与业务请求由可信配对支付。出生输入、命名导出及 Ready/Stopped 使用统一实例契约。
 
-发行者创建并支付角色，Root owner 保存 context/Lifetime；根、必要 ingress、release、retire 来源实际安装后才能对外交付或首次注册，Ready 不依赖验收请求。停止时已领取但未移交的 sender 释放，各 owner revoke/注销。Packet 独占移交母本，init 采用前核预期 PID/context、数量及真实 kind/rights；文件、目录、发布 authority、管理根分别保存。文件业务使用 Derive 缩权；目录访问沿已有整个根 Scope::Root 角色，不声称存在远程逐路径目录缩权接口。
+发行者创建并支付角色，Root owner 保存 context/Lifetime；根、必要 ingress、release、retire 来源实际安装后才能对外交付或首次注册，Ready 在必要来源安装后交付。停止时已领取但未移交的 sender 释放，各 owner revoke/注销。Packet 独占移交母本，init 采用前核预期 PID/context、数量及真实 kind/rights；文件、目录、发布 authority、管理根分别保存。文件业务使用 Derive 缩权；目录访问沿已有整个根 Scope::Root 角色，不声称存在远程逐路径目录缩权接口。
 
-secondary 第四出生槽为 publication inbox receiver；init 单次 AUTHORITY_GRANT_KIND 移交 exact-name publisher sender，无 GRANT。secondary 在有限期限内核对内核提供的 sender_pid 与出生 parent_pid、kind、槽和 sender 角色后采用，关闭 inbox。必要来源安装后，用原 Dispatcher 单步 Register 发布文件入口；init/test_fs 经 WatchName→Query→GetEntry 绑定真实 endpoint。停止封文件准入，显式 Withdraw 后再封 Runtime，失联则关闭原控制让目录 owner 自动撤出，不按名字删除替代者或重放未知 Register。
+不承载 registry 的文件实例经出生输入 `service.authority` 取得发布授权，必要来源安装后用 Dispatcher 注册首个文件入口。停止时 Withdraw，随后封闭 Runtime；失联时由注册控制寿命触发目录撤出，不按名字删除替代者或重放未知 Register。
 
-[Funding](../../user/libraries/libservice/src/funding.rs) 从冻结视图一次准备请求/Outbox/回复缓冲/来源费用，长期 Request 自身存储单独持费，回复收束不提前退还控制任务存储。运输停机检查 Budget 的 fs/service Request 实际占用；Runtime/Assembly 与 backing/角色退出后检查 Budget::is_empty。host 的认证 Ready/Stopped、DONE 监督与系统故障政策由[启动实现](startup.md#init-的静态部署与根监督)唯一描述，Registry 的 Active/Withdrawn 不承担这些健康阶段。
-
-init 将验收 B 文件/目录入口交现有 test_fs；A/B 私有 ExactName authority 分别从母根派生，经同 inbox 双槽交付。A Watch/Session 局部额度为全局一半，B 可达全局；System 单入口使用全局额度。消费者读同一 Capacity 元数据，关闭真实控制后以准入恢复核退款。流、Copy、Bind/Unbind、文件和服务 Watch 继续使用原正式消费者与领域合同；证据边界由[工作记录](../../plans/todo-2026-10-07-fal-service-redesign.md)及[装配记录](../../plans/todo-2026-10-07-service-assembly.md)拥有。
+[Funding](../../user/libraries/libservice/src/funding.rs) 从冻结视图一次准备请求/Outbox/回复缓冲/来源费用，长期 Request 自身存储单独持费，回复收束不提前退还控制任务存储。运输停机检查 Budget 的 fs/service Request 实际占用；Runtime/Assembly 与 backing/角色退出后检查 Budget::is_empty。host 的认证 Ready/Stopped、DONE 监督与系统故障政策由[启动实现](startup.md#init-的组态装配与根监督)唯一描述，Registry 的 Active/Withdrawn 不承担这些健康阶段。

@@ -32,19 +32,18 @@
 
 ## CPU 节流（tools/qemu-throttle.sh）
 
-自动验收不接入 GDB；本篇的断点、物理内存读取与注入只用于手动调查。路线、默认节流、超时和终态判定统一见 [构建与验证手册](BUILD-AND-TEST.md#判定日志与清理)。本节只说明调试时的工具行为。
+本篇的断点、物理内存读取与注入用于手动调查。正式运行入口、日志与清理由[构建与验证手册](BUILD-AND-TEST.md#判定日志与清理)拥有。
 
 - `tools/qemu-throttle.sh` 通过 OS 层 SIGSTOP/SIGCONT 控制 QEMU 宿主占用；`-icount` 不能替代 CPU 使用限制。
 - **调试（gdb -s）务必 `THROTTLE=100` 全速**：节流会周期性冻结整个 QEMU，使 gdb 交互卡顿并改变 `-icount` 复现时序。
 - 节流档下 QEMU 被后台化，终端 Ctrl-C 不再直达 guest；脚本捕获后会先 SIGCONT，再终止并清理 QEMU。仅 SIGKILL 可能遗留 STOP 态进程，此时先 `kill -CONT <pid>`。
-- `THROTTLE=100` 不等于绕过验收管道：全速档只是不执行 STOP/CONT，日志收割、锚点判定与路线超时仍然生效。计时对比必须使用同一 workload 与 throttle。
+- `THROTTLE=100` 只取消 STOP/CONT 节流。计时对比必须使用同一 workload 与 throttle。
 
 ## 输出与日志
 
 - **stdout 经管道/文件是缓冲的**：SIGTERM 杀 QEMU 丢失未刷出的尾部输出。
   「日志停在 X」可能只是缓冲假象——结论要靠 gdb/-d int 物理证据交叉验证。
-  `tools/qemu-acceptance.py` 在明确失败或无 shutdown 后端的完整成功终态后收割，
-  仍保留本轮日志与结果；只出现部分锚点不能通过。
+  主动终止前保存必要现场；进程退出和日志完整性分别核对。
 - `-d exec` 日志在部分场景看不到内核地址的 TB（与实际执行矛盾，原因未知），
   勿作为证据。
 
@@ -71,10 +70,8 @@
 
 - **QEMU sifive_u 的 U54 模型 senvcfg 可读不可写**：csrr 成功、csrw 触发
   illegal instruction。「实现了读」不等于「可写」，WARL 核验序列每一步都要守卫。
-- sifive_u 的无 shutdown 后端行为和路线超时见 [构建与验证手册](BUILD-AND-TEST.md#判定日志与清理)；reset 失败日志触发收割前须已有所选负载的完整成功事实。
-- **裸跑 QEMU 后必须 `just clean-qemu`**：验收脚本自己会清（挂起模式 trap 同时
-  收 runner 与 tailer），但 agent 手动拼命令行跑完容易漏下孤儿进程占满核。
-  已内置运行阶段超时收束，通过与否看完整业务锚点与显式 reset 结果。
+- sifive_u 没有 shutdown 后端，reset 失败后的手动收割不等于正常关机完成。
+- 手动演示或调查结束后核对 QEMU/GDB 与辅助进程；遗留 QEMU 用 `just clean-qemu` 清理。
 
 ## 子代理角色与配额边界
 

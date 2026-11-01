@@ -1,4 +1,0 @@
-# 仅核内核 Tunnel 的公开能力与几何，不装配业务服务。
-[instance.kernel]
-settings.suite = "tunnel"
-settings.mode = []

@@ -32,7 +32,7 @@ Receive 接受非消费 READ 并持 BodyLease，core 的 receiving token 仲裁�
 
 libkernel `wait_message_until` 在 Busy/NotAvailable 后独立检查原 Deadline，并用同一期限等待 READABLE/CLOSED；满箱重试不重新计算期限。时钟换算和全部绝对期限边界的验证由 [时间任务](../../plans/archived/todo-2026-09-monotonic-time-rpc-deadline.md) 拥有。
 
-libkernel typed 运输层：`MailboxSender`/`SendOnce` 是投递目标的类型身份——铸造（`Mailbox::mint`/`send_once`）由内核保证 kind 不 Query，未知能力只在 `from_capability` 唯一转换边界 Query 一次（返回描述供一次性 rights 检查）。MakeSendOnce 输出完整 HandlePair；`send_once` 返回 ReplyPermit，分别持 typed SendOnce 与 ReplyObserver；`MintedSender.lifetime` 持 LifetimeObserver。三个公开 Observer 的数字 kind 保持 13/18/20，内部 Lifetime/LifetimeOwner/LifetimeUse 不改名。Notification 工厂返回 typed Owner/Signaler，Owner 提供 take/mint_observer、Signaler 提供 signal；未知能力唯一转换边界 Query 一次，observer 必须 WAIT，返回描述供领域额外授权检查。所有角色独占 Capability，无隐式 Clone，duplicate 经真实裁剪调用，close 失败完整返还 owner；显式 into_capability/into_raw 移交责任。安全层没有裸 Handle 的 Notification signal/take/observe 函数，正式原始夹具使用带 SAFETY 的 sys_notification_*。Request 持观察权，Packet 运输回复权；发送后观察权移交 Sent owner。raw 夹具显式关闭不用的观察表项。`Packet` 为消费式出站 owner：`try_send(self)`/`try_reply(self, once)` 成功即消费全部 transit owner 与回复授权，失败以 `SendFailure`/`ReplyFailure` 完整返还 Packet（与 send-once），没有 delivered tombstone；`Request`/`PreparedResponse` 以 take/restore 搬运完整 Packet 维持重试。`RequestContext::decode` 校验通过后才摘取槽位并构造 typed 回复授权；处理终结前 `delivery` 显式暴露。验收/竞态夹具仍以 unsafe `send_raw*` 直验内核契约，属保留的 raw 边界用途。
+libkernel typed 运输层：`MailboxSender`/`SendOnce` 是投递目标的类型身份——铸造（`Mailbox::mint`/`send_once`）由内核保证 kind 不 Query，未知能力只在 `from_capability` 唯一转换边界 Query 一次（返回描述供一次性 rights 检查）。MakeSendOnce 输出完整 HandlePair；`send_once` 返回 ReplyPermit，分别持 typed SendOnce 与 ReplyObserver；`MintedSender.lifetime` 持 LifetimeObserver。三个公开 Observer 的数字 kind 保持 13/18/20，内部 Lifetime/LifetimeOwner/LifetimeUse 不改名。Notification 工厂返回 typed Owner/Signaler，Owner 提供 take/mint_observer、Signaler 提供 signal；未知能力唯一转换边界 Query 一次，observer 必须 WAIT，返回描述供领域额外授权检查。所有角色独占 Capability，无隐式 Clone，duplicate 经真实裁剪调用，close 失败完整返还 owner；显式 into_capability/into_raw 移交责任。安全层没有裸 Handle 的 Notification signal/take/observe 函数。Request 持观察权，Packet 运输回复权；发送后观察权移交 Sent owner。`Packet` 为消费式出站 owner：`try_send(self)`/`try_reply(self, once)` 成功即消费全部 transit owner 与回复授权，失败以 `SendFailure`/`ReplyFailure` 完整返还 Packet（与 send-once），没有 delivered tombstone；`Request`/`PreparedResponse` 以 take/restore 搬运完整 Packet 维持重试。`RequestContext::decode` 校验通过后才摘取槽位并构造 typed 回复授权；处理终结前 `delivery` 显式暴露。
 
 ## 通知与等待
 
@@ -56,7 +56,7 @@ Member位于`Pin<OwnedBox<Member,MetadataCharge>>`，唯一拥有稳定WaitNode�
 
 最后capability锁外close，集合锁内关准入/发布CLOSED，出生Work强持core并交替自摘一成员/扫描一观察候选。摘出的完整节点和Pinned Member均到集合锁外detach、释放、退款，不依赖调用者续调。观察loan仍可查询CLOSED/自摘，不代摘线程节点。WaitSet Arc宿主、内嵌Work/节点、独立Member/索引均按实际布局付款；core及观察loan的存储费用随last-live结束，逻辑Close不提前退款。
 
-libexecution 的持久来源/Assembly 已接当前 ABI，源码与 owner 由 [framework](framework.md#libexecution-的执行与扁平装配) 拥有。正式消费者与验收编排边界见 [runtime](runtime.md)；init/test 使用持久成员、Process DONE 与独立 Endpoint/View，不保留旧集合/Drain/Tunnel 接口。
+libexecution 的持久来源/Assembly 已接当前 ABI，源码与 owner 由 [framework](framework.md#libexecution-的执行与扁平装配) 拥有。正式消费者的执行与监督见 [runtime](runtime.md)；实例监督使用持久成员与 Process DONE，数据面使用独立 Endpoint/View。
 
 ## 退出与预算
 
@@ -65,8 +65,6 @@ ProcessDrain syscall/request 不存在；进程 Frozen 后回收记录自主完�
 Mailbox/Lifetime/Delivery、Notification/观察壳、WaitSet和SignalSource均出生时先在原付款Pool取得实际Arc布局费用，再分配；末字段强持payer并在全部先行成员销毁后归还费用。消息固定环与独立payload/handles/运输scratch各自付款，运输不改变原payer。只为保活的_pool字段已由charge取代，业务身份、authority/use和financial存活分别计。QuotaExceeded与OutOfMemory分开，拒绝/写回失败沿原owner退款。Pool Account承接维护执行，来源候选、VM片段、消息清理每step有结构上界；Account最终析构计量及运行注入覆盖的限制由工作记录拥有。
 
 ## 验证设施
-
-[`test_kernel/ipc_thread_checks.rs`](../../user/tests/test_kernel/src/ipc_thread_checks.rs) 使用真实用户线程验证同槽 Sender 的 Send/Query/WAIT、接收竞争与背压、transit/Once/Delivery/Lifetime 收束，以及已提交等待的调用者退出。[`test_kernel/time_checks.rs`](../../user/tests/test_kernel/src/time_checks.rs) 使用实际 syscall 验证绝对期限、过期优先级、取消观察和已提交投递的保留。
 
 capability 的 signal host 用例验证插入边界、删除扫描游标、瞬态电平与关闭提示；table host 用例验证消费 claim/restore、Close/shut、rights 和持有数。内部安装、迟到提示、写回撤销及实际 metadata 付款的证据边界由[对象链工作记录](../../plans/archived/todo-2026-10-01-object-chain-kernel-integration.md)拥有。历史自检和运行结果不作为当前实现说明，当前源码不保留旧 actor/Drain 自检。
 

@@ -1,6 +1,6 @@
 # init 组态与统一服务契约
 
-状态：**切面 A 已提交（`413f384`）；切面 B 已实施并提交，编译、clippy 与 host 单测通过；首次普通验收在实例准备阶段报 `RightsDenied`，尚未通过运行期验证**。当前事实见[当前接力](#当前接力)与[首次运行阻塞](#首次运行阻塞2026-10-29)。本篇是本任务唯一工作记录，拥有目标设计、实施顺序、验证门、债务与接力。上游职责边界（init 根监督、`srv_service` 分工）由[服务装配计划](todo-2026-10-07-service-assembly.md#已确认的-init-与服务管理职责)拥有；系统停止政策由[关机编排](todo-2026-09-system-shutdown-orchestration.md)拥有；设备安全事实由[设备计划](todo-2026-09-device-system-design.md)拥有。
+状态：**组态与统一服务契约已实施并提交；出生转授权阻塞已修复，正常出生、基础服务就绪及停止已有运行证据。部分组态负路径仍未覆盖。** 当前事实见[当前接力](#当前接力)与[首次运行阻塞](#首次运行阻塞2026-10-29)。本篇是本任务唯一工作记录，拥有目标设计、实施顺序、验证门、债务与接力。上游职责边界（init 根监督、`srv_service` 分工）由[服务装配计划](todo-2026-10-07-service-assembly.md#已确认的-init-与服务管理职责)拥有；系统停止政策由[关机编排](todo-2026-09-system-shutdown-orchestration.md)拥有；设备安全事实由[设备计划](todo-2026-09-device-system-design.md)拥有。
 
 ## 目标与非目标
 
@@ -311,8 +311,7 @@ srv_init 约 17.3k 行，直接依赖 `srv_fs`、`test_fs`、`libdevice`、`libd
 
 | 项 | 现状 | 目标 | 触发与删除条件 |
 |---|---|---|---|
-| `test_kernel` 按 feature 传模式 | 切面 A 使用 `test_kernel::birth` 私有出生帧：56 字节，依次为小端 u32 部署模式位、u8 进程角色（主验收进程或两种保留模式子进程，与部署模式不共用位空间）、12 个输入槽号（主 Pool/Job/reset/pm/target/hammer/MMIO/IRQ/DMA/retention Pool/self 映像/私有报告 sender，255 表示缺省）、保留零字节与 pm/target/hammer/self 四个小端 u64 映像长度；`test_kernel::report` 拥有 104 字节 held Pool 快照报告。能力实际种类/权限在采用时核验。init 按 feature 编码模式；`srv_init` 因共享 birth/report 格式而在 Cargo 中反向依赖测试 crate `test_kernel`。retention Pool 是 RootSupervisor 通用 held Pool 集合的一员，以 `memory.pool.retention` 签发给 test_kernel | 输入改用 `libprocess::birth`，模式写在验收组态的 `settings`，系统服务不再依赖测试 crate；held Pool 集合由组态 `[pool.<名>]` 声明 | 切面 B 步骤 6 接通时删除私有帧、init 侧编码、对应 feature 及 `srv_init → test_kernel` Cargo 依赖 |
-| 正式部署工作集无单一真值 | srv_fs、srv_device、srv_driver 各自以独立常量定义部署 Pool 工作集（`deployment::METADATA_BYTES`/`HEAP_PAGES`、device 的 8 MiB、`libdriver::boot::WORKER_POOL`），没有由内存领域给出的公共推导。test_kernel 借用 WORKER_POOL 属测试侧，按 AGENTS 过渡设施口径不在此跟踪 | 内存领域提供单进程工作集的公共推导，正式服务的同类常量收敛为一个真值；切面 B 中额度改由组态 `pool` 字段声明，数值仍沿用这些常量 | 触发：出现须精确核定单进程工作集的需求（不可信创建域、紧凑部署或额度不足的实证）。由[内存重构](todo-2026-10-01-memory-redesign.md)或[内核内存预算](todo-2026-09-14-kernel-memory-budget.md)承接 |
+| 正式部署工作集无单一真值 | srv_fs、srv_device、srv_driver 各自以独立常量定义部署 Pool 工作集（`deployment::METADATA_BYTES`/`HEAP_PAGES`、device 的 8 MiB、`libdriver::boot::WORKER_POOL`），没有由内存领域给出的公共推导。测试侧的 WORKER_POOL 借用已随测试进程删除 | 内存领域提供单进程工作集的公共推导，正式服务的同类常量收敛为一个真值；切面 B 中额度改由组态 `pool` 字段声明，数值仍沿用这些常量 | 触发：出现须精确核定单进程工作集的需求（不可信创建域、紧凑部署或额度不足的实证）。由[内存重构](todo-2026-10-01-memory-redesign.md)或[内核内存预算](todo-2026-09-14-kernel-memory-budget.md)承接 |
 
 ## 完成门
 
@@ -326,7 +325,7 @@ srv_init 约 17.3k 行，直接依赖 `srv_fs`、`test_fs`、`libdevice`、`libd
 
 ## 当前接力
 
-切面 A（内核级验收移出 init）已提交为 `413f384`，经提交前整体整理，在冻结点 A-F4 全部路线重跑，结果见[最终验证](#a-f4-最终验证)。retry-race 为既有观察器缺陷，已[移交设备计划](todo-2026-09-device-system-design.md#retry-观察器缺陷2026-10-29)，不计通过。
+切面 A、B 的实施与运行过程保留在下方历史记录。2026-11-01 用户决定只保留 host 自动测试，专用测试进程、组态和 runner 已由[设施清理](archived/todo-2026-11-01-host-only-validation.md)移除；原运行结果仍只对应当时版本，不构成当前可运行路线。
 
 切面 B 已实施并提交。首次实跑暴露的生命周期输入转授阻塞已按[原条目](#首次运行阻塞2026-10-29)修复；后续 memory 与 services 独立通过，取得 task 出生/正常退出及三宿主 Ready、Stopped/DONE、撤销链与关机证据。其余普通组结果由[验收记录](archived/todo-2026-10-29-acceptance-groups.md#逐条运行与修复2026-10-29)拥有。下一步仅按实际需求补充未覆盖的组态负路径与专项，不恢复已删消费者或固定全量验收。
 
@@ -337,12 +336,11 @@ srv_init 约 17.3k 行，直接依赖 `srv_fs`、`test_fs`、`libdevice`、`libd
 - **srv_device**：根来源自持不导出；设定 `sources` 预签发 `device.source.<名>` 与 `.admin`；`Family::Stop` 观察 `instance.stop`，停止时释放根与未发布来源的 sender 并封根；`request.rs` 第四支以请求方 admin context 服务 `Revoke`/`QueryRevoked`。`libdevice::startup` 已删。
 - **srv_driver**：声明表由 `libdriver::boot::Catalog::from_settings` 解析（identity 为字符串，删 `image_bytes`、槽位常量与 `ManagerReady`）；映像为 `driver.image.<实现键>`；Stop RPC op1 删除，改为 `Family::Stop`；就绪经 `Reporter` 导出 `driver.control`/`driver.observer`。
 - **srv_init**：`platform`（按 `erhino_shared::platform` 取根，不依赖 libpci）、`executor`（组态执行：具名 Pool/Job、实例 Pool 按 ELF runs+主栈+出生页+`work_pages`、出生帧、报告校验、`after`、反拓扑停止与撤销门）、`terminal`（封 services、对已收撤销管理端发 Revoke、封平台根、有界收集、冷重启）。全部 feature、领域依赖与旧装配/服务级验收已删。
-- **test_kernel**：经 `Birth` 采用命名输入，部署模式来自设定 `mode`；保留子进程角色经设定 `role` 传递；私有 `lib.rs` 出生帧删除。
-- **组态与构建**：`user/formations/` 下 `system`、`acceptance`、`fp`、`stress`、`memory` 与各 `mode-*` 源；Justfile 以 `ERHINO_FORMATION` 选组态，`make_initfs` 编译组态并只装入其引用映像，根目录为 `formation` 与 `image/<组件>`。
+- **组态与构建**：`user/formations/system.toml` 为正式部署源；Justfile 以 `ERHINO_FORMATION_SOURCES` 选源，`make_initfs` 编译组态并只装入其引用映像，根目录为 `formation` 与 `image/<组件>`。
 
 失去的覆盖（按 AGENTS 过渡设施口径删除，不登记债务）：`test_fs`、`test_device` 与 init 内服务级验收（fs/registry/copy/secondary 生命周期、device/driver 自检、function-session、reuse/candidates/retry-race、manager/controller fault、reset-rejection、fs-stop-order）；init 根监督的 failure-isolation、dispatcher funding、startup capture、idle ownership 自检；test_kernel 的 SystemReset 负路径与 held Pool 跨进程报告比对。失效宿主观察器、旧锚点和分组重建由[验收清理](archived/todo-2026-10-29-acceptance-groups.md)统一承接；本篇不再要求恢复已删除消费者。
 
-未闭合：正常出生与停止已有本轮证据；完成门中同一 init ELF 的 System/验收身份比对、多 fs 实例与运行期负路径仍未在本轮验证。验收工具的当前入口与删除范围见[验收清理](archived/todo-2026-10-29-acceptance-groups.md)；后续按具体需求人工验证组态负路径；自动内核验收按构建手册选择领域，不恢复旧服务验收或重跑历史清单。
+当前证据边界：正常出生与停止已有历史运行证据，多 fs 实例与运行期负路径仍未覆盖；随正式应用接入和具体问题取证。System/验收 init ELF 身份比对的旧完成门随验收部署删除而退出，不记为已通过。设施移除与覆盖变化见[清理记录](archived/todo-2026-11-01-host-only-validation.md)，自动验证按构建手册选择 host 边界。
 
 ### 接线与责任
 
@@ -433,7 +431,7 @@ srv_init 约 17.3k 行，直接依赖 `srv_fs`、`test_fs`、`libdevice`、`libd
 - **安全/并发**：新增 unsafe 的采用/移交及只读映像存活依据成立；保留子进程 spawn 前释放 Context 锁；不新增跨进程锁或内核临界区；未改共享 ABI 或硬件协议。
 - **工具**：GDB 观察器按 test_kernel 真实 PID 与 `test_kernel::irq_checks::process_retirement` 符号附着；`check-vm-fault` 在 Guest 明确 panic/reboot 后停止；nofd 脚本期望不适用锚点。业务判据未改。
 
-未做硬件或性能/WCET 验收；sifive_u、hetero、Boot/IPI/VM-repair/独立 DMA-retention 等未列路线未运行。私有出生帧与 WORKER_POOL 借用由[债务](#债务)两行承接。
+未做硬件或性能/WCET 验收；sifive_u、hetero、Boot/IPI/VM-repair/独立 DMA-retention 等未列路线未运行。当时的私有出生帧已由切面 B 替换，测试侧 WORKER_POOL 借用随后随客体设施删除；正式工作集推导仍由[债务](#债务)承接。
 
 ### 施工过程索引
 

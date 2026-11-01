@@ -1,5 +1,0 @@
-# memory 压力/发布窗口观察：复用线程映射消费者与原五份工作集。
-[instance.kernel]
-pool = { work_pages = 20480, metadata_bytes = 5242880 }
-inputs."kernel.image.test_hammer" = "init/image.test_hammer"
-settings.mode = ["memory"]

@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """选择 package 或 workspace 分面执行静态检查；host 测试始终显式选择本机 target。"""
 import argparse
+from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 
-from qemu_support import fresh_logs
-
 ROOT = Path(__file__).resolve().parents[1]
 BUILD_STD = ["-Z", "build-std=core,alloc", "-Z", "build-std-features=compiler-builtins-mem"]
-FACETS = ("formation-host", "shared-host", "os-host", "kernel", "user-host", "user", "fp")
+FACETS = ("formation-host", "shared-host", "os-host", "kernel", "user-host", "user")
 
 
 def packages():
@@ -37,11 +37,9 @@ def invocation(action, scope, host, known, filters=()):
             flags = ["--workspace"] + (["--exclude", "kernel"] if workspace == "os" else [])
         flags += ["--all-targets"]
     elif scope == "user":
-        workspace, flags, native = "user", ["--workspace", "--lib", "--bins", "--exclude", "test_fp"], False
-    elif scope in ("kernel", "fp"):
-        workspace = "os" if scope == "kernel" else "user"
-        name = "kernel" if scope == "kernel" else "test_fp"
-        flags, native = ["-p", name, "--bin", name], False
+        workspace, flags, native = "user", ["--workspace", "--lib", "--bins"], False
+    elif scope == "kernel":
+        workspace, flags, native = "os", ["-p", "kernel", "--bin", "kernel"], False
     elif scope in known:
         workspace, _, library = known[scope]
         native = action == "test" or workspace == "shared" or (workspace == "os" and scope != "kernel")
@@ -58,8 +56,6 @@ def invocation(action, scope, host, known, filters=()):
         flags += ["--target", host]
     else:
         flags += BUILD_STD
-        if scope in ("fp", "test_fp"):
-            flags += ["--target", "platforms/riscv64gc-unknown-erhino-elf.json"]
     if action == "clippy":
         flags += ["--", "-D", "warnings"]
     elif action == "test":
@@ -87,7 +83,9 @@ def main():
         jobs = [(scope, *invocation(args.action, scope, host, known, args.filters)) for scope in (FACETS if args.scope == "all" else (args.scope,))]
     except ValueError as error:
         parser.error(str(error))
-    logs = fresh_logs(ROOT / "artifacts" / "checks")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    logs = ROOT / "artifacts" / "checks" / f"{stamp}-{os.getpid()}"
+    logs.mkdir(parents=True, exist_ok=False)
     for scope, cwd, command in jobs:
         log = logs / (scope + ".log")
         print(f"Starting {args.action} {scope}; log: {log}", flush=True)

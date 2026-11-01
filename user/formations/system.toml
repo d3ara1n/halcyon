@@ -1,5 +1,5 @@
 # System 组态：设备登记、驱动选择与内存文件宿主（承载服务 registry）。
-# 验收形态在此之上叠加覆盖层，见 Justfile 的 FORMATION 选择。
+# 组态源选择由 Justfile 的 FORMATION_SOURCES 拥有。
 finish = "stay"
 
 [job.drivers]

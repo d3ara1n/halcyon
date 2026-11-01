@@ -89,7 +89,7 @@ fn system() -> Formation {
 }
 
 fn images(name: &str) -> bool {
-    matches!(name, "srv_device" | "srv_driver" | "srv_fs" | "test_kernel")
+    matches!(name, "srv_device" | "srv_driver" | "srv_fs")
 }
 
 fn rejects(formation: &Formation, reason: &str) {

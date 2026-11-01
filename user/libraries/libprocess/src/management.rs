@@ -1,9 +1,6 @@
 //! 用户态进程装配与监督；同步 loader 驱动同一个可分步 Preparation。
-//! `race` 模块是生命周期竞态矩阵验证负载（init ↔ test_hammer）的线协议。
 
 extern crate alloc;
-
-pub mod race;
 
 use alloc::vec::Vec;
 

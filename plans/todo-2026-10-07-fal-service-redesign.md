@@ -584,6 +584,8 @@ host 检查按受影响包选择并显式指定 host target；例如目标包建
 
 ### F：精确故障窗口
 
+2026-11-01 用户确认：自动测试只保留 host 边界，真实运行围绕正式用户态应用取证，见[设施清理](archived/todo-2026-11-01-host-only-validation.md)。下列项目不作为提前构建专用测试应用或 harness 的任务；出现真实反例或相关责任链变化时按具体契约修复、复核。
+
 owner 为后续负责本计划的实施者，实际位置是 fs provider/outbound/stream/Copy、librpc Dispatcher/Outbox 和 Runtime/source。已有 host 与代码审查证明各 owner/付款的结构，但并非所有真实故障点均已注入。触发条件是已有正式设施可安全隔离真实故障、相关生产反例出现或这些责任链发生修改；不为补证另造假 provider 或测试运行体。
 
 补证顺序按准入前、已发送未提交、已提交未领取、实际注销/Close 回执安排；核对原付款与 owner 不提前释放、未回执时不自旋、迟到结果不影响替代者及最终退款。当前精确边界如下：

@@ -57,10 +57,7 @@ pub fn load(address: usize, length: usize) {
         },
     )
     .expect("BootPackage initial ELF admission failed");
-    crate::clock::selftest::run();
     let root_pool = task::memory_pool::MemoryPool::initialize_root(frame::take_root_pool_seed());
-    task::memory_pool::MemoryPool::self_test(&root_pool);
-    frame::selftest::run(&root_pool);
     let (device_tree, io) = PLATFORM
         .lock()
         .take()

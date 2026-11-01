@@ -21,7 +21,7 @@
 
 分步接口由 [`CallOperation`](../../user/libraries/librpc/src/caller.rs) 直接提供。普通 `new` 使用 CallWait；`new_composed` 只准备原调用 owner，不创建私有 WaitSet。`poll_ready` 按实际电平和原期限判定，`wait_sources` 返回 reply/service/cancel/reply-observer 的有界计划，未用位置为 INVALID。宿主借用这些真实对象，必须实际注销来源后才能完成、abort 或丢弃操作；操作持有期间原 Caller 不能开始第二个调用。
 
-顺序 OAL、文件、服务客户端依赖 `Exchange` 的 call/call_cancelable 合同，复用原 Request/Reply 和领域编解码。普通 Caller 自己等待；init 通过[根装配接点](runtime.md#顺序装配的等待与推进)推进原 CallOperation，任务不回调根顺序入口。无 DUP 来源仍借用原 sender，不复制权限。Copy 和 Watch 的异步操作继续组合 Dispatcher。
+顺序 OAL、文件、服务客户端依赖 `Exchange` 的 call/call_cancelable 合同，复用原 Request/Reply 和领域编解码。普通 Caller 自己等待；init 的来源撤销使用有限期限的同步 Caller。无 DUP 来源仍借用原 sender，不复制权限。Copy 和 Watch 的异步操作继续组合 Dispatcher。
 
 `caller.rs` 仅在 RISC-V 目标编译，真实运输行为由目标消费者观察；host framing/OutboundStage 测试不替代目标运行。已投递操作的错误保持 Sent/Unknown，任何宿主的等待方式都不能把它改判为未提交。
 
@@ -40,7 +40,7 @@ WaitSet、来源表、直接期限推进或 `mem::forget` 放弃循环。
 
 ## 当前嵌入与边界
 
-`Dispatcher` 由宿主 World 持有，运输任务负责 advance、期限及来源回调，业务任务通过 World 借用提交调用、接收完成；它不拥有第二套 WaitSet，也不在 handler 中同步等待。完成进入有界 FIFO，由原任务取得并继续推进，停止时先取消或收束下游调用，再注销来源、关闭回复端点并退休 Dispatcher owner。srv_fs 的正常发布和撤出通过同一 Dispatcher 推进，生命周期和角色交付由[服务装配](service.md#进程装配与行为限制)拥有。init 在根就绪后复用原 ReadDuty 并发调用 A/B 服务目录，验证各私有来源实际付款/退款及共享 H 归属；provider 不为这组验收调用预留槽或延迟 Ready。
+`Dispatcher` 由宿主 World 持有，运输任务负责 advance、期限及来源回调，业务任务通过 World 借用提交调用、接收完成；它不拥有第二套 WaitSet，也不在 handler 中同步等待。完成进入有界 FIFO，由原任务取得并继续推进，停止时先取消或收束下游调用，再注销来源、关闭回复端点并退休 Dispatcher owner。srv_fs 的正常发布和撤出通过同一 Dispatcher 推进，生命周期和角色交付由[服务装配](service.md#进程装配与行为限制)拥有。
 
 Dispatcher 的调用期限索引为侵入式 TimerQueue<txid>，每个 PendingCall 在提交前 fallible 分配 pin Box 节点；终态取消节点后才摘路由/释放调用，非空 Dispatcher Drop 先排空索引。最早期限继续向 Runtime 的任务期限入口声明，没有独立硬件时钟或执行循环；底层节点/队列契约见[时间实现](time.md)。每调用保留服务 CLOSED 与一个 progress 来源槽：Writable 实际注销回执后，binding role 转 Abandoned，同一槽登记 ReplyObserver。事件核 SourceId，终态保留观察权到来源收束，不增加第三个每调用槽。
 

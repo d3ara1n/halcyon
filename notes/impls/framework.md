@@ -11,7 +11,7 @@
 - `user/libraries/libprocess::context` 解析并采用启动 grants，adoptable_kind 接纳 LifetimeObserver、ReplyObserver 与 NotificationObserver（13/18/20）；StartupContext 只保留进程身份、payload 和 affine InitialGrants，入口 descriptor 经 StartupAdoption 交由 libruntime/ThreadRegistry。应用消费 InitialGrants 后在各领域 typed 转换边界核角色和所需权利，错误保留原 Capability；高层进程装载/监督仍归 `libprocess`。
 - `user/libraries/libthread` 的 `ResultReceiver::Drop` 只放弃结果引用，不等待或触碰 record；显式 `join` 才观察 DONE。结果发布有独立状态字，线程退出不再提供安全逃生路径。
 - `user/libraries/libruntime` 的 `_start` 保持 a0/a1，建立 gp，初始化 heap，采用入口 ThreadControl 并按 reservation 建立普通 `MappedRegion` owner；`start` lang item 将 `()`/`Result<(), E: Debug>` 分别收束为 ThreadExit/ProcessAbort，panic/OOM 也由 runtime 调用 ProcessAbort。
-- 所有服务、驱动和验收程序均为普通 `fn main`，显式依赖 runtime/thread/kernel owner；不存在旧目录、旧 alias 或 facade。
+- 所有服务和驱动均为普通 `fn main`，显式依赖 runtime/thread/kernel owner；不存在旧目录、旧 alias 或 facade。
 - 用户 target 与共同 linker 位于 `user/platforms/`；linker `ENTRY(_start)`，两个 target 使用 `riscv64-elf-ld` 以生成受审计的 SystemV ELF ABI。
 
 ## 当前启动和资源接口

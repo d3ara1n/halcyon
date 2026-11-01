@@ -33,7 +33,7 @@ cold boot 使用专用 stack、临时页表、bootstrap Lock Ladder 帧和早期
 
 F-only、Q、V、TSO 与未建模扩展由 loader 拒绝。Q-capable hart 可运行 Base64，但不进入 D64 域。
 
-`os/kernel/src/context.rs::UserContext` 每线程保存 GPR、sepc 与完整 `FpState`；`FpState` 含 32 个 FPR 和 fcsr，创建时全零。D64 切入时完整恢复并置 FS=Clean，trap 只在 FS=Dirty 时回写，随后恢复内核 FS=Off。局部 F/D helper 位于独立代码 section；`test_fp` 验证 FPR/fcsr 跨 ecall、Sleep 和调度轮转保持。
+`os/kernel/src/context.rs::UserContext` 每线程保存 GPR、sepc 与完整 `FpState`；`FpState` 含 32 个 FPR 和 fcsr，创建时全零。D64 切入时完整恢复并置 FS=Clean，trap 只在 FS=Dirty 时回写，随后恢复内核 FS=Off。局部 F/D helper 位于独立代码 section。
 
 Building 首线程与 Running 期 ThreadCreate 共用 `ThreadStartContext` 到 `UserContext` 的编码：entry 写 sepc，sp 写 x2，arg1/arg2 写 a0/a1，其余 GPR、tp、FP 状态清零。ProcessBindExecution 在首次 ThreadCreate 前冻结 requirement 与兼容调度域；ThreadCreate 只继承已冻结的 execution binding，线程只能进入该域。ThreadExit 与被终止线程都走非 Resume trap 出口，先切回 kernel satp、清 active，再由调度侧释放执行容器并请求 `ThreadDeparture`，不会在仍使用用户 root 时发布 DONE。
 

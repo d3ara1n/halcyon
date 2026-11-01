@@ -23,11 +23,10 @@
 
 | 角色 | 格式 | 示例 |
 |---|---|---|
-| 系统服务 | `srv_<domain>` | `srv_init`、`srv_fs`、`srv_pm`、未来的 `srv_process` |
+| 系统服务 | `srv_<domain>` | `srv_init`、`srv_fs`、`srv_device`、`srv_driver` |
 | 用户态驱动 | `drv_<domain>` | `drv_pci_generic`、`drv_usb_xhci`、`drv_usb_hid` |
-| 验收进程 | `test_<domain-or-scenario>` | `test_fp`、`test_hammer`、`test_target` |
 
-`srv`、`drv`、`test` 在这里表示二进制运行角色，只能作为带下划线的前缀使用；它们不能替代库的领域名称。库是否包含管理接口、客户端接口或服务端接口，不改变其 `lib<domain>` 身份。
+`srv`、`drv` 在这里表示二进制运行角色，只能作为带下划线的前缀使用；它们不能替代库的领域名称。库是否包含管理接口、客户端接口或服务端接口，不改变其 `lib<domain>` 身份。
 
 ### 变更门
 

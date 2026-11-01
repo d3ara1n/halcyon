@@ -25,25 +25,20 @@ Halcyon 是以 eRhino RV64 微内核为核心、包含用户态系统服务与�
 
 > QEMU 默认以内置 OpenSBI 固件作为 `-bios`，无需自行编译 OpenSBI。
 
-## 运行与验收
+## 运行与验证
 
-构建系统用 [Just](https://just.systems)，可执行名为 `just`。演示入口直接运行系统，
-自动验收只检查内核公开契约，带路线级超时保护；两者默认 CPU 节流（`THROTTLE=100` 全速）：
+构建系统用 [Just](https://just.systems)，可执行名为 `just`。运行入口启动正式系统，
+默认 CPU 节流（`THROTTLE=100` 全速）；自动测试在 host 执行：
 
 ```sh
 just virt                 # qemu virt 正式 System 演示，默认 debug
 just virt release         # 同一演示，release
 just sifive_u             # qemu sifive_u 演示，默认 release
-just acceptance           # 只列可选分组，不运行
-just acceptance memory    # 只运行内存组，默认 release
-just acceptance resources dma
-just acceptance process stress  # 进程压力与竞态矩阵
-just acceptance platform nofd   # Base64 域与出生/收集
-just acceptance tunnel    # 内核 Tunnel 能力、映射与回收
-just acceptance all       # 显式9条普通内核路线，不含压力与额外平台
+just test-host formation  # 组态编译、校验与编码的 host 单测
+just test-host libprocess -- --features management # 进程装配与收束的 host 单测
 ```
 
-演示默认常驻，由用户退出；终端实时显示编译与系统输出，非交互环境仅显示概要并将输出保存到 `artifacts/run/`，可用 `ERHINO_OUTPUT=live|summary` 覆盖。验收按改动范围选择，通过后停止；失败先查日志再扩大范围。详见[构建与验证手册](plans/BUILD-AND-TEST.md)。
+演示默认常驻，由用户退出；终端实时显示编译与系统输出，非交互环境仅显示概要并将输出保存到 `artifacts/run/`，可用 `ERHINO_OUTPUT=live|summary` 覆盖。自动验证保留编译、clippy、ELF 审计与 host 测试；运行证据来自正式应用和设备使用，不能由 host 通过替代。详见[构建与验证手册](plans/BUILD-AND-TEST.md)。
 
 秒级检查与仅编译内核：
 
