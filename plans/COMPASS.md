@@ -10,6 +10,8 @@
 2. [OAL、fs 与服务目录改造](todo-2026-10-07-fal-service-redesign.md#当前接力)：本轮实施已提交；[固定交付独立 Review](archived/todo-2026-10-11-oal-fs-service-review.md)已完成，报告记录的证据缺口继续由主计划和既有 owner 承接；通用等待与付款前置分别由 [Notification 观察角色](todo-2026-10-10-notification-observer-roles.md#当前接力与范围)和[执行付款](archived/todo-2026-10-10-execution-funding.md#当前接力与范围)拥有。
 3. [正式用户态环境的接续](todo-2026-10-07-service-assembly.md#当前接力)：首个交互应用的输入输出、装配与生命周期设计；已有 [initfs 组态与统一服务契约](todo-2026-10-28-init-formation.md#当前接力)作为前置。
 
+扩展参考：[用户态设施与驱动缺口盘点](ref-2026-11-10-userland-facilities.md)；固定基线的能力地图与候选路线，不是施工入口或新增排期。
+
 host 验证与正式运行按[构建与验证手册](BUILD-AND-TEST.md)选择；设施清理与覆盖变化见[移除客体测试设施](archived/todo-2026-11-01-host-only-validation.md)，旧运行证据从[验收档案](archived/todo-2026-10-29-acceptance-groups.md)追溯。
 
 对象链已交付范围和[内存/hart兼容完成边界](todo-2026-10-01-memory-redesign.md#完成边界与-hart-兼容性复核)从各记录接手，不恢复旧内核拼装；运行时分层/线程生命周期见[复核档案](archived/review-2026-09-28-runtime-layering.md)。五批 Review 的当前有效性与后续责任统一从[总报告](review-2026-10-12-consolidated.md)接手；测量触发的[锁评估](todo-2026-10-01-lock-performance.md)按自身条件推进。

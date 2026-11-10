@@ -65,7 +65,7 @@ ideas 只在设计阶段修改。实施中遇到无法继续或需要推翻方�
 - **语言**：文档、注释、提交信息用中文；提交使用 Conventional Commits。内核/用户态日志、panic/assert/expect 消息和构建工具输出用正式英文。
 - **安全与并发**：用户可触发的 fault 终止进程，不 panic 内核；未知 syscall 返回错误。`unsafe` 须有成立的 SAFETY 论证，`unwrap/expect` 仅用于有论证的结构性不可达分支。状态按 hart 私有、对象、真正全局事实分层，禁用 `static mut`；先考虑单一所有权或消息传递，确需共享时压短临界区并写明单向锁序。公平性与唤醒活性须有结构性保证。
 - **用户内存访问**：遵守 [mm 实现](notes/impls/mm.md) 的 uaccess 契约，使用 translate 前置校验与受保护的 SUM 直访，不另建软件遍历页表的拷贝路径。
-- **提交署名**：`pre-ai`（975c46f）之前为手写实现。AI 辅助提交使用当前会话实际模型显示名与 provider 对应 noreply 邮箱生成 `Co-Authored-By: <模型显示名> <邮箱>`；无对应邮箱时用 `noreply@pi.dev`，不得伪造 provider 域名。不能确定实际模型时问用户。
+- **提交署名**：`pre-ai`（975c46f）之前为手写实现。AI 辅助提交从当前可用环境信息确定实际模型，并提取 provider 的模型 ID，生成 `Co-Authored-By: <模型 ID> <邮箱>`；去掉渠道标记（如 `[Kiro]`）和变体后缀（如 `-thinking`），例如 `[Kiro]claude-opus-5-5-thinking` 记为 `claude-opus-5-5`。邮箱使用 provider 对应的 noreply 地址，未知时用 `noreply@pi.dev`，不得伪造 provider 域名。不依赖固定的 `PI_MODEL` 环境变量；仅在无法确定实际模型时问用户。
 
 ## 任务适用范围与完成条件
 
