@@ -8,7 +8,7 @@
 
 1. [全项目重构总纲：剩余切面与接续顺序](todo-2026-09-29-system-redesign.md#剩余切面与接续顺序)。本轮整理范围见[活跃资料清理](todo-2026-09-29-system-redesign.md#活跃资料清理2026-10-27)，后续代码/Review按各自记录接手；主线设计入口如下。
 2. [OAL、fs 与服务目录改造](todo-2026-10-07-fal-service-redesign.md#当前接力)：本轮实施已提交；[固定交付独立 Review](archived/todo-2026-10-11-oal-fs-service-review.md)已完成，报告记录的证据缺口继续由主计划和既有 owner 承接；通用等待与付款前置分别由 [Notification 观察角色](todo-2026-10-10-notification-observer-roles.md#当前接力与范围)和[执行付款](archived/todo-2026-10-10-execution-funding.md#当前接力与范围)拥有。
-3. [静态入口与 OAL 组态装配 IF2](todo-2026-10-28-init-formation.md#if2-交付与接力)：从本案当前审阅/清理与条件提交接力进入；正式运行仍由用户另选范围；[pm 与正式用户态接续](todo-2026-10-07-service-assembly.md#当前接力)在引用新出生接口前重核详细设计，电源管理与新故障机制后置。
+3. [静态入口与 OAL 组态装配 IF2](todo-2026-10-28-init-formation.md#if2-交付与接力)：从本案已提交交付与后续承接表进入；正式运行仍由用户另选范围；[pm 与正式用户态接续](todo-2026-10-07-service-assembly.md#当前接力)在引用新出生接口前重核详细设计，电源管理与新故障机制后置。
 
 扩展参考：[用户态设施与驱动缺口盘点](ref-2026-11-10-userland-facilities.md)；固定基线的能力地图与候选路线，不是施工入口或新增排期。
 
@@ -26,6 +26,7 @@ host 验证与正式运行按[构建与验证手册](BUILD-AND-TEST.md)选择；
 
 | 类型 | 入口 |
 |---|---|
+| IF2 静态资源与 OAL 组态装配交付的可选独立 Review | [固定 c8c54da 的登记](todo-2026-11-10-if2-review.md)，未执行 |
 | 五批 Review 当前责任与处置 | [统一报告](review-2026-10-12-consolidated.md) |
 | 审计剩余发现 | [架构审计发现承接](todo-2026-09-14-architecture-audit-findings.md) |
 | 静态常驻基座设计的可选独立 Review | [固定 99f5e9b 的登记](todo-2026-10-28-service-foundation-design-review.md)，未执行 |
