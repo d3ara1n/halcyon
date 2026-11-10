@@ -1,4 +1,4 @@
-//! 启动装配：两个独立 mailbox/backing 在同一 Runtime 推进，母本直接移入启动 Packet。
+//! 采用预建 receiver/pair；本地角色全部安装之后才让 Ingress 接收。
 use super::{FileTask, Ingress, World, lifecycle, services};
 use alloc::{boxed::Box, rc::Rc};
 use erhino_shared::{call::SystemCallError, object::Rights, time::Deadline};
@@ -11,18 +11,17 @@ use libexecution::{
 use libfs::{backend::MemoryBackend, grant::GrantTable, resource::FsResource};
 use libkernel::ipc::{
     capability::Capability,
-    message::{Mailbox, MailboxSender},
+    message::{Mailbox, MailboxSender, MintedSender},
     notification,
     object::query,
     wait_set::WaitSet,
 };
-use libservice::instance::child::Reporter;
 use libservice::{
     authority::{AccessTable, AuthorityTable, Scope},
     maintenance::Maintenance,
     protocol::{
-        self as service, AccessRights, Addressing, Descriptors, ProtocolDescriptor, PublishRights,
-        RegisterMode, Request as Command, Response,
+        self as service, Addressing, Descriptors, ProtocolDescriptor, RegisterMode,
+        Request as Command, Response,
     },
     provider::State,
     registry::Registry,
@@ -34,32 +33,15 @@ use srv_fs::{
         BINDINGS, Capacity, GRANTS, MAX_ENTRIES as ENTRIES, NODES, REGISTRATIONS, REQUESTS, ROLES,
         RPC_CALLS, WATCHES,
     },
-    startup::{AUTHORITY_EXPORT, Config, DIRECTORY_EXPORT, FILE_ROOT_EXPORT, MANAGEMENT_EXPORT},
+    startup::Config,
 };
-/// 每个入口一条命名导出 `<prefix>.<序号>`，权利取 sender 的实际权利。
-fn export_all(reporter: &mut Reporter, prefix: &str, senders: &mut [Option<MailboxSender>]) {
-    let mut name = alloc::string::String::new();
-    for (entry, sender) in senders.iter_mut().enumerate() {
-        let sender = sender.take().expect("export entry sender missing");
-        let rights = sender
-            .description()
-            .expect("export sender description failed")
-            .rights;
-        name.clear();
-        core::fmt::write(&mut name, format_args!("{prefix}.{entry}"))
-            .expect("String write cannot fail");
-        reporter
-            .export(&name, sender.into_capability(), rights, Deadline::INFINITE)
-            .map_err(|(_, error)| error)
-            .expect("export publication failed");
-    }
-}
 fn begin_registration(
     dispatcher: &mut librpc::dispatcher::Dispatcher,
     authority: MailboxSender,
     endpoint: MailboxSender,
     funding: &libbudget::AccountView<ExecutionResource>,
     name: &str,
+    transport: Rights,
 ) -> Result<(u64, Deadline), SystemCallError> {
     let deadline = libkernel::time::timeout_millis(5000)?;
     let descriptor = [ProtocolDescriptor {
@@ -71,7 +53,6 @@ fn begin_registration(
     let mut descriptor_bytes = [0; 20];
     let used = Descriptors::encode(&descriptor, &mut descriptor_bytes)
         .map_err(|_| SystemCallError::IllegalArgument)?;
-    let transport = Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE;
     let request = Command::Register {
         name,
         mode: RegisterMode::CreateOnly,
@@ -122,21 +103,43 @@ fn begin_withdraw(
         })?;
     Ok((txid, deadline))
 }
+pub(crate) struct EntryPairs {
+    pub file: MintedSender,
+    pub management: MintedSender,
+    pub directory: Option<MintedSender>,
+    pub authority: Option<MintedSender>,
+}
 pub(crate) struct Startup {
-    pub reporter: Reporter,
-    pub stop: Capability,
     pub pool: Capability,
     pub config: Config<'static>,
     pub authority: Option<MailboxSender>,
+    pub namespace: liboal::Namespace,
+    pub route: Mailbox,
+    pub service: Option<Mailbox>,
+    pub pairs: alloc::vec::Vec<EntryPairs>,
+}
+fn scope(name: &str) -> Result<Scope, SystemCallError> {
+    if name == "/" {
+        return Ok(Scope::Root);
+    }
+    let mut owned = alloc::string::String::new();
+    owned
+        .try_reserve_exact(name.len())
+        .map_err(|_| SystemCallError::OutOfMemory)?;
+    owned.push_str(name);
+    Ok(Scope::ExactName(owned))
 }
 pub(crate) fn run(mailbox: Mailbox, startup: Startup) {
     let Startup {
-        mut reporter,
-        stop,
-        pool: _pool,
+        pool,
         config,
         authority,
+        namespace: _namespace,
+        route,
+        service: service_mailbox,
+        pairs,
     } = startup;
+    // Namespace 与基础设施 Pool 持有到整个 provider 生命期结束。
     let with_registry = config.registry;
     let entries = config.entries().len();
     let capacity = Capacity::new(&config).expect("provider capacity invalid");
@@ -144,11 +147,6 @@ pub(crate) fn run(mailbox: Mailbox, startup: Startup) {
     let tasks = capacity.tasks;
     let mut publisher = authority;
     let publish_name = config.publish.unwrap_or_default();
-    let owner_rights = Rights::READ | Rights::WAIT | Rights::MANAGE;
-    let service_mailbox = with_registry
-        .then(|| Mailbox::create(owner_rights).expect("registry mailbox creation failed"));
-    // 管理 receiver 的运行与最终关闭责任进入 World，入口由独立管理 sender 出生。
-    let route = Mailbox::create(owner_rights).expect("management mailbox creation failed");
     let input = Runtime::<FileTask, WaitSet>::fixed_input_budget(sources)
         .and_then(|fixed| {
             fixed
@@ -169,13 +167,14 @@ pub(crate) fn run(mailbox: Mailbox, startup: Startup) {
     limits[fs_base..service_base].fill(REQUESTS + GRANTS + WATCHES);
     limits[fs_base + FsResource::Node.slot()] = NODES;
     limits[fs_base + FsResource::Binding.slot()] = BINDINGS;
-    limits[fs_base + FsResource::Grant.slot()] = GRANTS;
+    // 普通 grant 表与独立 management 表分别持有自己的真实角色槽。
+    limits[fs_base + FsResource::Grant.slot()] = GRANTS + entries;
     limits[fs_base + FsResource::Watch.slot()] = WATCHES;
     limits[fs_base + FsResource::Offer.slot()] = srv_fs::deployment::SESSIONS;
     limits[fs_base + FsResource::Stream.slot()] = srv_fs::deployment::SESSIONS;
     limits[fs_base + FsResource::Bytes.slot()] = srv_fs::deployment::DOMAIN_BYTES;
     limits[fs_base + FsResource::WaitSource.slot()] =
-        GRANTS + REQUESTS + WATCHES + 2 * srv_fs::deployment::SESSIONS + entries + 4;
+        GRANTS + REQUESTS + WATCHES + 2 * srv_fs::deployment::SESSIONS + entries + 3;
     limits[service_base..].fill(REQUESTS + 2 * ROLES + 2 * REGISTRATIONS + WATCHES + 2);
     limits[service_base + ServiceResource::Authority.slot()] = ROLES;
     limits[service_base + ServiceResource::Access.slot()] = ROLES;
@@ -207,10 +206,10 @@ pub(crate) fn run(mailbox: Mailbox, startup: Startup) {
     let tenants: alloc::vec::Vec<_> = (0..entries)
         .map(|entry| {
             let mut local = limits;
-            local[fs_base + FsResource::Watch.slot()] = config.entries()[entry].watches;
-            local[fs_base + FsResource::Stream.slot()] = config.entries()[entry].sessions;
-            local[fs_base + FsResource::Offer.slot()] = config.entries()[entry].sessions;
-            local[service_base + ServiceResource::Watch.slot()] = config.entries()[entry].watches;
+            local[fs_base + FsResource::Watch.slot()] = config.entry(entry).watches;
+            local[fs_base + FsResource::Stream.slot()] = config.entry(entry).sessions;
+            local[fs_base + FsResource::Offer.slot()] = config.entry(entry).sessions;
+            local[service_base + ServiceResource::Watch.slot()] = config.entry(entry).watches;
             let account = budget
                 .account(&local)
                 .expect("entry account creation failed");
@@ -259,7 +258,7 @@ pub(crate) fn run(mailbox: Mailbox, startup: Startup) {
         }
     });
     let mut world = World {
-        pool: _pool,
+        pool,
         streams: libfs::stream::StreamTable::new(srv_fs::deployment::SESSIONS)
             .expect("stream table creation failed"),
         retirement_task: 0,
@@ -294,12 +293,37 @@ pub(crate) fn run(mailbox: Mailbox, startup: Startup) {
     .expect("provider runtime creation failed");
     let mut file_roots = [None; ENTRIES];
     let mut management_roots = [None; ENTRIES];
-    for entry in 0..entries {
-        let (execution, fs, _) = &tenants[entry];
+    let mut directory_roots = [None; ENTRIES];
+    let mut authority_roots = [None; ENTRIES];
+    for (entry, pair) in pairs.into_iter().enumerate() {
+        let (execution, fs, service_account) = &tenants[entry];
+        let policy = config.entry(entry);
+        let file_transport = pair
+            .file
+            .sender
+            .description()
+            .expect("file sender query failed")
+            .rights;
         let prepared = world
-            .prepare_root(with_registry, fs, execution)
-            .map_err(|f| f.error)
-            .expect("file root preparation failed");
+            .grants
+            .prepare_minted(
+                &world.mailbox,
+                world
+                    .memory
+                    .root()
+                    .expect("file backing root missing")
+                    .clone(),
+                libfs::authority::Issuance {
+                    rights: policy.file.rights,
+                    sender_transport: file_transport,
+                    output_transport: policy.file.output,
+                },
+                fs,
+                execution,
+                pair.file,
+            )
+            .map_err(|failure| failure.error)
+            .expect("file root adoption failed");
         file_roots[entry] = Some(
             runtime
                 .spawn(libexecution::TaskSubmission::new(
@@ -310,38 +334,32 @@ pub(crate) fn run(mailbox: Mailbox, startup: Startup) {
                     1,
                     execution.clone(),
                 ))
-                .map_err(|f| f.error)
+                .map_err(|failure| failure.error)
                 .expect("file root admission failed"),
         );
-        let minted = world
-            .route
-            .mint(
-                0,
-                Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE | Rights::GRANT,
-            )
-            .expect("management sender mint failed");
         let prepared = world
             .management
             .prepare_minted(
+                &world.route,
                 world
                     .memory
                     .root()
                     .expect("management root missing")
                     .clone(),
-                libfs::FsRights::ALL,
-                srv_fs::deployment::root_output_transport(),
+                policy.management.rights,
+                policy.management.output,
                 fs,
                 execution,
-                minted,
+                pair.management,
             )
             .map_err(|failure| failure.error)
-            .expect("management role preparation failed");
+            .expect("management root adoption failed");
         management_roots[entry] = Some(
             runtime
                 .spawn(libexecution::TaskSubmission::new(
                     FileTask::FileRoot(
                         lifecycle::Root::management(prepared, fs)
-                            .expect("management root owner preparation failed"),
+                            .expect("management owner preparation failed"),
                     ),
                     1,
                     execution.clone(),
@@ -349,25 +367,57 @@ pub(crate) fn run(mailbox: Mailbox, startup: Startup) {
                 .map_err(|failure| failure.error)
                 .expect("management root admission failed"),
         );
+        if let Some(state) = world.service.as_ref() {
+            let directory = policy.directory.expect("directory policy missing");
+            let root = Root::prepare_minted(
+                state,
+                Policy::Directory {
+                    scope: scope(directory.scope).expect("directory scope allocation failed"),
+                    rights: directory.rights,
+                    output: directory.output,
+                },
+                pair.directory.expect("directory pair missing"),
+                service_account,
+                execution,
+            )
+            .map_err(|failure| failure.status)
+            .expect("directory root adoption failed");
+            directory_roots[entry] = Some(
+                runtime
+                    .spawn(libexecution::TaskSubmission::new(
+                        FileTask::ServiceRoot(root),
+                        1,
+                        execution.clone(),
+                    ))
+                    .map_err(|failure| failure.error)
+                    .expect("directory root admission failed"),
+            );
+            let authority = policy.authority.expect("authority policy missing");
+            let root = Root::prepare_minted(
+                state,
+                Policy::Authority {
+                    scope: scope(authority.scope).expect("authority scope allocation failed"),
+                    rights: authority.rights,
+                    output: authority.output,
+                },
+                pair.authority.expect("authority pair missing"),
+                service_account,
+                execution,
+            )
+            .map_err(|failure| failure.status)
+            .expect("authority root adoption failed");
+            authority_roots[entry] = Some(
+                runtime
+                    .spawn(libexecution::TaskSubmission::new(
+                        FileTask::ServiceRoot(root),
+                        1,
+                        execution.clone(),
+                    ))
+                    .map_err(|failure| failure.error)
+                    .expect("authority root admission failed"),
+            );
+        }
     }
-    let file_ingress = runtime
-        .spawn(libexecution::TaskSubmission::new(
-            FileTask::Ingress(Ingress::new(&fs).expect("file ingress preparation failed")),
-            Ingress::MAX_SOURCES,
-            execution.clone(),
-        ))
-        .map_err(|f| f.error)
-        .expect("file ingress admission failed");
-    let management_ingress = runtime
-        .spawn(libexecution::TaskSubmission::new(
-            FileTask::Ingress(
-                Ingress::management(&fs).expect("management ingress preparation failed"),
-            ),
-            Ingress::MAX_SOURCES,
-            execution.clone(),
-        ))
-        .map_err(|failure| failure.error)
-        .expect("management ingress admission failed");
     world.retirement_task = runtime
         .spawn(libexecution::TaskSubmission::new(
             FileTask::Retire(
@@ -378,23 +428,6 @@ pub(crate) fn run(mailbox: Mailbox, startup: Startup) {
         ))
         .map_err(|f| f.error)
         .expect("retirement admission failed");
-    let release_task = runtime
-        .spawn(libexecution::TaskSubmission::new(
-            FileTask::Release(
-                lifecycle::Release::new(
-                    notification::NotificationOwner::from_capability(stop)
-                        .map_err(|f| f.error)
-                        .expect("provider release role invalid")
-                        .0,
-                    &fs,
-                )
-                .expect("release owner preparation failed"),
-            ),
-            1,
-            execution.clone(),
-        ))
-        .map_err(|f| f.error)
-        .expect("release admission failed");
     let dispatcher = runtime
         .spawn(libexecution::TaskSubmission::new(
             FileTask::Dispatcher(super::Transport::new()),
@@ -405,59 +438,7 @@ pub(crate) fn run(mailbox: Mailbox, startup: Startup) {
         .map_err(|f| f.error)
         .expect("publication Dispatcher admission failed");
     world.transport_task = dispatcher;
-    let mut directory_roots = [None; ENTRIES];
-    let mut authority_roots = [None; ENTRIES];
-    let mut service_ingress = None;
     if let Some(state) = world.service.as_mut() {
-        let transport =
-            Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE | Rights::GRANT;
-        for entry in 0..entries {
-            let (execution, _, service_account) = &tenants[entry];
-            let directory = Root::prepare(
-                state,
-                Policy::Directory {
-                    scope: Scope::Root,
-                    rights: AccessRights::ALL,
-                    output: Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
-                },
-                transport,
-                service_account,
-                execution,
-            )
-            .expect("directory root preparation failed");
-            let authority = Root::prepare(
-                state,
-                Policy::Authority {
-                    scope: Scope::Root,
-                    rights: PublishRights::ALL,
-                    output: transport,
-                },
-                transport,
-                service_account,
-                execution,
-            )
-            .expect("publication root preparation failed");
-            directory_roots[entry] = Some(
-                runtime
-                    .spawn(libexecution::TaskSubmission::new(
-                        FileTask::ServiceRoot(directory),
-                        1,
-                        execution.clone(),
-                    ))
-                    .map_err(|f| f.error)
-                    .expect("directory root admission failed"),
-            );
-            authority_roots[entry] = Some(
-                runtime
-                    .spawn(libexecution::TaskSubmission::new(
-                        FileTask::ServiceRoot(authority),
-                        1,
-                        execution.clone(),
-                    ))
-                    .map_err(|f| f.error)
-                    .expect("publication root admission failed"),
-            );
-        }
         let maintenance = Maintenance::new(state).expect("registry maintenance preparation failed");
         state.maintenance = runtime
             .spawn(libexecution::TaskSubmission::new(
@@ -467,29 +448,123 @@ pub(crate) fn run(mailbox: Mailbox, startup: Startup) {
             ))
             .map_err(|f| f.error)
             .expect("registry maintenance admission failed");
-        let ingress = services::Ingress::new(state).expect("registry ingress preparation failed");
-        service_ingress = Some(
-            runtime
-                .spawn(libexecution::TaskSubmission::new(
-                    FileTask::ServiceIngress(ingress),
-                    2,
-                    execution.clone(),
-                ))
-                .map_err(|f| f.error)
-                .expect("registry ingress admission failed"),
-        );
     }
-    let mut published_file = false;
-    let mut published_management = false;
-    let mut management_senders: [Option<MailboxSender>; ENTRIES] = core::array::from_fn(|_| None);
-    let mut published_directory = !with_registry;
-    let mut published_authority = !with_registry;
-    let mut file_senders: [Option<MailboxSender>; ENTRIES] = core::array::from_fn(|_| None);
-    let mut directory_senders: [Option<MailboxSender>; ENTRIES] = core::array::from_fn(|_| None);
-    let mut authority_senders: [Option<MailboxSender>; ENTRIES] = core::array::from_fn(|_| None);
-    let mut publication = None;
+    // 上游 sender 已能发送。只驱动来源/角色 owner；任何 Ingress 尚未进入 Runtime，
+    // 因而早到消息仍留在真实内核队列中，不会得到临时 Permission 或额外缓存。
+    loop {
+        for &record in assembly
+            .receive(64)
+            .expect("provider adoption source receive failed")
+        {
+            runtime.feed(record);
+        }
+        runtime
+            .turn(&mut world, 1)
+            .unwrap_or_else(|failure| panic!("provider adoption failed: {:?}", failure.error));
+        assert!(!world.stop, "provider role source admission failed");
+        let files = file_roots[..entries]
+            .iter()
+            .chain(&management_roots[..entries])
+            .all(|id| {
+                id.and_then(|id| runtime.get_task_mut(id)).is_some_and(
+                    |task| matches!(task, FileTask::FileRoot(root) if root.installed()),
+                )
+            });
+        let roles = !with_registry
+            || directory_roots[..entries]
+                .iter()
+                .chain(&authority_roots[..entries])
+                .all(|id| {
+                    id.and_then(|id| runtime.get_task_mut(id)).is_some_and(
+                        |task| matches!(task, FileTask::ServiceRoot(root) if root.installed()),
+                    )
+                });
+        if files && roles {
+            break;
+        }
+        if let DriveState::Waiting(deadline) = runtime.drive_state() {
+            assembly
+                .wait(deadline)
+                .expect("provider adoption wait failed");
+        }
+    }
+    let mut publication_endpoint = None;
+    for (entry, id) in file_roots[..entries].iter().enumerate() {
+        let Some(FileTask::FileRoot(root)) =
+            runtime.get_task_mut(id.expect("file root task missing"))
+        else {
+            unreachable!("file root task role changed")
+        };
+        let sender = root.take_sender().expect("installed file witness missing");
+        if !with_registry && entry == 0 {
+            publication_endpoint = Some(sender);
+        } else {
+            drop(sender);
+        }
+    }
+    for id in management_roots[..entries].iter().flatten() {
+        let Some(FileTask::FileRoot(root)) = runtime.get_task_mut(*id) else {
+            unreachable!("management root task role changed")
+        };
+        drop(root.take_sender());
+    }
+    for id in directory_roots[..entries]
+        .iter()
+        .chain(&authority_roots[..entries])
+        .flatten()
+    {
+        let Some(FileTask::ServiceRoot(root)) = runtime.get_task_mut(*id) else {
+            unreachable!("service root task role changed")
+        };
+        drop(root.take_sender());
+    }
+    // 全部 Lifetime 来源实际登记、授权表项安装并释放 witness 后才创建收件任务。
+    for ingress in [Ingress::new(&fs), Ingress::management(&fs)] {
+        runtime
+            .spawn(libexecution::TaskSubmission::new(
+                FileTask::Ingress(ingress.expect("file ingress preparation failed")),
+                Ingress::MAX_SOURCES,
+                execution.clone(),
+            ))
+            .map_err(|failure| failure.error)
+            .expect("file ingress admission failed");
+    }
+    if let Some(state) = world.service.as_ref() {
+        runtime
+            .spawn(libexecution::TaskSubmission::new(
+                FileTask::ServiceIngress(
+                    services::Ingress::new(state).expect("registry ingress preparation failed"),
+                ),
+                2,
+                execution.clone(),
+            ))
+            .map_err(|failure| failure.error)
+            .expect("registry ingress admission failed");
+    }
+    let publication_transport = publication_endpoint
+        .as_ref()
+        .map(|endpoint| {
+            let actual = endpoint
+                .description()
+                .expect("publication endpoint query failed")
+                .rights;
+            Rights::WRITE | Rights::WAIT | Rights::TRANSIT | (actual & Rights::DUPLICATE)
+        })
+        .unwrap_or(Rights::NONE);
+    let mut publication = publication_endpoint.map(|endpoint| {
+        let call = begin_registration(
+            world.rpc_mut(),
+            publisher.take().expect("publication authority missing"),
+            endpoint,
+            &tenants[0].0,
+            publish_name,
+            publication_transport,
+        )
+        .expect("publication request preparation failed");
+        runtime.wake(dispatcher).expect("publication wake failed");
+        call
+    });
     let mut registration_control = None;
-    let mut ready = false;
     let mut sealing = false;
     let mut stop_prepared = false;
     let mut withdrawal = None;
@@ -521,17 +596,6 @@ pub(crate) fn run(mailbox: Mailbox, startup: Startup) {
                 }
                 let _ = runtime.wake(management_root);
             }
-            // 已领取但尚未交付的根也须退回原领域寿命，不能由局部数组保活至收空之后。
-            for roots in [
-                &mut file_senders,
-                &mut management_senders,
-                &mut directory_senders,
-                &mut authority_senders,
-            ] {
-                for sender in roots {
-                    drop(sender.take());
-                }
-            }
             stop_prepared = true;
         }
         if world.stop && !withdrawal_finished && publication.is_none() && withdrawal.is_none() {
@@ -560,120 +624,6 @@ pub(crate) fn run(mailbox: Mailbox, startup: Startup) {
             runtime.turn(&mut world, 1)
         }
         .unwrap_or_else(|failure| panic!("provider Runtime failed: {:?}", failure.error));
-        let infrastructure_ready = [
-            file_ingress,
-            management_ingress,
-            release_task,
-            world.retirement_task,
-        ]
-        .into_iter()
-        .chain(service_ingress)
-        .all(|id| {
-            runtime.get_task_mut(id).is_some_and(|task| match task {
-                FileTask::Ingress(task) => task.source.source().is_some(),
-                FileTask::ServiceIngress(task) => task.admitted(),
-                FileTask::Release(task) => task.admitted(),
-                FileTask::Retire(task) => task.admitted(),
-                _ => false,
-            })
-        });
-        if !world.stop && infrastructure_ready {
-            for entry in 0..entries {
-                if management_senders[entry].is_none()
-                    && !published_management
-                    && let Some(id) = management_roots[entry]
-                    && let Some(FileTask::FileRoot(root)) = runtime.get_task_mut(id)
-                {
-                    management_senders[entry] = root.take_sender();
-                }
-                if file_senders[entry].is_none()
-                    && !published_file
-                    && let Some(id) = file_roots[entry]
-                    && let Some(FileTask::FileRoot(root)) = runtime.get_task_mut(id)
-                {
-                    file_senders[entry] = root.take_sender();
-                }
-                if directory_senders[entry].is_none()
-                    && !published_directory
-                    && let Some(id) = directory_roots[entry]
-                    && let Some(FileTask::ServiceRoot(root)) = runtime.get_task_mut(id)
-                {
-                    directory_senders[entry] = root.take_sender();
-                }
-                if authority_senders[entry].is_none()
-                    && !published_authority
-                    && let Some(id) = authority_roots[entry]
-                    && let Some(FileTask::ServiceRoot(root)) = runtime.get_task_mut(id)
-                {
-                    authority_senders[entry] = root.take_sender();
-                }
-            }
-        }
-        if !world.stop
-            && infrastructure_ready
-            && !published_file
-            && file_senders[..entries].iter().all(Option::is_some)
-        {
-            if with_registry {
-                export_all(
-                    &mut reporter,
-                    FILE_ROOT_EXPORT,
-                    &mut file_senders[..entries],
-                );
-            } else {
-                let dispatch = world.rpc_mut();
-                publication = Some(
-                    begin_registration(
-                        dispatch,
-                        publisher.take().expect("publication authority missing"),
-                        file_senders[0]
-                            .take()
-                            .expect("publication file root missing"),
-                        &tenants[0].0,
-                        publish_name,
-                    )
-                    .expect("publication request preparation failed"),
-                );
-                runtime.wake(dispatcher).expect("publication wake failed");
-            }
-            published_file = true;
-        }
-        if !world.stop
-            && infrastructure_ready
-            && !published_directory
-            && directory_senders[..entries].iter().all(Option::is_some)
-        {
-            export_all(
-                &mut reporter,
-                DIRECTORY_EXPORT,
-                &mut directory_senders[..entries],
-            );
-            published_directory = true;
-        }
-        if !world.stop
-            && infrastructure_ready
-            && !published_management
-            && management_senders[..entries].iter().all(Option::is_some)
-        {
-            export_all(
-                &mut reporter,
-                MANAGEMENT_EXPORT,
-                &mut management_senders[..entries],
-            );
-            published_management = true;
-        }
-        if !world.stop
-            && infrastructure_ready
-            && !published_authority
-            && authority_senders[..entries].iter().all(Option::is_some)
-        {
-            export_all(
-                &mut reporter,
-                AUTHORITY_EXPORT,
-                &mut authority_senders[..entries],
-            );
-            published_authority = true;
-        }
         if let Some((txid, deadline)) = publication
             && let Some(completion) = world.rpc_mut().take(txid)
         {
@@ -694,10 +644,7 @@ pub(crate) fn run(mailbox: Mailbox, startup: Startup) {
                 mode: RegisterMode::CreateOnly,
                 descriptors: Descriptors::decode(&descriptors[..used])
                     .expect("registration descriptor invariant"),
-                export_transport: Rights::WRITE
-                    | Rights::WAIT
-                    | Rights::TRANSIT
-                    | Rights::DUPLICATE,
+                export_transport: publication_transport,
             };
             let response = service::decode_response(
                 &reply.payload,
@@ -735,20 +682,6 @@ pub(crate) fn run(mailbox: Mailbox, startup: Startup) {
             }
             withdrawal = None;
             withdrawal_finished = true;
-        }
-        if !world.stop
-            && infrastructure_ready
-            && !ready
-            && published_file
-            && published_directory
-            && published_authority
-            && published_management
-            && (with_registry || registration_control.is_some())
-        {
-            reporter
-                .ready(&[], Deadline::INFINITE)
-                .expect("provider ready publication failed");
-            ready = true;
         }
         if world.stop && withdrawal_finished && !sealing {
             continue;
@@ -796,7 +729,4 @@ pub(crate) fn run(mailbox: Mailbox, startup: Startup) {
         "provider budget remained after owner retirement"
     );
     libkernel::debug!("FS1 provider budget empty after owner retirement");
-    reporter
-        .stopped(Deadline::INFINITE)
-        .expect("provider stopped publication failed");
 }

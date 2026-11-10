@@ -3,30 +3,14 @@
 use crate::protocol::Status;
 
 pub fn validate_path(path: &str) -> Result<(), Status> {
-    if path.is_empty() {
-        return Ok(());
-    }
-    for component in path.split('/') {
-        validate_name(component)?;
-    }
-    Ok(())
+    oal::path::validate_path(path).map_err(|_| Status::Invalid)
 }
-
 pub fn validate_name(name: &str) -> Result<(), Status> {
-    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
-        Err(Status::Invalid)
-    } else {
-        Ok(())
-    }
+    oal::path::validate_name(name).map_err(|_| Status::Invalid)
 }
-
-/// 链接目标属于客户端视图路径，可以含斜杠、`.` 和 `..`。
+/// 链接目标可含斜杠、`.` 和 `..`，不强制规范化。
 pub fn validate_target(target: &str) -> Result<(), Status> {
-    if target.is_empty() || target.contains('\0') {
-        Err(Status::Invalid)
-    } else {
-        Ok(())
-    }
+    oal::path::validate_target(target).map_err(|_| Status::Invalid)
 }
 
 #[cfg(test)]

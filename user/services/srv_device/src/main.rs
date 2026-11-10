@@ -4,9 +4,10 @@
 extern crate alloc;
 extern crate libruntime;
 use erhino_shared::object::{ObjectKind, Rights};
+use libkernel::ipc::message::{Mailbox, MintedSender};
+use liboal::Namespace;
 use libpci::platform::{DESCRIPTION_RIGHTS, DescriptionObject, Platform, ROOT_RIGHTS};
 use libprocess::birth::Birth;
-use libservice::instance::{self, child::Reporter};
 mod config;
 mod server;
 
@@ -23,19 +24,55 @@ fn main() {
             .expect("device birth frame invalid");
     let config = config::Config::parse(birth.settings())
         .unwrap_or_else(|invalid| panic!("device settings invalid: {}", invalid.0));
-    let reporter = Reporter::new(
+    let namespace = Namespace::adopt_birth(&mut birth).expect("device Namespace input invalid");
+    let (mailbox, _) = Mailbox::from_capability(
         birth
             .require(
-                instance::REPORT,
-                instance::REPORT_KIND,
-                instance::REPORT_RIGHTS,
+                "device.receiver",
+                ObjectKind::MailboxReceiver,
+                Rights::READ | Rights::WAIT | Rights::MANAGE,
             )
-            .expect("device report input invalid"),
+            .expect("device receiver input invalid"),
     )
-    .expect("device report sender invalid");
-    let stop = birth
-        .require(instance::STOP, instance::STOP_KIND, instance::STOP_RIGHTS)
-        .expect("device stop input invalid");
+    .map_err(|failure| failure.error)
+    .expect("device receiver role invalid");
+    let mut sources = alloc::vec::Vec::new();
+    sources
+        .try_reserve_exact(config.sources.len())
+        .expect("device static source allocation failed");
+    let mut contexts = alloc::vec::Vec::new();
+    contexts
+        .try_reserve_exact(config.sources.len() * 2)
+        .expect("device static context allocation failed");
+    for index in 0..config.sources.len() {
+        let source = adopt_pair(
+            &mut birth,
+            &mailbox,
+            "device.source",
+            "device.source_lifetime",
+            index,
+        );
+        let admin = adopt_pair(
+            &mut birth,
+            &mailbox,
+            "device.admin",
+            "device.admin_lifetime",
+            index,
+        );
+        for pair in [&source, &admin] {
+            let context = pair
+                .sender
+                .description()
+                .expect("device static source identity invalid")
+                .object_id;
+            assert!(
+                !contexts.contains(&context),
+                "device static source context duplicated"
+            );
+            contexts.push(context);
+        }
+        sources.push(server::SourcePair { source, admin });
+    }
     let pool = birth
         .require("memory.pool", ObjectKind::MemoryPool, Rights::CREATE)
         .expect("device Pool input invalid");
@@ -61,10 +98,38 @@ fn main() {
     let platform =
         Platform::adopt(description, roots).expect("device platform root binding invalid");
     server::run(server::Startup {
-        reporter,
-        stop,
+        namespace,
+        mailbox,
+        sources,
         pool,
         platform,
         config,
     });
+}
+
+/// 运输关联由 libkernel 的完整 pair 采用器核验；本地角色冲突另在全部输入领取后检查。
+fn adopt_pair(
+    birth: &mut Birth,
+    mailbox: &Mailbox,
+    sender_prefix: &str,
+    lifetime_prefix: &str,
+    index: usize,
+) -> MintedSender {
+    let sender = birth
+        .require(
+            &alloc::format!("{sender_prefix}.{index}"),
+            ObjectKind::MailboxSender,
+            Rights::WRITE | Rights::WAIT,
+        )
+        .expect("device static sender input invalid");
+    let lifetime = birth
+        .require(
+            &alloc::format!("{lifetime_prefix}.{index}"),
+            ObjectKind::LifetimeObserver,
+            Rights::WAIT,
+        )
+        .expect("device static Lifetime input invalid");
+    MintedSender::from_capabilities(mailbox, sender, lifetime, Rights::WRITE | Rights::WAIT)
+        .map_err(|failure| failure.error)
+        .expect("device static sender pair invalid")
 }

@@ -1,4 +1,4 @@
-//! 根发行者的真实 Lifetime owner；sender 只在来源成功登记后交给启动投递者。
+//! 根角色的真实 Lifetime owner；sender 只作身份凭据，安装后由装配者释放。
 use crate::{
     authority::{PreparedRole, Scope},
     protocol::{AccessRights, PublishRights, Status},
@@ -33,6 +33,10 @@ enum Prepared {
     Directory(PreparedRole<AccessRights>),
     Authority(PreparedRole<PublishRights>),
 }
+pub struct AdoptFailure {
+    pub status: Status,
+    pub minted: libkernel::ipc::message::MintedSender,
+}
 pub struct Root {
     funding: crate::Funding,
     context: u64,
@@ -41,60 +45,66 @@ pub struct Root {
     sender: Option<MailboxSender>,
     lifetime: Option<libkernel::ipc::message::LifetimeObserver>,
     source: SourceRegistration,
-    published: bool,
+    installed: bool,
     stopping: bool,
     revoking: bool,
     _bytes: Charge,
 }
 impl Root {
-    pub fn prepare(
+    /// 采用已存在且可被调用的运输入口；仅在来源登记和角色安装后开放 Ingress。
+    /// 失败返还完整 pair，不能把业务政策当作运输授权。
+    pub fn prepare_minted(
         state: &State,
         policy: Policy,
-        transport: Rights,
+        minted: libkernel::ipc::message::MintedSender,
         account: &AccountView<ServiceResource>,
         execution: &AccountView<libexecution::ExecutionResource>,
-    ) -> Result<Self, Status> {
-        let funding = crate::Funding::new(account, execution).map_err(|_| Status::Invalid)?;
-        if !transport.is_known() {
-            return Err(Status::Invalid);
-        }
-        if !transport.contains(Rights::WRITE | Rights::WAIT | Rights::TRANSIT) {
-            return Err(Status::Permission);
-        }
-        let bytes = account
-            .acquire(ServiceResource::Bytes, core::mem::size_of::<Self>())
-            .map_err(|_| Status::Resource)?;
-        let prepared = match policy {
-            Policy::Directory {
-                scope,
-                rights,
-                output,
-            } => Prepared::Directory(state.accesses.prepare(
-                scope,
-                rights,
-                output,
-                funding.clone(),
-            )?),
-            Policy::Authority {
-                scope,
-                rights,
-                output,
-            } => Prepared::Authority(state.authorities.prepare(
-                scope,
-                rights,
-                output,
-                funding.clone(),
-            )?),
+    ) -> Result<Self, AdoptFailure> {
+        let setup = (|| {
+            let funding = crate::Funding::new(account, execution).map_err(|_| Status::Invalid)?;
+            let description = minted
+                .validate(
+                    &state.mailbox,
+                    Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+                )
+                .map_err(|_| Status::Invalid)?;
+            let context = description.object_id;
+            if state.accesses.contains_context(context)
+                || state.authorities.contains_context(context)
+            {
+                return Err(Status::Conflict);
+            }
+            let bytes = account
+                .acquire(ServiceResource::Bytes, core::mem::size_of::<Self>())
+                .map_err(|_| Status::Resource)?;
+            let prepared = match policy {
+                Policy::Directory {
+                    scope,
+                    rights,
+                    output,
+                } => Prepared::Directory(state.accesses.prepare(
+                    scope,
+                    rights,
+                    output,
+                    funding.clone(),
+                )?),
+                Policy::Authority {
+                    scope,
+                    rights,
+                    output,
+                } => Prepared::Authority(state.authorities.prepare(
+                    scope,
+                    rights,
+                    output,
+                    funding.clone(),
+                )?),
+            };
+            Ok((funding, context, bytes, prepared))
+        })();
+        let (funding, context, bytes, prepared) = match setup {
+            Ok(setup) => setup,
+            Err(status) => return Err(AdoptFailure { status, minted }),
         };
-        let minted = state
-            .mailbox
-            .mint(0, transport)
-            .map_err(|_| Status::Resource)?;
-        let context = minted
-            .sender
-            .description()
-            .map_err(|_| Status::Resource)?
-            .object_id;
         Ok(Self {
             funding,
             context,
@@ -103,7 +113,7 @@ impl Root {
             sender: Some(minted.sender),
             lifetime: Some(minted.lifetime),
             source: SourceRegistration::new(),
-            published: false,
+            installed: false,
             stopping: false,
             revoking: false,
             _bytes: bytes,
@@ -112,16 +122,16 @@ impl Root {
     pub fn execution_funding(&self) -> &AccountView<libexecution::ExecutionResource> {
         self.funding.execution()
     }
-    /// 启动投递者接管母本；本 owner 从此只持 Lifetime，不在 World 留一份 sender。
+    /// 角色已安装后交回本地身份凭据；装配者释放它，不再动态导出。
     pub fn take_sender(&mut self) -> Option<MailboxSender> {
-        if self.published && !self.stopping {
+        if self.installed && !self.stopping {
             self.sender.take()
         } else {
             None
         }
     }
-    pub fn published(&self) -> bool {
-        self.published && !self.stopping
+    pub fn installed(&self) -> bool {
+        self.installed && !self.stopping
     }
     pub fn stop(&mut self) {
         self.stopping = true;
@@ -150,7 +160,7 @@ impl Root {
         }
         input.take_timeout();
         if self.stopping {
-            if self.published {
+            if self.installed {
                 if self.revoking {
                     if self.directory {
                         state.accesses.revoke(self.context);
@@ -178,13 +188,13 @@ impl Root {
                 });
             }
             self.prepared = None;
-            if self.published {
+            if self.installed {
                 if self.directory {
                     state.accesses.remove(self.context);
                 } else {
                     state.authorities.remove(self.context);
                 }
-                self.published = false;
+                self.installed = false;
             }
             return Ok(Advance {
                 work_done: 1,
@@ -213,6 +223,13 @@ impl Root {
                 step: Step::Runnable,
             });
         }
+        if self.prepared.is_some()
+            && (state.accesses.contains_context(self.context)
+                || state.authorities.contains_context(self.context))
+        {
+            // 两个尚未安装的准备角色也可能同号；在领域边界拒绝，不交给底层表断言。
+            return Err(SystemCallError::IllegalArgument);
+        }
         if let Some(prepared) = self.prepared.take() {
             match prepared {
                 Prepared::Directory(role) => {
@@ -228,9 +245,10 @@ impl Root {
                     }
                 }
             }
-            if !self.stopping {
-                self.published = true;
+            if self.stopping {
+                return Err(SystemCallError::IllegalArgument);
             }
+            self.installed = true;
             return Ok(Advance {
                 work_done: 1,
                 step: Step::Runnable,

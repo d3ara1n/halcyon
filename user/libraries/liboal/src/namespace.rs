@@ -22,7 +22,43 @@ pub struct BindFailure {
     pub entry: Arc<MailboxSender>,
 }
 
+/// 出生采用失败不交付部分视图；已领取的能力随局部 Namespace 释放。
+#[derive(Debug)]
+pub enum AdoptError {
+    Birth(libprocess::birth::Error),
+    Description(oal::namespace::Error),
+    Bind(LocalError),
+    Sender(erhino_shared::call::SystemCallError),
+}
+
 impl Namespace {
+    pub fn adopt_birth(birth: &mut libprocess::birth::Birth) -> Result<Self, AdoptError> {
+        use erhino_shared::object::{ObjectKind, Rights};
+        let Some(bytes) = birth
+            .take_data(oal::namespace::SECTION_NAME)
+            .map_err(AdoptError::Birth)?
+        else {
+            return Ok(Self::new());
+        };
+        let description =
+            oal::namespace::Description::decode(bytes).map_err(AdoptError::Description)?;
+        let mut namespace = Self::new();
+        for binding in description.bindings {
+            let capability = birth
+                .require(
+                    &binding.input,
+                    ObjectKind::MailboxSender,
+                    Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+                )
+                .map_err(AdoptError::Birth)?;
+            let (sender, _) = MailboxSender::from_capability(capability)
+                .map_err(|failure| AdoptError::Sender(failure.error))?;
+            namespace
+                .bind(&binding.prefix, Arc::new(sender))
+                .map_err(|failure| AdoptError::Bind(failure.cause))?;
+        }
+        Ok(namespace)
+    }
     pub const fn new() -> Self {
         Self {
             bindings: Vec::new(),

@@ -1,256 +1,377 @@
 use super::*;
-use alloc::{collections::BTreeMap, string::ToString, vec};
-
-const SENDER: Rights = Rights::from_raw(
-    Rights::WRITE.raw()
-        | Rights::WAIT.raw()
-        | Rights::DUPLICATE.raw()
-        | Rights::TRANSIT.raw()
-        | Rights::GRANT.raw(),
-);
-
-fn empty_settings() -> Vec<u8> {
-    settings::encode(&BTreeMap::new()).unwrap()
+use alloc::{collections::BTreeMap, vec};
+fn call() -> Rights {
+    Rights::WRITE | Rights::WAIT | Rights::TRANSIT
 }
-
-fn export(name: &str) -> Export {
-    Export {
+fn object(name: &str) -> Source {
+    Source::Resource {
         name: name.into(),
-        kind: ObjectKind::MailboxSender as u32,
-        rights: SENDER,
+        output: ResourceOutput::Main,
     }
 }
-
-fn resident(name: &str, image: &str) -> Instance {
+fn lifetime(name: &str) -> Source {
+    Source::Resource {
+        name: name.into(),
+        output: ResourceOutput::Lifetime,
+    }
+}
+fn input(name: &str, source: Source) -> Input {
+    Input {
+        name: name.into(),
+        source,
+        rights: None,
+    }
+}
+fn instance(name: &str) -> Instance {
     Instance {
         name: name.into(),
-        image: image.into(),
-        kind: Kind::Resident,
+        image: "srv_host".into(),
         job: None,
         pool: Budget {
-            work_pages: 16,
+            work_pages: 2,
             metadata_bytes: 4096,
         },
-        inputs: vec![Input {
-            name: "memory.pool".into(),
-            source: Source::SelfPool,
-            rights: None,
-            revoke: None,
-        }],
-        exports: Vec::new(),
-        settings: empty_settings(),
-        start_timeout_ms: 5000,
-        stop_timeout_ms: 40000,
-        after: Vec::new(),
+        inputs: Vec::new(),
+        namespace: Vec::new(),
+        settings: settings::encode(&BTreeMap::new()).unwrap(),
     }
 }
-
-/// System 的形状：device 签发预限定来源，driver 经可撤销路由消费，worker Job 由 driver 付款。
-fn system() -> Formation {
-    let mut device = resident("device", "srv_device");
-    device.inputs.push(Input {
-        name: "platform.root".into(),
-        source: Source::PlatformRoot,
-        rights: None,
-        revoke: None,
-    });
-    device.exports = vec![
-        export("device.root"),
-        export("device.root.admin"),
-        export("device.source.driver"),
-        export("device.source.driver.admin"),
+fn formation() -> Formation {
+    let mut i = instance("host");
+    i.inputs = vec![
+        input("receiver", object("mailbox")),
+        input("proof", object("entry")),
+        input("life", lifetime("entry")),
     ];
-    let mut driver = resident("driver", "srv_driver");
-    driver.inputs.push(Input {
-        name: "device.source".into(),
-        source: Source::parse("device/device.source.driver").unwrap(),
-        rights: None,
-        revoke: Source::parse("device/device.source.driver.admin"),
-    });
-    driver.inputs.push(Input {
-        name: "driver.workers".into(),
-        source: Source::Job("drivers".into()),
-        rights: None,
-        revoke: None,
-    });
-    driver.exports = vec![export("driver.control")];
-    let fs = resident("fs", "srv_fs");
     Formation {
-        finish: Finish::Stay,
         pools: Vec::new(),
-        jobs: vec![Job {
-            name: "drivers".into(),
-            parent: SERVICES_JOB.into(),
-            payer: "driver".into(),
-        }],
-        // driver 先于 device 声明，顺序仍须由依赖决定。
-        instances: vec![driver, fs, device],
+        jobs: Vec::new(),
+        resources: vec![
+            Resource {
+                name: "mailbox".into(),
+                payer: "init".into(),
+                kind: ResourceKind::Mailbox {
+                    rights: Rights::READ | Rights::WAIT,
+                },
+                terminal_revoke: false,
+            },
+            Resource {
+                name: "entry".into(),
+                payer: "host".into(),
+                kind: ResourceKind::Sender {
+                    mailbox: "mailbox".into(),
+                    badge: 91,
+                    rights: call(),
+                },
+                terminal_revoke: false,
+            },
+        ],
+        instances: vec![i],
     }
 }
-
-fn images(name: &str) -> bool {
-    matches!(name, "srv_device" | "srv_driver" | "srv_fs")
-}
-
-fn rejects(formation: &Formation, reason: &str) {
-    match formation.validate(images) {
-        Err(Error::Invalid { reason: got, .. }) => assert_eq!(got, reason),
-        other => panic!("expected {reason}, got {other:?}"),
+#[test]
+fn v2_resources_namespace_roundtrip_and_reject_legacy_truncated_trailing() {
+    let mut f = formation();
+    f.instances[0].namespace.push(NamespaceBinding {
+        prefix: "/雪".into(),
+        source: object("entry"),
+        rights: call(),
+    });
+    f.resources[1].terminal_revoke = true;
+    if let ResourceKind::Sender { rights, .. } = &mut f.resources[1].kind {
+        *rights |= Rights::DUPLICATE;
     }
+    f.validate(|_| true).unwrap();
+    let bytes = f.encode().unwrap();
+    assert_eq!(Formation::decode(&bytes).unwrap(), f);
+    for n in 0..bytes.len() {
+        assert!(Formation::decode(&bytes[..n]).is_err());
+    }
+    let mut old = bytes.clone();
+    old[8..12].copy_from_slice(&1u32.to_le_bytes());
+    assert!(Formation::decode(&old).is_err());
+    let mut trailing = bytes;
+    trailing.push(0);
+    assert!(Formation::decode(&trailing).is_err());
+}
+#[test]
+fn static_sender_routes_do_not_create_instance_topology() {
+    let mut f = formation();
+    let mut peer = instance("peer");
+    peer.inputs.push(input("receiver", object("peer.mailbox")));
+    peer.inputs.push(input("host", object("entry")));
+    f.instances[0]
+        .inputs
+        .push(input("peer", object("peer.entry")));
+    f.instances.push(peer);
+    f.resources.push(Resource {
+        name: "peer.mailbox".into(),
+        payer: "host".into(),
+        kind: ResourceKind::Mailbox {
+            rights: Rights::READ | Rights::WAIT,
+        },
+        terminal_revoke: false,
+    });
+    f.resources.push(Resource {
+        name: "peer.entry".into(),
+        payer: "peer".into(),
+        kind: ResourceKind::Sender {
+            mailbox: "peer.mailbox".into(),
+            badge: 92,
+            rights: call(),
+        },
+        terminal_revoke: false,
+    });
+    // 双方都持对方真实入口，并分别用对方或自身 Pool 付款；没有启动先后依赖。
+    f.resources[1].payer = "peer".into();
+    f.validate(|_| true).unwrap();
+    f.instances.reverse();
+    f.validate(|_| true).unwrap();
 }
 
 #[test]
-fn names_follow_the_segment_grammar() {
-    for good in [
-        "device",
-        "device.root.admin",
-        "platform.root.0",
-        "file.root.12",
-    ] {
-        assert!(valid_name(good), "{good}");
+fn receiver_exactly_one_and_lifetime_at_most_one_move_owner() {
+    let f = formation();
+    let mut missing = f.clone();
+    missing.instances[0].inputs.remove(0);
+    assert!(missing.validate(|_| true).is_err());
+    let mut duplicate = f.clone();
+    duplicate.instances[0]
+        .inputs
+        .push(input("other", object("mailbox")));
+    assert!(duplicate.validate(|_| true).is_err());
+    let mut duplicate = f.clone();
+    duplicate.instances[0]
+        .inputs
+        .push(input("other", lifetime("entry")));
+    assert!(duplicate.validate(|_| true).is_err());
+    let mut unused = f;
+    unused.instances[0].inputs.pop();
+    unused.validate(|_| true).unwrap();
+}
+#[test]
+fn references_payers_kinds_and_images_checked() {
+    let mut f = formation();
+    f.resources[1].payer = "missing".into();
+    assert!(f.validate(|_| true).is_err());
+    let mut f = formation();
+    if let ResourceKind::Sender { mailbox, .. } = &mut f.resources[1].kind {
+        *mailbox = "entry".into();
     }
-    for bad in [
-        "",
-        "Device",
-        "0device",
-        "device..root",
-        "device.",
-        "root.01",
-        "a.0.b",
-        "device-root",
-        "abcdefghijklmnopqrstuvwxyzabcdefg",
+    assert!(f.validate(|_| true).is_err());
+    let mut f = formation();
+    f.instances[0].inputs[2].source = lifetime("mailbox");
+    assert!(f.validate(|_| true).is_err());
+    let mut f = formation();
+    f.instances[0].inputs[1].source = object("unknown");
+    assert!(f.validate(|_| true).is_err());
+    let mut f = formation();
+    f.instances[0]
+        .inputs
+        .push(input("image", Source::Image("drv_worker".into())));
+    assert!(f.validate(|name| name != "drv_worker").is_err());
+    let mut f = formation();
+    f.instances[0]
+        .inputs
+        .push(input("pool", Source::Pool("host".into())));
+    assert!(f.validate(|_| true).is_err());
+    let mut f = formation();
+    f.pools.push(Pool {
+        name: "host".into(),
+        budget: Budget::default(),
+    });
+    assert!(f.validate(|_| true).is_err());
+}
+#[test]
+fn rights_at_every_edge_and_object_factory() {
+    let mut f = formation();
+    f.instances[0].inputs[1].rights = Some(Rights::MANAGE);
+    assert!(f.validate(|_| true).is_err());
+    let mut f = formation();
+    f.instances[0].inputs[2].rights = Some(Rights::DUPLICATE);
+    assert!(f.validate(|_| true).is_err());
+    let mut f = formation();
+    f.instances[0]
+        .inputs
+        .push(input("description", Source::PlatformDescription));
+    f.instances[0].inputs.last_mut().unwrap().rights = Some(Rights::WRITE);
+    assert!(f.validate(|_| true).is_err());
+    let mut f = formation();
+    f.resources[0].kind = ResourceKind::Mailbox {
+        rights: Rights::DUPLICATE,
+    };
+    assert!(f.validate(|_| true).is_err());
+    let mut f = formation();
+    if let ResourceKind::Sender { rights, .. } = &mut f.resources[1].kind {
+        *rights = Rights::READ;
+    }
+    assert!(f.validate(|_| true).is_err());
+    let mut f = formation();
+    f.instances[0].inputs[1].rights = Some(Rights::WRITE);
+    f.validate(|_| true).unwrap();
+    assert_eq!(f.source_rights(&lifetime("entry")), Ok(Rights::WAIT));
+}
+#[test]
+fn namespaces_are_explicit_sender_views_and_cannot_shadow_hidden_inputs() {
+    let bind = |source, rights| NamespaceBinding {
+        prefix: "/".into(),
+        source,
+        rights,
+    };
+    for b in [
+        bind(object("mailbox"), Rights::READ),
+        bind(lifetime("entry"), Rights::WAIT),
+        bind(Source::PlatformRoot, call()),
+        bind(object("entry"), Rights::WRITE),
     ] {
-        assert!(!valid_name(bad), "{bad}");
+        let mut f = formation();
+        f.instances[0].namespace.push(b);
+        assert!(f.validate(|_| true).is_err());
+    }
+    let mut f = formation();
+    f.instances[0].namespace = vec![bind(object("entry"), call()), bind(object("entry"), call())];
+    assert!(f.validate(|_| true).is_err());
+    let mut f = formation();
+    f.instances[0].namespace.push(NamespaceBinding {
+        prefix: "/a/..".into(),
+        source: object("entry"),
+        rights: call(),
+    });
+    assert!(f.validate(|_| true).is_err());
+    let mut f = formation();
+    f.instances[0]
+        .inputs
+        .push(input("oal.entry.0", object("entry")));
+    assert!(f.validate(|_| true).is_err());
+}
+#[test]
+fn actual_grants_include_platform_expansion_and_namespace() {
+    let mut f = formation();
+    f.instances[0]
+        .inputs
+        .push(input("platform", Source::PlatformRoot));
+    f.instances[0].namespace.push(NamespaceBinding {
+        prefix: "/".into(),
+        source: object("entry"),
+        rights: call(),
+    });
+    f.validate(|_| true).unwrap();
+    f.validate_grants(MAX_INPUTS - 4).unwrap();
+    assert!(f.validate_grants(MAX_INPUTS - 3).is_err());
+    assert!(f.validate_grants(usize::MAX).is_err());
+    // host 无法知道平台展开数，但可拒绝普通输入和 Namespace 已经超限的部署。
+    for n in 0..MAX_INPUTS {
+        f.instances[0]
+            .inputs
+            .push(input(&alloc::format!("extra.{n}"), object("entry")));
+    }
+    assert!(f.validate(|_| true).is_err());
+}
+#[test]
+fn terminal_revoke_is_explicit_not_a_suffix_policy() {
+    let mut f = formation();
+    f.resources[1].name = "entry.admin".into();
+    f.instances[0].inputs[1].source = object("entry.admin");
+    f.instances[0].inputs[2].source = lifetime("entry.admin");
+    f.validate(|_| true).unwrap();
+    assert!(!f.resources[1].terminal_revoke);
+    f.resources[1].terminal_revoke = true;
+    assert!(f.validate(|_| true).is_err());
+    if let ResourceKind::Sender { rights, .. } = &mut f.resources[1].kind {
+        *rights |= Rights::DUPLICATE;
+    }
+    f.validate(|_| true).unwrap();
+    f.resources[0].terminal_revoke = true;
+    assert!(f.validate(|_| true).is_err());
+    for missing in [
+        Rights::WRITE,
+        Rights::WAIT,
+        Rights::TRANSIT,
+        Rights::DUPLICATE,
+    ] {
+        let mut f = formation();
+        f.resources[1].terminal_revoke = true;
+        if let ResourceKind::Sender { rights, .. } = &mut f.resources[1].kind {
+            *rights = Rights::from_raw((call() | Rights::DUPLICATE).raw() & !missing.raw());
+        }
+        assert!(f.validate(|_| true).is_err());
     }
 }
-
 #[test]
-fn sources_round_trip_through_their_text_form() {
-    for text in [
+fn job_parent_cycles_budget_overflow_and_duplicate_names_rejected() {
+    let mut f = formation();
+    f.jobs = vec![
+        Job {
+            name: "a".into(),
+            parent: "b".into(),
+            payer: "init".into(),
+        },
+        Job {
+            name: "b".into(),
+            parent: "a".into(),
+            payer: "host".into(),
+        },
+    ];
+    assert!(f.validate(|_| true).is_err());
+    f.jobs[1].parent = SERVICES_JOB.into();
+    f.validate(|_| true).unwrap();
+    let mut f = formation();
+    f.resources.push(f.resources[1].clone());
+    assert!(f.validate(|_| true).is_err());
+    let mut f = formation();
+    f.pools.push(Pool {
+        name: "overflow".into(),
+        budget: Budget {
+            work_pages: u64::MAX,
+            metadata_bytes: 0,
+        },
+    });
+    assert!(f.validate(|_| true).is_err());
+}
+#[test]
+fn static_source_syntax_names_and_reserved_old_routes() {
+    for s in [
         "init/platform.description",
         "init/platform.root",
-        "init/image.drv_usb_hid",
-        "init/job.drivers",
-        "init/pool.retention",
+        "init/image.srv_fs",
+        "init/job.services",
+        "init/pool.extra",
         "self/memory.pool",
-        "device/device.source.driver",
+        "init/object.file.root.0",
+        "init/lifetime.file.root.admin",
     ] {
-        assert_eq!(Source::parse(text).unwrap().to_string(), text);
+        assert_eq!(Source::parse(s).unwrap().to_string(), s);
     }
-    for bad in [
-        "init/clock",
-        "self/job",
-        "device",
-        "Init/x.y",
-        "init/image.Bad",
+    for s in [
+        "fs/file.root.0",
+        "init/object.",
+        "init/object.a..b",
+        "init/lifetime.bad/route",
     ] {
-        assert!(Source::parse(bad).is_none(), "{bad}");
+        assert!(Source::parse(s).is_none());
+    }
+    for s in ["a", "file.root.0", "file.root.admin"] {
+        assert!(valid_name(s));
+    }
+    for s in ["", "A", "a..b", "a.01", "a.1.b"] {
+        assert!(!valid_name(s));
     }
 }
 
 #[test]
-fn encoding_round_trips_and_rejects_corruption() {
-    let formation = system();
-    let bytes = formation.encode().unwrap();
-    assert_eq!(Formation::decode(&bytes).unwrap(), formation);
-    let mut trailing = bytes.clone();
-    trailing.push(0);
-    assert_eq!(
-        Formation::decode(&trailing),
-        Err(Error::Format("trailing bytes"))
-    );
-    for cut in 0..bytes.len() {
-        assert!(Formation::decode(&bytes[..cut]).is_err(), "cut {cut}");
-    }
-    let mut magic = bytes;
-    magic[0] ^= 1;
-    assert_eq!(Formation::decode(&magic), Err(Error::Format("bad magic")));
-}
-
-#[test]
-fn order_follows_dependencies_then_declaration() {
-    let formation = system();
-    formation.validate(images).unwrap();
-    let names: Vec<&str> = formation
-        .order()
-        .unwrap()
-        .into_iter()
-        .map(|i| formation.instances[i].name.as_str())
-        .collect();
-    assert_eq!(names, ["fs", "device", "driver"]);
-}
-
-#[test]
-fn static_validation_rejects_bad_compositions() {
-    let mut f = system();
-    f.instances[0].image = "srv_missing".into();
-    rejects(&f, "missing image");
-
-    let mut f = system();
-    f.instances[1].name = "driver".into();
-    rejects(&f, "duplicate instance");
-
-    let mut f = system();
-    f.instances[1].name = "init".into();
-    rejects(&f, "invalid instance name");
-
-    let mut f = system();
-    f.instances[0].inputs[1].source = Source::parse("device/device.source.other").unwrap();
-    rejects(&f, "undeclared export");
-
-    let mut f = system();
-    f.instances[0].inputs[1].rights = Some(SENDER | Rights::MANAGE);
-    rejects(&f, "route rights exceed the export");
-
-    let mut f = system();
-    f.instances[0].inputs[1].revoke = Source::parse("device/device.root.admin");
-    rejects(&f, "revoke must name <export>.admin of the provider");
-
-    let mut f = system();
-    f.instances[0].inputs.push(Input {
-        name: "instance.stop".into(),
-        source: Source::SelfPool,
-        rights: None,
-        revoke: None,
-    });
-    rejects(&f, "invalid input name");
-
-    let mut f = system();
-    f.instances[2].after = vec!["driver".into()];
-    rejects(&f, "instance dependency cycle");
-
-    let mut f = system();
-    f.jobs[0].parent = "drivers".into();
-    rejects(&f, "job parent cycle");
-
-    let mut f = system();
-    f.instances[1].stop_timeout_ms = 0;
-    rejects(&f, "resident instance requires both timeouts");
-
-    let mut f = system();
-    f.instances[1].pool.work_pages = u64::MAX;
-    rejects(&f, "budget sum overflows");
-
-    let mut f = system();
-    f.finish = Finish::Shutdown;
-    rejects(&f, "finish action requires at least one task");
-
-    let mut f = system();
-    f.instances[1].settings = vec![0];
-    rejects(&f, "invalid settings encoding");
-}
-
-#[test]
-fn kind_and_right_names_resolve() {
-    assert_eq!(
-        kind_by_name("mailbox_sender"),
-        Some(ObjectKind::MailboxSender as u32)
-    );
-    assert_eq!(
-        kind_name(ObjectKind::DmaMapping as u32),
-        Some("dma_mapping")
-    );
-    assert_eq!(kind_by_name("mailbox"), None);
-    assert_eq!(right_by_name("grant"), Some(Rights::GRANT));
-    assert_eq!(right_by_name("own"), None);
+fn expanded_platform_names_cannot_alias_ordinary_inputs() {
+    let mut f = formation();
+    f.instances[0]
+        .inputs
+        .push(input("platform", Source::PlatformRoot));
+    f.instances[0]
+        .inputs
+        .push(input("platform.0", object("entry")));
+    f.validate(|_| true).unwrap();
+    assert!(f.validate_grants(1).is_err());
+    let mut f = formation();
+    f.instances[0]
+        .inputs
+        .push(input(&"a".repeat(MAX_NAME), Source::PlatformRoot));
+    assert!(f.validate_grants(1).is_err());
 }

@@ -52,7 +52,6 @@ impl FileTask {
                     task.advance(state, requests, budget)
                 }
             }
-            Self::Release(task) => task.advance(world, requests, input),
             Self::Retire(task) => task.advance(world, requests, input, budget),
             Self::Dispatcher(task) => task.advance(world, requests, input, budget),
             Self::Ingress(_) | Self::Request(_) => unreachable!("file task entered extra dispatch"),
@@ -64,7 +63,6 @@ impl FileTask {
             Self::ServiceRoot(task) => task.registered(kind, source),
             Self::ServiceIngress(task) => task.registered(kind, source),
             Self::ServiceRequest(task) => task.registered(kind, source),
-            Self::Release(task) => task.registered(kind, source),
             Self::Retire(task) => task.registered(kind, source),
             Self::Dispatcher(task) => {
                 let rpc = world.rpc_mut();
@@ -89,7 +87,6 @@ impl FileTask {
                 kind,
                 source,
             ),
-            Self::Release(task) => task.unregistered(source),
             Self::Retire(task) => task.unregistered(source),
             Self::Dispatcher(task) => {
                 let rpc = world.rpc_mut();
@@ -129,12 +126,6 @@ impl FileTask {
                 }
             },
             Self::ServiceRequest(task) => task.refused(failure),
-            Self::Release(task) => {
-                if let RequestFailure::Source { kind, .. } = failure {
-                    task.refused(kind);
-                }
-                world.stop = true;
-            }
             Self::Retire(task) => {
                 if let RequestFailure::Source { kind, .. } = failure {
                     task.refused(kind);
@@ -159,7 +150,6 @@ impl FileTask {
             Self::ServiceRoot(task) => task.stop(),
             Self::ServiceIngress(task) => task.stop(),
             Self::ServiceRequest(task) => task.stop(),
-            Self::Release(task) => task.stop(),
             Self::Retire(task) => task.stop(),
             Self::Dispatcher(task) => task.stopping = true,
             Self::Maintenance(_) => {

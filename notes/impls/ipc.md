@@ -14,7 +14,11 @@ libkernel `Capability` 拥有合法非映射 entry，适用于叶对象和 affin
 
 ## Mailbox 与交付
 
-MailboxCreate 只交付 owner。MintSender 要求 owner MANAGE，原子创建独立 MailboxSender 和对应 LifetimeObserver。sender 的 KOID/badge 不可变，并强持目标队列；duplicate、once 派生和 move 保持该上下文。MessageHeader 的 PID 是来源信息，badge/context ID 是目标发送授权；内核生成，不由 payload 声明。
+[`MailboxCreate`/`MailboxMintSender`](../../shared/erhino_shared/src/call.rs) 都接收显式付款 Pool 选择。Create 的 a0/a1/a2 为 Pool、receiver rights、输出 Handle；MintSender 的 a0–a4 为 receiver、Pool、badge、sender rights、输出 SenderResult。真实 Pool 须具 CREATE，receiver 须具 MANAGE；两种输入均只借用、不消费。唯一便利选择 [`CURRENT_PROCESS_POOL`](../../shared/erhino_shared/src/object.rs) 为 raw=1、generation=0 的非 capability 值，明确选择当前进程绑定 Pool；INVALID 或任意其他无效 Handle 不作默认付款，也无失败 fallback。Create 只交付唯一 receiver-owner；MintSender 原子交付独立 MailboxSender 和对应 LifetimeObserver。sender 的 KOID/badge 不可变，并强持目标队列；duplicate、once 派生和 move 保持该上下文。MessageHeader 的 PID 是来源信息，badge/context ID 是目标发送授权；内核生成，不由 payload 声明。
+
+[`mailbox.rs::resolve_payer/create/mint_sender`](../../os/kernel/src/task/mailbox.rs) 先在对象来源锁外接受付款授权并取得真实 `Arc<MemoryPool>`。Create 将同一选定 Pool 贯穿 Core 的 Arc charge、固定队列、Receiver 壳和 Core WaitQueue 的维护账户；MintSender 将其独立选定 Pool 贯穿 Sender charge、Lifetime 存储及其 WaitQueue/维护账户，不从 Mailbox 继承付款者。本地 Handle 表与安装暂存继续由持有进程付款，Send 的消息/Delivery 仍按原发送规则收费。配对构造、表安装或用户写回失败沿原 owner 释放/退款；已接受资源强持原付款链，转授、提供方退出或付款 Pool Handle 关闭都不提前退款。最后 Receiver 关闭后，内核原有 Work 继续清队列；存储费用随实际引用消散归还，不把 Close/DONE 等同全部退款。
+
+[`libkernel::ipc::message`](../../user/libraries/libkernel/src/ipc/message.rs) 的 `Mailbox::create_in(pool, rights)` 与 `mint_in(pool, badge, rights)` 使用上述工厂；`create`/`mint` 只是以 CURRENT_PROCESS_POOL 选择同一 syscall。原始 `mint_sender` 同样委托 `mint_sender_in`，没有第二套无付款构造。
 
 唯一 MailboxReceiver 的 ObjectHeader 是 core header，不另铸造接收角色 KOID；Sender 的 related_id 因而对应 Receiver 的真实对象身份。Receiver/各发送对象的 Holders 与计数仍独立，core 不作为第二个 capability 对象公开。
 
@@ -33,6 +37,8 @@ Receive 接受非消费 READ 并持 BodyLease，core 的 receiving token 仲裁�
 libkernel `wait_message_until` 在 Busy/NotAvailable 后独立检查原 Deadline，并用同一期限等待 READABLE/CLOSED；满箱重试不重新计算期限。时钟换算和全部绝对期限边界的验证由 [时间任务](../../plans/archived/todo-2026-09-monotonic-time-rpc-deadline.md) 拥有。
 
 libkernel typed 运输层：`MailboxSender`/`SendOnce` 是投递目标的类型身份——铸造（`Mailbox::mint`/`send_once`）由内核保证 kind 不 Query，未知能力只在 `from_capability` 唯一转换边界 Query 一次（返回描述供一次性 rights 检查）。MakeSendOnce 输出完整 HandlePair；`send_once` 返回 ReplyPermit，分别持 typed SendOnce 与 ReplyObserver；`MintedSender.lifetime` 持 LifetimeObserver。三个公开 Observer 的数字 kind 保持 13/18/20，内部 Lifetime/LifetimeOwner/LifetimeUse 不改名。Notification 工厂返回 typed Owner/Signaler，Owner 提供 take/mint_observer、Signaler 提供 signal；未知能力唯一转换边界 Query 一次，observer 必须 WAIT，返回描述供领域额外授权检查。所有角色独占 Capability，无隐式 Clone，duplicate 经真实裁剪调用，close 失败完整返还 owner；显式 into_capability/into_raw 移交责任。安全层没有裸 Handle 的 Notification signal/take/observe 函数。Request 持观察权，Packet 运输回复权；发送后观察权移交 Sent owner。`Packet` 为消费式出站 owner：`try_send(self)`/`try_reply(self, once)` 成功即消费全部 transit owner 与回复授权，失败以 `SendFailure`/`ReplyFailure` 完整返还 Packet（与 send-once），没有 delivered tombstone；`Request`/`PreparedResponse` 以 take/restore 搬运完整 Packet 维持重试。`RequestContext::decode` 校验通过后才摘取槽位并构造 typed 回复授权；处理终结前 `delivery` 显式暴露。
+
+`MintedSender::from_capabilities(&Mailbox, sender, lifetime, required_sender_rights)` 对真实 receiver 和两个输入 Query，核对 MailboxReceiver/MailboxSender/LifetimeObserver kind、sender.related_object_id 等于 receiver.object_id、Lifetime.related_object_id 等于 sender.object_id；receiver 须有 READ，sender 须有 WRITE 及指定运输权利，Lifetime 须有 WAIT。失败的 `MintedSenderAdoptFailure` 完整返还两个 Capability owner；成功才转为 typed pair。`MintedSender::validate` 对已组成 pair 做同一借用校验并返回 sender 描述，供领域取得真实 context/badge，失败不改变 owner。此边界不证明业务角色、账户绑定或 context 尚未登记；重复 context、来源登记和开放 Receive 的先后由领域采用者拥有。
 
 ## 通知与等待
 

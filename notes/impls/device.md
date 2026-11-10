@@ -50,6 +50,10 @@ Shared Binding 活动期从 Registry/Seat 查询占用，释放后只保留原 R
 
 [`server`](../../user/services/srv_device/src/server.rs) 的 World 独占 mailbox、Registry、角色表和 Dispatcher；任务族包含 ingress、原请求、根来源、运输、维护和平台任务。ingress 收到消息后使用 RequestContext 的 sender_context_id 查角色与付款，经 TaskSubmission 准入后才推进业务。输入 Vec 移到请求 owner，不额外复制正文。Outbox 在提交前准入，回复完成后归还消息费用；长期来源、登记和绑定 owner 留在原任务。
 
+[`main`](../../user/services/srv_device/src/main.rs) 先采用完整 Namespace 和 `device.receiver`，再按 `settings.sources` 的声明顺序采用第 N 项 `device.source.N`、`device.source_lifetime.N`、`device.admin.N`、`device.admin_lifetime.N`。每项仍以 name/scope/access 设定领域范围；name 是标签，不推导输入名或终局协议。完整 sender/Lifetime 配对由 libkernel 核真实 receiver 及两级 related ID，全部 use/admin context 在进入运行体前排除重复；领取平台输入后执行 Birth::finish，拒绝未采用输入。Namespace 在整个宿主生命期持有，仅提供前缀路由，不承诺 `/` 枚举聚合其他绑定点。
+
+服务使用采用的 receiver 建 Registry incarnation，先建立业务/管理 Funding，再内部 mint 私有 root 与平台 Provision。root 两份 Lifetime 实际登记且表项安装后，静态来源复用 Source::prepare_minted 和原 Source owner 逐项准入；所有静态来源的 Lifetime 来源与授权表都安装后才创建 Ingress。身份凭据 sender 随安装释放，不人为保活外部来源。该本地门不等待平台登记或远端业务响应；早到消息此前留在真实 Mailbox 队列，Scope Watch 可先观察空树，随后观察平台增量。根由服务自持，不对外交付；运行期 IssueSource、子 Registrar 与原 Lifetime/封口/退休责任保持同一机制。
+
 [`request`](../../user/services/srv_device/src/server/request.rs) 将原请求转为来源、登记、Binding、Use 或 Watch owner。Use 可查询、观察、Get；仅冻结了报告权的 Use 可提交自身静止，不能发行子角色或停止 Binding。首次 Use 的 Lifetime owner 留在原请求，母本移交 Binding；子来源的并发候选在 actor 提交点恢复已提交的原对子，不另登记来源。控制入口与实际操作权共同决定控制预留，payload opcode 不授予权限。Lifetime 的 authority/use 双零覆盖外部别名和已接 Delivery。
 
 BindingControl/Use 的 OAL 根由 [`resource/oal`](../../user/libraries/libdevice/src/resource/oal.rs) 直接投影原 Frozen，按名字逐项分页。ObjectInfo 只给原 BindingRef 和既有 Descriptor，零 cap、无 Boundary；领域 opaque metadata 仍随显式 Get 配对。游标在同一原轮中以冻结项索引恢复最后交付名字，不保存会话或目录副本；旧轮游标拒绝。根与叶的编码布局决定唯一资源名上界，Entry 准入共用该值。Preparing 返回 Busy，停止/释放拒新读取为 Revoked；观察失败不产生 Released。只读投影不触 resources_exposed，实际能力仍只走原 Binding::resource。
@@ -60,13 +64,7 @@ BindingControl/Use 的 OAL 根由 [`resource/oal`](../../user/libraries/libdevic
 
 ## init 的管理者监督
 
-不可恢复的来源/运输或绑定安全故障使管理进程显式失败。init 的 [`supervision`](../../user/services/srv_init/src/supervision.rs) 在 RootSupervisor 的同一 Assembly 上按部署预付本地 InstanceTask（设备两项，文件另计）。每个任务观察 World 中对应的 Record；记录通过 ProcessOwner 独占未启动 PreparedProcess 或运行期 ProcessControl，并持真实 SourceAdmin、停止期限与 DONE 快照。DONE 来源实际附着之后才消费 Start。srv_driver 的 SourceAdmin 在准备进程之前移入，srv_device 的根 admin 在认证私有 bootstrap 后移入。Job/Pool 的关闭权继续由 root 原能力账本持有，领域装配记录只借用其 handle。
-
-init 的组态执行器在实例装载步骤之间消费已经登记的 DONE/报告观察，并在常驻阶段通过同一 WaitSet 等待。设备与驱动作为 resident 按统一出生、Ready/Stopped 和撤销契约接入；具体持有与停止边界由[启动实现](startup.md#init-的组态装配与根监督)拥有。
-
-正常停止在第一个可使管理者退出的请求之前提交原实例意图和绝对期限。SourceAdmin 的 QuerySourceStop 确认 Closed 后，由同一 root 直接关闭原 admin；DONE 必须核验 Completed/无异常 detail，先到时保留快照等来源证明。两项事实齐全后实际注销 DONE 来源，将原 Control 交原 Collector，再关闭对应 Job/Pool。全部管理任务退休后关闭其 Runtime 和终局预备资源，不存在 release_admin/disarm/ACK/join 握手。
-
-故障由同一个 root 不可逆进入终局：先封 services Job，向仍可响应的原 SourceAdmin 有界 Seal，封真实平台根，使用原 JobCollector 枚举/停止受影响执行。总升级界约束实际 wait，但不伪造原观察请求提前超时；到界或不可继续时保留未完成事实，提交 Reboot/SystemFailure（内核 ColdReboot），reset 拒绝则终止整个 init，由 boot 的 DONE 观察停驻。该路径不等待全部 Pool 退款或 Job DONE，也不返回业务脚本。进程失败、JobSeal、Kill 提交或 reset 都不证明 DMA 静止；平台根与内核保留责任继续按各自合同存活。
+两个宿主不再领取 `instance.report`/`instance.stop`，也不发送 Export、Ready 或 Stopped。不可恢复的来源、运输或绑定安全故障使管理进程显式失败；根监督与故障终局的实际装配由[启动实现](startup.md#init-的组态装配与根监督)拥有。device 的既有通用 revoke 协议仍只接受真实 SourceAdmin context，不由输入名后缀授予协议或权限。进程退出、Job 封口和 Kill 都不证明硬件或 DMA 静止，实际 Binding/供应/平台根继续按各自安全合同收束；当前宿主没有正常系统关机操作。
 
 ## srv_driver 的选择与进程管理
 
@@ -76,13 +74,13 @@ Managed 的 reconcile 在领取 RPC 前后消费观察事实与单调停止意�
 
 运行实例统一使用libdriver::view::InstanceId=(Control Mailbox incarnation,出生前checked serial)，原Run与ProcessRecord共用同一身份，PID/路径不授予权限。Drivers视图直接读取原processes/runs，按名弱一致分页，实例下的bindings给原BindingRef及实际阶段/Released观察；无目录副本或读者会话。Control与只读Observer由两个真实Mailbox/认证context承载，仍在同一World/Runtime内使用原Ingress/Request/Outbox；公开队列满不占Control队列。总请求事实outstanding_requests给认证Control保留两席，原任务/来源和两个Ingress存储按配置预付。公开回复占用界为min(原调用期限,5s服务界)，wire回原期限，零cap且无Boundary；Native Once运输由发行者Pool付款，服务用户态请求/回复缓冲仍由服务总请求预算承担。
 
-boot Ready精确交两sender槽及各自Mailbox KOID，init核实际kind/rights/context后保Control并只委托Observer；具体worker原单slot boot不变。原Manager首次停止唤醒公开Ingress，实际注销来源后关公开Mailbox，关闭失败保留owner；旧回复由原Outbox期限/来源收尾，不等外部Observer别名消失。观察错误/成员NotFound只表示弱一致视图中该关联不可见，不证明硬件Released。
+[`main`](../../user/services/srv_driver/src/main.rs) 采用 Namespace、`driver.control.receiver/sender/lifetime` 和 `driver.observer.receiver/sender/lifetime`，沿 libkernel 完整 pair 采用器核真实身份，另拒绝同 receiver 或同 context 的双角色。`device.source`、worker Job、映像及 Catalog declarations 仍由出生输入和设定给出。World 先保存两个认证 context、真实队列及 Funding，再显式关闭没有业务消费者的两份 Lifetime 和本地身份 sender，随后创建两个 Ingress。关闭 Lifetime 只释放观察 owner，不附加“最后客户端关闭则停止管理器”语义；普通 Namespace 只获得公开 observer，不能因路径取得 control。
+
+Manager 建立 device Scope Watch、有限扫描与被动入站并发推进，不向 init 导出入口或报告就绪。具体 worker 的私有 BOOT_READY 协议及其原单 slot 核验保留。原 Manager 观察设备来源封口后首次停止唤醒公开 Ingress，实际注销来源后关公开 Mailbox，关闭失败保留 owner；旧回复由原 Outbox 期限/来源收尾，不等外部 Observer 别名消失。观察错误/成员 NotFound 只表示弱一致视图中该关联不可见，不证明硬件 Released。
 
 驱动选择使用同一Catalog的严格降优先级游标，Run保存当前implementation及首个导致停止的失败原因，不保存候选集合。真正Released且已Detach的失败Run才可自动尝试下一唯一候选；同级歧义拒绝，Quota/Resource/Busy/NotReady或未提交Claim的终态等待显式政策，不因普通Watch变化重试。正常停止不产生自动fallback原因。Manager重新读取当前DeviceInfo并以最新epoch建立下一Managed，保留原Run直到原任务/调用/订阅/进程关联退场。
 
 Manager 先兑现停止意图，再消费发现 RPC。停止后取消原 txid 并等待真实运输退休，迟到结果只释放；尚未收到 Scope Watch 撤销时，形状合法的 Enumerate Closed 同样进入单调停止。通知来源注销后释放 Scope Watch，Managed 继续从原 Binding Watch 的完整快照确认 Released，不把运输错误当成硬件完成。
-
-init的显式并发Retry消费者仍复用同一编解码/发送/采用函数：主线原Control经root调用，一份WRITE|WAIT别名由独立Caller线程使用；新线程不持RootSupervisor或管理记录。主线通过原Assembly等待线程DONE，再try_join/reap，数量只作辅助检查。只读取证从同一ResultReceiver的Tid/control关联原registry唯一Live槽及stack owner，join/reap后核仍存活registry内同槽为Free；不再解引用已退的control/stack。每次RPC各发一次，Unknown不重发；是否实际命中迟到提交由只读原Request/Run取证决定，不以客户端一成一败代替。
 
 Control的Retry(DeviceId)是非幂等本地选择重置，仍由原Request/Outbox持一次Dispatcher只读Query及原Run/ref/implementation；提交前复核同一记录已Terminal/task=0且无关联、设备取样仍present/无活绑定、本World未Stopping。成功只清纯选择记录，不保证远端来源仍开放或新激活成功；原Claim提交点才是授权门。Outbox先终结时取消原Query，等其实际注销后才退休请求。最坏管理查询数纳入CALLS原配置及来源预付，不另建Retry队列/历史账本。
 

@@ -1,13 +1,10 @@
-//! 实例设定：设备管理者在 Ready 前签发的预限定来源。
+//! 实例设定：静态来源输入对应的领域权限。
 //!
-//! `sources` 为表列表，每项 `name`（单段小写名）、`scope`（当前只接受 `"root"`）与
-//! `access`（libdevice `Access` 位名列表）。每项导出 `device.source.<name>` 与其管理端
-//! `device.source.<name>.admin`。
+//! `sources` 为有序表列表，每项 `name`（单段小写名）、`scope`（当前只接受 `"root"`）与
+//! `access`（libdevice `Access` 位名列表）。第 N 项采用同序号的 source/admin 及 Lifetime；
+//! name 是设定标签，不用于推导输入名或终局协议。
 use alloc::vec::Vec;
 use libdevice::registry::{Access, Scope};
-
-/// 预限定来源的导出名前缀。
-pub const SOURCE_EXPORT: &str = "device.source";
 
 const ACCESS_NAMES: [(&str, Access); 7] = [
     ("observe", Access::OBSERVE),

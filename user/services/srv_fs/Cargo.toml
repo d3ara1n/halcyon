@@ -22,3 +22,6 @@ ordered_table = { path = "../../../shared/ordered_table" }
 metadata_admission = { path = "../../../shared/metadata_admission" }
 settings = { path = "../../../shared/settings" }
 libprocess = { path = "../../libraries/libprocess" }
+
+[dev-dependencies]
+settings = { path = "../../../shared/settings", features = ["encode"] }

@@ -115,17 +115,27 @@ Preparation 首次失败后冻结状态，重复 advance 返回同一错误。�
 
 ## init 的组态装配与根监督
 
-[`srv_init::executor`](../../user/services/srv_init/src/executor.rs) 从 initfs 根的 `formation` 读取二进制组态，按 `image/<组件>` 核引用映像，完整校验后才创建实例。`shared/formation` 拥有组态、引用、拓扑及 host 编译器；源 TOML 按序深合并，构建前的 `--list` 和正式编码使用同一解析与校验。内核只交付 BootPackage 和初始 authority，不解释服务名单。
+[`shared/formation`](../../shared/formation/src/lib.rs) 拥有 v2 组态模型、二进制编码、资源/付款/引用校验；其 host 编译器按序深合并源 TOML，`--list` 与实际打包使用同一解析器。组态描述持续服务，没有 finish、task、动态 Export、业务启动依赖或就绪/正常停止报告。内核只交付 BootPackage 和初始 authority，不解释服务名单。
 
-`user/formations/system.toml` 声明设备管理者、驱动管理者、文件/registry 宿主及按需驱动映像。`finish=stay` 持续监督，不因空闲退出。有限组态用 `finish=shutdown`，等待所有 task 正常完成后停止 resident。task 的 `after` 依赖要求其 DONE，resident 依赖由拓扑与 Ready 导出满足。
+[`srv_init::executor::load`](../../user/services/srv_init/src/executor.rs) 在创建服务 Job 之前解码、校验所有引用及实际平台根展开数，为每实例编码真实出生表、settings 和 Namespace 描述，并验证 ELF。实例 Pool 包括映像 load runs、主栈、实际 StartupBlock 页数及工作集；metadata 独立换算成槽，合计与根 Pool 可用额度比较。出生几何由 [`compact_block_len`](../../shared/erhino_shared/src/startup.rs) 唯一推导，公共 Preparation 同样使用，不把长设定或 Namespace 描述误算成一页。
 
-Executor 持具名 Pool/Job、映像 owner、实例 Record 和路由。实例 Pool 的页数包括 ELF load runs、主栈、出生页与组态 `work_pages`，metadata 按槽换算。实例经 `libprocess::birth` 收命名输入和 settings，经 `libservice::instance` 报告命名导出、Ready/Stopped；init 按真实 PID/context、声明名字、种类与权利验证报告。报告 sender、停止 owner 和普通输入的源能力持有 GRANT，供 ProcessGrant 转授；目标权利仍衰减为生命周期契约或组态声明，服务不额外取得 GRANT。Control、报告 receiver、停止 signaler、导出及等待登记由同一实例 Record 持有，准备/出生失败仍按 Preparation 和 GrantOutcome 处理。
+Executor 先派生全部具名/实例 Pool，建立 Job，再按声明的 payer 预建所有 Mailbox，最后铸造各 Sender/Lifetime。Mailbox receiver 只持一个施工 owner，sender 主输出可按同一真实身份复制，Lifetime 是独立输出。各工厂的选定 Pool 直接支付对象及持久派生存储；能力转授不迁费。init 自有共享 Image 缓存、输入拷贝及装载暂存继续由自身付款。付款工厂和运输寿命见 [IPC 实现](ipc.md)。
 
-### 停止与终局
+实例按确定序逐个经原 Preparation 构造和 ProcessStart，不等待其他服务 Ready；彼此引用 sender 不产生启动排序。receiver/Lifetime 输入 move，普通 sender 输入和 Namespace binding 使用缩权别名；只有施工源保留所需 GRANT，目标按声明接收。借用 grants 的所有退出边，包括中途观察到另一服务 DONE，均按 Preparation 的 GrantOutcome 兑现消费事实，不能在消费后再次关闭源 handle。所有进程 Start 前均在同一 WaitSet 登记 DONE；装载/拷贝的有界步之间同时消费已发布进程的观察。发布完成后丢弃普通施工 sender 和未交付的 Lifetime，不保留多余 receiver；仅明确声明终局角色的 sender 持续由 init 持有。
 
-[`Executor::stop_all`](../../user/services/srv_init/src/executor.rs) 按实际启动序逆序处理：resident 先丢弃 init 持有的导出，再 signal Stop，等待 Stopped 和正常 DONE；随后处理该消费者的可撤销输入路由。撤销用原 provider 的管理导出，核真实回复 PID，沿 REVOKE/QUERY 等 Closed 后才允许继续停止提供方。各阶段使用组态的启动/停止期限，异常或超时交统一系统终局。
+### 出生与初始 Namespace
 
-[`terminal`](../../user/services/srv_init/src/terminal.rs) 持 services、平台根与 reset 的借用和管理端集合，封 services、请求来源撤销、封平台根并有界收集，最后提交系统失败复位。正常链在所有实例收束后提交 Requested reset；reset 拒绝时终止 init，由内核原 DONE 观察者承担停驻。正式 init 不链接验收 crate，也不包含 FS/设备专用测试编排。
+[`libprocess::birth`](../../user/libraries/libprocess/src/birth.rs) 的 v2 帧包含独立的命名 capability 表、settings 及 named data sections。输入和 section 各按名字规范排序；Birth 按真实 kind/rights 采用能力，data section 一次领取，finish 拒绝任何未采用项。它不解释 OAL 或领域政策。
+
+[`shared/oal`](../../shared/oal/src/lib.rs) 拥有规范路径规则与 Namespace birth 描述。描述只关联绝对 prefix 和命名输入，不保存 PID、裸 handle 或组态 Source。init 将 `Instance.namespace` 解析为 `oal.entry.N` 输入和 `oal.namespace` section；[`liboal::Namespace::adopt_birth`](../../user/libraries/liboal/src/namespace.rs) 验证并采用真实 sender，建立调用方本地完整绑定。没有可变占位 backing，也不要求客户发现后再拼接初始系统视图。
+
+[`system.toml`](../../user/formations/system.toml) 为 device、driver、fs 分别交付 `/`、`/services`、`/devices`、`/drivers` 四项初始前缀；设备观察来源与 driver 的 claim 来源独立，控制端、发布根和来源 admin 不混入普通视图。前缀绑定不合成文件根的目录项，所以 `/` provider 的枚举不自动列出其他绑定点。各宿主在本地权限/Funding 与 Lifetime 观察实际安装后才开始读取早到请求；init 不观察该本地采用门，不因此推导业务可用。
+
+### 根监督与故障终局
+
+Executor 的持续监督没有正常完成结果；任一基础实例出现 Dead 都进入系统失败，不将 Completed 解释成部署完成。没有 init 的正常关机/重启操作或反启动序停止链。已有设备 Binding/硬件静止与运行期服务注册/撤出仍由其领域契约负责。
+
+[`terminal`](../../user/services/srv_init/src/terminal.rs) 持 services、平台根与 reset 的借用及静态撤销入口。只有资源显式声明 `terminal_revoke` 才委托该协议给故障终局；资源引用名或后缀不产生协议身份/权限。终局封 services、在同一有界期限内 best-effort 请求撤销、封平台根、有界收集后提交 SystemFailure 冷重启。不等待撤销 Closed，不将 DONE 当作硬件静止；内核仍独立保留活 DMA。复位拒绝后终止 init，由既有 initial DONE 保护承担停驻。不包含恢复、重试、救援或正式验收进程编排。
 
 ## 验证入口与边界
 

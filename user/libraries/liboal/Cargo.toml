@@ -6,6 +6,8 @@ description = "Object Abstraction Layer: directory discovery and boundary expres
 edition = "2024"
 
 [dependencies]
+oal = { path = "../../../shared/oal" }
+libprocess = { path = "../libprocess" }
 librpc = { path = "../librpc" }
 erhino_shared = { path = "../../../shared/erhino_shared" }
 libkernel = { path = "../libkernel" }

@@ -9,17 +9,7 @@ mod executor;
 mod platform;
 mod terminal;
 
-use formation::Finish;
-use libkernel::{
-    debug,
-    ipc::capability::Capability,
-    process,
-    shared::{
-        reset::{ResetAction, ResetReason},
-        startup::initial,
-    },
-    system,
-};
+use libkernel::{debug, ipc::capability::Capability, process, shared::startup::initial};
 
 fn take(grants: &mut libprocess::context::InitialGrants, slot: usize, what: &str) -> Capability {
     grants
@@ -43,7 +33,7 @@ fn main() {
     let root_pool = take(&mut grants, initial::ROOT_MEMORY_POOL, "root MemoryPool");
     let archive = payload.as_static_bytes();
     // 组态在任何进程出生前完整校验；失败时尚无服务责任，直接退出交 boot 观察。
-    let formation = match executor::load(archive) {
+    let formation = match executor::load(archive, &platform, root_pool.as_handle()) {
         Ok(formation) => formation,
         Err(reason) => {
             debug!("init formation rejected: {}", reason);
@@ -61,28 +51,19 @@ fn main() {
         &platform,
     )
     .unwrap_or_else(|reason| fail(&services, &reset, &platform, &[], reason));
-    let result = executor
-        .start_all()
-        .and_then(|()| executor.supervise())
-        .and_then(|()| executor.stop_all());
+    let result = executor.start_all().and_then(|()| executor.supervise());
     if let Err(reason) = result {
         let admins = executor.admins();
         fail(&services, &reset, &platform, &admins, reason);
     }
-    let action = match executor.finish() {
-        Finish::Shutdown => ResetAction::Shutdown,
-        Finish::Reboot => ResetAction::Reboot,
-        Finish::Stay => unreachable!("a staying formation never finishes supervision"),
-    };
-    debug!("init: formation complete, submitting {:?}", action);
-    match system::reset(reset.as_handle(), action, ResetReason::Requested) {
-        Ok(never) => match never {},
-        Err(error) => {
-            debug!("system reset failed: {:?}", error);
-            // SAFETY: reset 失败是不可恢复终局；内核稳定持 DMA 责任，boot 观察 init DONE。
-            unsafe { libkernel::sys_process_terminate() }
-        }
-    }
+    // 持续服务的根监督没有正常完成结果；仅系统故障或受授权电源操作结束它。
+    fail(
+        &services,
+        &reset,
+        &platform,
+        &[],
+        "root supervision unexpectedly returned",
+    );
 }
 
 fn owned_job(
@@ -99,7 +80,7 @@ fn fail(
     services: &Capability,
     reset: &Capability,
     platform: &platform::Platform,
-    admins: &[&Capability],
+    admins: &[erhino_shared::object::Handle],
     reason: &str,
 ) -> ! {
     terminal::run(
@@ -107,7 +88,7 @@ fn fail(
             services: services.as_handle(),
             reset: reset.as_handle(),
             platform,
-            admins: admins.to_vec(),
+            admins,
         },
         reason,
     )

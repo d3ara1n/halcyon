@@ -25,7 +25,7 @@ use erhino_shared::{
         HandleMove, MAILBOX_CAPACITY, MESSAGE_HANDLE_MAX, MailboxBadge, MessageHeader, PAYLOAD_MAX,
         SendHeader,
     },
-    object::{Handle, HandlePair, ObjectSignals, Rights, SenderResult},
+    object::{CURRENT_PROCESS_POOL, Handle, HandlePair, ObjectSignals, Rights, SenderResult},
 };
 
 use crate::{
@@ -743,14 +743,24 @@ fn receiver_core(
     Ok((invocation, core))
 }
 
+/// 在任何对象来源锁外接受付款选择；真实 Pool 授权只借用，不消费。
+fn resolve_payer(thread: &Thread, selected: Handle) -> Result<Arc<MemoryPool>, SystemCallError> {
+    if selected == CURRENT_PROCESS_POOL {
+        return Ok(thread.process.funding_pool());
+    }
+    let authority = Authorization::accept(thread, selected, Rights::CREATE)?;
+    MemoryPool::concrete(authority.object())
+}
+
 pub fn create(
     thread: &Thread,
+    payer: Handle,
     receiver_rights: Rights,
     output: usize,
 ) -> Result<(), SystemCallError> {
-    let core = MailboxCore::new(thread.process.funding_pool())?;
-    let metadata =
-        super::resources::MetadataCharge::arc::<MailboxReceiver>(&thread.process.funding_pool())?;
+    let pool = resolve_payer(thread, payer)?;
+    let core = MailboxCore::new(pool.clone())?;
+    let metadata = super::resources::MetadataCharge::arc::<MailboxReceiver>(&pool)?;
     let receiver: ObjectRef = Arc::try_new(MailboxReceiver {
         holders: capability::Holders::new(capability::ZeroPolicy::Terminal),
         core,
@@ -771,10 +781,12 @@ pub fn create(
 pub fn mint_sender(
     thread: &Thread,
     receiver: Handle,
+    payer: Handle,
     badge: MailboxBadge,
     rights: Rights,
     output: usize,
 ) -> Result<(), SystemCallError> {
+    let pool = resolve_payer(thread, payer)?;
     let authority = Authorization::accept(thread, receiver, Rights::MANAGE)?;
     let receiver = authority
         .object()
@@ -783,9 +795,8 @@ pub fn mint_sender(
         .ok_or(SystemCallError::WrongObjectType)?;
     let core = receiver.core.clone();
     let header = ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?;
-    let (lifetime, observer) = LifetimeOwner::new(header.koid(), thread.process.funding_pool())?;
-    let metadata =
-        super::resources::MetadataCharge::arc::<MailboxSender>(&thread.process.funding_pool())?;
+    let (lifetime, observer) = LifetimeOwner::new(header.koid(), pool.clone())?;
+    let metadata = super::resources::MetadataCharge::arc::<MailboxSender>(&pool)?;
     let sender: ObjectRef = Arc::try_new(MailboxSender {
         holders: capability::Holders::new(capability::ZeroPolicy::Terminal),
         header,

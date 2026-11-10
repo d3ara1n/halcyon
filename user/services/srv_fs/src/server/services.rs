@@ -22,9 +22,6 @@ pub(super) struct Ingress {
     _bytes: Charge,
 }
 impl Ingress {
-    pub fn admitted(&self) -> bool {
-        self.source.source().is_some()
-    }
     pub fn new(state: &libservice::provider::State) -> Result<Self, SystemCallError> {
         Ok(Self {
             source: SourceRegistration::new(),

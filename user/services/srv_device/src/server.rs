@@ -25,12 +25,13 @@ use libexecution::{
 };
 use libkernel::ipc::{
     capability::Capability,
-    message::{LifetimeObserver, Mailbox, MailboxSender, MessageStorage, ReceiveBuffer},
+    message::{
+        LifetimeObserver, Mailbox, MailboxSender, MessageStorage, MintedSender, ReceiveBuffer,
+    },
     object,
     wait_set::WaitSet,
 };
 use librpc::dispatcher::Dispatcher;
-use libservice::instance::{self, child::Reporter};
 use ordered_table::{OrderedTable, PreparedEntry};
 mod platform;
 mod request;
@@ -54,20 +55,16 @@ const REQUEST_SOURCES: usize = 3;
 const CONTROL_SOURCES: usize = 1;
 const INGRESS_SOURCES: usize = 2;
 const ROOT_SOURCES: usize = 2;
-const STOP_SOURCES: usize = 1;
-const STOP_KIND: u64 = 1;
 const RPC_CALLS: usize = BINDINGS + 1;
 const RPC_SOURCES: usize = match Dispatcher::source_capacity(RPC_CALLS) {
     Ok(count) => count,
     Err(_) => panic!("device RPC capacity overflow"),
 };
-const BUSINESS_TASKS: usize = 5 + SOURCES + DEVICES + BINDINGS + USES + WATCHES + REQUESTS;
+// 固定任务为 Ingress、Transport、Maintenance、Platform；来源已单列于 SOURCES。
+const BUSINESS_TASKS: usize = 4 + SOURCES + DEVICES + BINDINGS + USES + WATCHES + REQUESTS;
 const TASKS: usize = BUSINESS_TASKS + CONTROL_REQUESTS;
-const BUSINESS_SOURCES: usize = REQUEST_SOURCES * (BUSINESS_TASKS - 4)
-    + INGRESS_SOURCES
-    + ROOT_SOURCES
-    + RPC_SOURCES
-    + STOP_SOURCES;
+const BUSINESS_SOURCES: usize =
+    REQUEST_SOURCES * (BUSINESS_TASKS - 3) + INGRESS_SOURCES + ROOT_SOURCES + RPC_SOURCES;
 const WAIT_SOURCES: usize = BUSINESS_SOURCES + CONTROL_REQUESTS * CONTROL_SOURCES;
 const ROLES: usize = DEVICES + BINDINGS + USES + WATCHES;
 const POLICY: binding_work::Policy = binding_work::Policy {
@@ -183,11 +180,7 @@ pub(super) struct World {
     transport_task: u64,
     maintenance_task: u64,
     dirty: bool,
-    finished: bool,
-    /// 监督方经 `instance.stop` 请求停止。
-    stop_requested: bool,
     platform: Option<platform::Adapter>,
-    platform_ready: bool,
     platform_task: u64,
     root_task: u64,
 }
@@ -261,51 +254,6 @@ enum Family {
     Transport(Transport),
     Maintenance(Maintenance),
     Platform(platform::PlatformTask),
-    Stop(StopWatch),
-}
-
-/// 观察 `instance.stop`：监督方 signal 或其消失都置停止请求。
-pub(super) struct StopWatch {
-    owner: Capability,
-    source: SourceRegistration,
-    stopping: bool,
-}
-impl StopWatch {
-    fn new(owner: Capability) -> Self {
-        Self {
-            owner,
-            source: SourceRegistration::new(),
-            stopping: false,
-        }
-    }
-    fn advance(
-        &mut self,
-        world: &mut World,
-        requests: &mut Requests<'_, Family>,
-        input: &mut Input<'_>,
-    ) -> Result<Advance, SystemCallError> {
-        while let Some(event) = input.pull() {
-            if event.kind == STOP_KIND && event.observed.intersects(instance::STOP_SIGNALS) {
-                world.stop_requested = true;
-            }
-        }
-        if self.stopping || world.stop_requested {
-            self.source.remove(requests)?;
-            return Ok(step(if self.source.is_empty() {
-                Step::Complete
-            } else {
-                Step::Runnable
-            }));
-        }
-        if self.source.is_empty() {
-            self.source.install(
-                requests,
-                SourcePlan::new(self.owner.as_handle(), instance::STOP_SIGNALS),
-                STOP_KIND,
-            )?;
-        }
-        Ok(step(Step::Parked))
-    }
 }
 
 impl Task<World> for Family {
@@ -332,7 +280,6 @@ impl Task<World> for Family {
             }
             Self::Maintenance(task) => task.advance(world, requests, input),
             Self::Platform(task) => task.advance(id, world, requests, input),
-            Self::Stop(task) => task.advance(world, requests, input),
         }
     }
     fn registered(&mut self, world: &mut World, kind: u64, id: SourceId) {
@@ -349,7 +296,6 @@ impl Task<World> for Family {
             Self::Transport(_) => world.rpc.registered(&mut (), kind, id),
             Self::Maintenance(_) => {}
             Self::Platform(task) => task.registered(kind, id),
-            Self::Stop(task) => task.source.registered(kind, id),
         }
     }
     fn unregistered(&mut self, world: &mut World, kind: u64, id: SourceId) {
@@ -366,9 +312,6 @@ impl Task<World> for Family {
             Self::Transport(_) => world.rpc.unregistered(&mut (), kind, id),
             Self::Maintenance(_) => {}
             Self::Platform(task) => task.unregistered(id),
-            Self::Stop(task) => {
-                task.source.unregistered(id);
-            }
         }
     }
     fn refused(&mut self, world: &mut World, failure: RequestFailure<Self>) {
@@ -420,7 +363,6 @@ impl Task<World> for Family {
             Self::Request(task) => task.stop(world),
             Self::Source(task) => task.stop(world),
             Self::Platform(task) => task.stop(),
-            Self::Stop(task) => task.stopping = true,
         }
     }
     fn deadline(&self) -> Deadline {
@@ -433,7 +375,7 @@ impl Task<World> for Family {
                 .as_ref()
                 .map_or(Deadline::INFINITE, |r| r.deadline()),
             Self::Maintenance(_) => Deadline::INFINITE,
-            Self::Platform(_) | Self::Stop(_) => Deadline::INFINITE,
+            Self::Platform(_) => Deadline::INFINITE,
         }
     }
 }
@@ -629,24 +571,25 @@ impl Ingress {
 
 /// 出生采用后的服务输入。
 pub(super) struct Startup {
-    pub reporter: Reporter,
-    pub stop: Capability,
+    pub namespace: liboal::Namespace,
+    pub mailbox: Mailbox,
+    pub sources: alloc::vec::Vec<SourcePair>,
     pub pool: Capability,
     pub platform: libpci::platform::Platform,
     pub config: crate::config::Config,
 }
 
-/// 根提交后预签发设定声明的来源，全部提交后导出并报 Ready。
-enum Publication {
-    Root,
-    Issuing,
-    Ready,
+/// 同一来源的 use/admin 配对；静态输入和内部 mint 共用原 Source owner。
+pub(super) struct SourcePair {
+    pub source: MintedSender,
+    pub admin: MintedSender,
 }
 
 pub(super) fn run(startup: Startup) {
     let Startup {
-        mut reporter,
-        stop,
+        namespace: _namespace,
+        mailbox,
+        sources,
         pool: _pool,
         platform,
         config,
@@ -725,8 +668,6 @@ pub(super) fn run(startup: Startup) {
             .expect("device control execution funding invalid"),
     )
     .expect("device control funding mismatch");
-    let mailbox = Mailbox::create(Rights::READ | Rights::WAIT | Rights::MANAGE)
-        .expect("device mailbox failed");
     let incarnation = object::query(mailbox.as_handle())
         .expect("device mailbox description failed")
         .object_id;
@@ -749,10 +690,7 @@ pub(super) fn run(startup: Startup) {
         transport_task: 0,
         maintenance_task: 0,
         dirty: false,
-        finished: false,
-        stop_requested: false,
         platform: None,
-        platform_ready: false,
         platform_task: 0,
         root_task: 0,
     };
@@ -794,11 +732,6 @@ pub(super) fn run(startup: Startup) {
         }),
         0,
     );
-    spawn(
-        &mut runtime,
-        Family::Ingress(Ingress::new(&funding).expect("device ingress failed")),
-        INGRESS_SOURCES,
-    );
     let root = Source::root(&world).unwrap_or_else(|error| fatal(error));
     let provider = world
         .mailbox
@@ -824,51 +757,24 @@ pub(super) fn run(startup: Startup) {
             .unwrap_or_else(|error| fatal(error)),
         )
     } else {
-        world.platform_ready = true;
         None
     };
     world.platform = Some(adapter);
     world.root_task = spawn(&mut runtime, Family::Source(root), ROOT_SOURCES);
-    spawn(
-        &mut runtime,
-        Family::Stop(StopWatch::new(stop)),
-        STOP_SOURCES,
-    );
-    let mut publication = Publication::Root;
-    let mut prescoped: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-    prescoped
+    let mut sources = Some(sources);
+    let mut adopting: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    adopting
         .try_reserve_exact(config.sources.len())
-        .expect("device pre-scoped task storage failed");
+        .expect("device static source storage failed");
+    let mut ingress_started = false;
     if let Some(task) = platform_task {
         world.platform_task = spawn(&mut runtime, Family::Platform(task), 1);
     }
-    let mut stopping = false;
-    let mut releasing = false;
     loop {
         for &record in assembly.receive(64).expect("device receive sources failed") {
             runtime.feed(record);
         }
-        if world.stop_requested && !releasing {
-            // 封根并交还自持的发送端；根在子来源全部退休后退休并置 finished。
-            for task in core::iter::once(world.root_task).chain(prescoped.iter().copied()) {
-                if let Some(Family::Source(source)) = runtime.get_task_mut(task) {
-                    source.release_senders();
-                    source.stop(&mut world);
-                }
-                let _ = runtime.wake(task);
-            }
-            world.dirty = true;
-            releasing = true;
-        }
-        if world.finished && !stopping {
-            runtime.seal();
-            stopping = true;
-        }
-        let result = if stopping {
-            runtime.shutdown_turn(&mut world, 1)
-        } else {
-            runtime.turn(&mut world, 1)
-        };
+        let result = runtime.turn(&mut world, 1);
         if let Err(failure) = result {
             libkernel::debug!(
                 "device task failed: id={}, error={:?}",
@@ -877,20 +783,53 @@ pub(super) fn run(startup: Startup) {
             );
             fatal(Error::Unavailable);
         }
-        if !world.stop_requested {
-            publication = publish(
-                publication,
-                &mut runtime,
-                &world,
-                &config,
-                &mut prescoped,
-                &mut reporter,
-            );
+        if !ingress_started {
+            // 唯一准入门是本地来源安装，不等平台发现或远端响应。
+            let issuer = match runtime.get_task_mut(world.root_task) {
+                Some(Family::Source(root)) if root.committed() => Some(root.use_context()),
+                Some(Family::Source(_)) => None,
+                _ => fatal(Error::Closed),
+            };
+            if let Some(issuer) = issuer {
+                if let Some(sources) = sources.take() {
+                    for (declared, pair) in config.sources.iter().zip(sources) {
+                        let source = Source::prepare_minted(
+                            &world,
+                            issuer,
+                            declared.scope,
+                            declared.access,
+                            pair,
+                        )
+                        .unwrap_or_else(|error| fatal(error));
+                        adopting.push(spawn(&mut runtime, Family::Source(source), ROOT_SOURCES));
+                    }
+                }
+                adopting.retain(|&task| {
+                    match runtime.get_task_mut(task) {
+                        Some(Family::Source(source)) if source.committed() => {
+                            // 只作配对凭据的 sender 不保活已公开的静态 authority。
+                            source.release_senders();
+                            false
+                        }
+                        Some(Family::Source(_)) => true,
+                        _ => fatal(Error::Invalid),
+                    }
+                });
+                if adopting.is_empty() {
+                    spawn(
+                        &mut runtime,
+                        Family::Ingress(Ingress::new(&funding).expect("device ingress failed")),
+                        INGRESS_SOURCES,
+                    );
+                    ingress_started = true;
+                    libkernel::debug!("device static sources installed; ingress open");
+                }
+            }
         }
         if world.registry.take_discovery_change() {
             world.dirty = true;
         }
-        if world.dirty && !stopping {
+        if world.dirty {
             runtime
                 .wake(world.maintenance_task)
                 .unwrap_or_else(|_| fatal(Error::Unavailable));
@@ -901,114 +840,9 @@ pub(super) fn run(startup: Startup) {
             }
         }
         match runtime.drive_state() {
-            DriveState::Drained => break,
+            DriveState::Drained => fatal(Error::Closed),
             DriveState::Runnable => {}
             DriveState::Waiting(deadline) => assembly.wait(deadline).expect("device wait failed"),
         }
     }
-    if !world.registry.is_empty() || !world.roles.is_empty() {
-        fatal(Error::Busy);
-    }
-    runtime
-        .close()
-        .unwrap_or_else(|(_, e)| panic!("device runtime close failed: {e:?}"));
-    assembly
-        .close()
-        .unwrap_or_else(|(_, e)| panic!("device assembly close failed: {e:?}"));
-    drop(world);
-    assert!(
-        budget.is_empty(),
-        "device service budget retained after shutdown"
-    );
-    reporter
-        .stopped(Deadline::INFINITE)
-        .unwrap_or_else(|_| fatal(Error::Unavailable));
-    libkernel::debug!("device manager stopped; control records retired");
-}
-
-/// 推进一步发布状态：根提交且平台就绪后预签发，全部提交后导出并 Ready。
-fn publish(
-    state: Publication,
-    runtime: &mut Runtime<Family, WaitSet>,
-    world: &World,
-    config: &crate::config::Config,
-    prescoped: &mut alloc::vec::Vec<u64>,
-    reporter: &mut Reporter,
-) -> Publication {
-    match state {
-        Publication::Root => {
-            if !world.platform_ready {
-                return Publication::Root;
-            }
-            let issuer = match runtime.get_task_mut(world.root_task) {
-                Some(Family::Source(root)) if root.committed() => root.use_context(),
-                _ => return Publication::Root,
-            };
-            for declared in &config.sources {
-                let source = Source::prepare(
-                    world,
-                    Some(issuer),
-                    declared.scope,
-                    declared.access,
-                    world.funding.clone(),
-                    None,
-                )
-                .unwrap_or_else(|error| fatal(error));
-                prescoped.push(
-                    runtime
-                        .spawn(TaskSubmission::new(
-                            Family::Source(source),
-                            ROOT_SOURCES,
-                            world.funding.execution().clone(),
-                        ))
-                        .unwrap_or_else(|f| {
-                            panic!("device pre-scoped source admission failed: {:?}", f.error)
-                        }),
-                );
-            }
-            Publication::Issuing
-        }
-        Publication::Issuing => {
-            let committed = prescoped.iter().all(|&task| {
-                matches!(runtime.get_task_mut(task), Some(Family::Source(source)) if source.committed())
-            });
-            if !committed {
-                return Publication::Issuing;
-            }
-            for (&task, declared) in prescoped.iter().zip(&config.sources) {
-                let Some(Family::Source(source)) = runtime.get_task_mut(task) else {
-                    fatal(Error::Closed);
-                };
-                let (entry, admin) = source.take_senders().unwrap_or_else(|error| fatal(error));
-                let mut name = alloc::string::String::new();
-                let _ = core::fmt::write(
-                    &mut name,
-                    format_args!("{}.{}", crate::config::SOURCE_EXPORT, declared.name),
-                );
-                export(reporter, &name, entry);
-                name.push_str(".admin");
-                export(reporter, &name, admin);
-            }
-            reporter
-                .ready(&[], Deadline::INFINITE)
-                .unwrap_or_else(|_| fatal(Error::Unavailable));
-            libkernel::debug!(
-                "device manager ready: {} pre-scoped sources exported",
-                prescoped.len()
-            );
-            Publication::Ready
-        }
-        Publication::Ready => Publication::Ready,
-    }
-}
-
-fn export(reporter: &mut Reporter, name: &str, sender: MailboxSender) {
-    reporter
-        .export(
-            name,
-            sender.into_capability(),
-            TRANSPORT,
-            Deadline::INFINITE,
-        )
-        .unwrap_or_else(|_| fatal(Error::Unavailable));
 }

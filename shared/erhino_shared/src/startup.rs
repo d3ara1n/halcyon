@@ -80,6 +80,17 @@ const _: () = {
     assert!(core::mem::align_of::<StartupBlockHeader>() == 8);
 };
 
+/// 紧凑出生块的实际长度；`handle_count` 包含入口线程 Control。
+/// 装配器、额度预检与公共 loader 共用该几何，不能假定 payload 只占一页。
+pub fn compact_block_len(handle_count: usize, payload_len: usize) -> Option<usize> {
+    let handles = handle_count.checked_mul(core::mem::size_of::<Handle>())?;
+    core::mem::size_of::<StartupBlockHeader>()
+        .checked_add(handles)?
+        .checked_add(core::mem::size_of::<EntryThreadDescriptor>())?
+        .checked_add(payload_len)
+        .filter(|length| u32::try_from(*length).is_ok())
+}
+
 /// 内核构造启动块时遇到的几何或分配错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupBuildError {
@@ -221,12 +232,7 @@ pub fn build_startup_block_with_entry(
     entry: EntryThreadDescriptor,
     payload: &[u8],
 ) -> Result<Vec<u8>, StartupBuildError> {
-    let descriptor_off = core::mem::size_of::<StartupBlockHeader>()
-        .checked_add(core::mem::size_of_val(handles))
-        .ok_or(StartupBuildError::Overflow)?;
-    let payload_off = descriptor_off
-        .checked_add(core::mem::size_of::<EntryThreadDescriptor>())
-        .ok_or(StartupBuildError::Overflow)?;
+    let payload_off = compact_block_len(handles.len(), 0).ok_or(StartupBuildError::Overflow)?;
     let mut block = build_startup_prefix_with_entry(
         pid,
         parent_pid,
@@ -369,6 +375,17 @@ fn append_values<T: Copy>(output: &mut Vec<u8>, values: &[T]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_geometry_accounts_for_large_payloads_and_rejects_overflow() {
+        let prefix = core::mem::size_of::<StartupBlockHeader>()
+            + 3 * core::mem::size_of::<Handle>()
+            + core::mem::size_of::<EntryThreadDescriptor>();
+        assert_eq!(compact_block_len(3, 9000), Some(prefix + 9000));
+        assert_eq!(compact_block_len(usize::MAX, 0), None);
+        assert_eq!(compact_block_len(0, usize::MAX), None);
+        assert_eq!(compact_block_len(0, u32::MAX as usize), None);
+    }
 
     #[test]
     fn block_carries_actual_handles_and_opaque_payload() {

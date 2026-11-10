@@ -21,4 +21,4 @@ pub use budget::{FollowBudget, FollowLimits, LocalError};
 #[cfg(target_arch = "riscv64")]
 pub use client::{Client, ClientError, EnumerationCursor, EnumerationPage, Lookup};
 pub use info::{DIRECTORY, MarkerId, ObjectInfo, Tag};
-pub use namespace::Namespace;
+pub use namespace::{AdoptError, Namespace};

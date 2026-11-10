@@ -7,8 +7,8 @@ use std::{collections::BTreeMap, fs, path::Path, process::ExitCode};
 
 use erhino_shared::object::Rights;
 use formation::{
-    Budget, Export, Finish, Formation, Input, Instance, Job, Kind, Pool, SERVICES_JOB, Source,
-    kind_by_name, right_by_name,
+    Budget, Formation, Input, Instance, Job, NamespaceBinding, Pool, Resource, ResourceKind,
+    SERVICES_JOB, Source, right_by_name,
 };
 use toml::{Table, Value};
 
@@ -81,11 +81,10 @@ fn input(name: &str, value: &Value, context: &str) -> Result<Input> {
             name: name.into(),
             source: source(text, &context)?,
             rights: None,
-            revoke: None,
         });
     }
     let table = table(value, &context)?;
-    only(table, &context, &["from", "rights", "revoke"])?;
+    only(table, &context, &["from", "rights"])?;
     Ok(Input {
         name: name.into(),
         source: source(string(table, "from", &context)?, &context)?,
@@ -93,32 +92,72 @@ fn input(name: &str, value: &Value, context: &str) -> Result<Input> {
             .get("rights")
             .map(|value| rights(value, &context))
             .transpose()?,
-        revoke: table
-            .get("revoke")
-            .map(|value| {
-                value
-                    .as_str()
-                    .ok_or_else(|| format!("{context}.revoke: expected a string"))
-                    .and_then(|text| source(text, &context))
-            })
-            .transpose()?,
     })
 }
 
-fn export(name: &str, value: &Value, context: &str) -> Result<Export> {
-    let context = format!("{context}.exports.\"{name}\"");
+fn namespace_binding(prefix: &str, value: &Value, context: &str) -> Result<NamespaceBinding> {
+    let context = format!("{context}.namespace.\"{prefix}\"");
     let table = table(value, &context)?;
-    only(table, &context, &["kind", "rights"])?;
-    let kind = string(table, "kind", &context)?;
-    Ok(Export {
-        name: name.into(),
-        kind: kind_by_name(kind).ok_or_else(|| format!("{context}: unknown kind `{kind}`"))?,
+    only(table, &context, &["from", "rights"])?;
+    Ok(NamespaceBinding {
+        prefix: prefix.into(),
+        source: source(string(table, "from", &context)?, &context)?,
         rights: rights(
             table
                 .get("rights")
                 .ok_or_else(|| format!("{context}: missing `rights`"))?,
             &context,
         )?,
+    })
+}
+
+fn resource(name: &str, value: &Value) -> Result<Resource> {
+    let context = format!("resource.{name}");
+    let table = table(value, &context)?;
+    let kind = string(table, "kind", &context)?;
+    only(
+        table,
+        &context,
+        match kind {
+            "mailbox" => &["kind", "payer", "rights", "terminal_revoke"],
+            "sender" => &[
+                "kind",
+                "payer",
+                "rights",
+                "mailbox",
+                "badge",
+                "terminal_revoke",
+            ],
+            _ => return Err(format!("{context}: unknown resource kind `{kind}`")),
+        },
+    )?;
+    let rights = rights(
+        table
+            .get("rights")
+            .ok_or_else(|| format!("{context}: missing `rights`"))?,
+        &context,
+    )?;
+    let terminal_revoke = table
+        .get("terminal_revoke")
+        .map(|v| {
+            v.as_bool()
+                .ok_or_else(|| format!("{context}.terminal_revoke: expected a boolean"))
+        })
+        .transpose()?
+        .unwrap_or(false);
+    Ok(Resource {
+        name: name.into(),
+        payer: string(table, "payer", &context)?.into(),
+        terminal_revoke,
+        kind: match kind {
+            "mailbox" => ResourceKind::Mailbox { rights },
+            "sender" => ResourceKind::Sender {
+                mailbox: string(table, "mailbox", &context)?.into(),
+                badge: unsigned(table, "badge", &context)?.unwrap_or(0),
+                rights,
+            },
+            _ => unreachable!("resource kind checked above"),
+        },
     })
 }
 
@@ -154,24 +193,8 @@ fn instance(name: &str, value: &Value) -> Result<Instance> {
     only(
         table,
         &context,
-        &[
-            "image",
-            "kind",
-            "job",
-            "pool",
-            "inputs",
-            "exports",
-            "settings",
-            "start_timeout_ms",
-            "stop_timeout_ms",
-            "after",
-        ],
+        &["image", "job", "pool", "inputs", "namespace", "settings"],
     )?;
-    let kind = match string(table, "kind", &context)? {
-        "resident" => Kind::Resident,
-        "task" => Kind::Task,
-        other => return Err(format!("{context}.kind: unknown kind `{other}`")),
-    };
     let named = |key: &str| -> Result<Vec<(&String, &Value)>> {
         match table.get(key) {
             None => Ok(Vec::new()),
@@ -187,23 +210,9 @@ fn instance(name: &str, value: &Value) -> Result<Instance> {
             &format!("{context}.settings"),
         )?,
     };
-    let after = match table.get("after") {
-        None => Vec::new(),
-        Some(value) => value
-            .as_array()
-            .ok_or_else(|| format!("{context}.after: expected an array"))?
-            .iter()
-            .map(|item| {
-                item.as_str()
-                    .map(String::from)
-                    .ok_or_else(|| format!("{context}.after: instance names are strings"))
-            })
-            .collect::<Result<_>>()?,
-    };
     Ok(Instance {
         name: name.into(),
         image: string(table, "image", &context)?.into(),
-        kind,
         job: table
             .get("job")
             .map(|value| {
@@ -222,15 +231,12 @@ fn instance(name: &str, value: &Value) -> Result<Instance> {
             .into_iter()
             .map(|(name, value)| input(name, value, &context))
             .collect::<Result<_>>()?,
-        exports: named("exports")?
+        namespace: named("namespace")?
             .into_iter()
-            .map(|(name, value)| export(name, value, &context))
+            .map(|(prefix, value)| namespace_binding(prefix, value, &context))
             .collect::<Result<_>>()?,
         settings: settings::encode(&settings)
             .map_err(|error| format!("{context}.settings: {error:?}"))?,
-        start_timeout_ms: unsigned(table, "start_timeout_ms", &context)?.unwrap_or(0),
-        stop_timeout_ms: unsigned(table, "stop_timeout_ms", &context)?.unwrap_or(0),
-        after,
     })
 }
 
@@ -247,13 +253,7 @@ fn merge(base: &mut Table, layer: Table) {
 }
 
 fn compile(root: Table) -> Result<Formation> {
-    only(&root, "formation", &["finish", "pool", "job", "instance"])?;
-    let finish = match string(&root, "finish", "formation")? {
-        "stay" => Finish::Stay,
-        "shutdown" => Finish::Shutdown,
-        "reboot" => Finish::Reboot,
-        other => return Err(format!("formation.finish: unknown action `{other}`")),
-    };
+    only(&root, "formation", &["pool", "job", "resource", "instance"])?;
     let section = |key: &str| -> Result<Vec<(&String, &Value)>> {
         match root.get(key) {
             None => Ok(Vec::new()),
@@ -277,23 +277,29 @@ fn compile(root: Table) -> Result<Formation> {
             only(table, &context, &["parent", "pool"])?;
             Ok(Job {
                 name: name.clone(),
-                parent: table
-                    .get("parent")
-                    .and_then(Value::as_str)
-                    .unwrap_or(SERVICES_JOB)
-                    .into(),
+                parent: match table.get("parent") {
+                    None => SERVICES_JOB.into(),
+                    Some(value) => value
+                        .as_str()
+                        .ok_or_else(|| format!("{context}.parent: expected a string"))?
+                        .into(),
+                },
                 payer: string(table, "pool", &context)?.into(),
             })
         })
+        .collect::<Result<_>>()?;
+    let resources = section("resource")?
+        .into_iter()
+        .map(|(name, value)| resource(name, value))
         .collect::<Result<_>>()?;
     let instances = section("instance")?
         .into_iter()
         .map(|(name, value)| instance(name, value))
         .collect::<Result<_>>()?;
     Ok(Formation {
-        finish,
         pools,
         jobs,
+        resources,
         instances,
     })
 }
@@ -346,13 +352,13 @@ fn run(sources: &[&Path], destination: Option<(&Path, &Path)>) -> Result<()> {
     let list = output.with_extension("images");
     fs::write(&list, components.join("\n") + "\n")
         .map_err(|error| format!("{}: {error}", list.display()))?;
-    let order = formation.order().map_err(|error| error.to_string())?;
-    let names: Vec<&str> = order
+    let names: Vec<&str> = formation
+        .instances
         .iter()
-        .map(|&index| formation.instances[index].name.as_str())
+        .map(|i| i.name.as_str())
         .collect();
     println!(
-        "formation {}: {} instance(s), start order {}",
+        "formation {}: {} instance(s), declaration order {}",
         output.display(),
         names.len(),
         names.join(" → ")
@@ -383,5 +389,93 @@ fn main() -> ExitCode {
             eprintln!("formation: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    const SOURCE: &str = r#"
+[resource.inbox]
+kind="mailbox"
+payer="init"
+rights=["read","wait"]
+[resource.entry]
+kind="sender"
+payer="host"
+mailbox="inbox"
+badge=17
+rights=["write","wait","transit","duplicate"]
+terminal_revoke=true
+[instance.host]
+image="srv_host"
+[instance.host.inputs]
+receiver="init/object.inbox"
+[instance.host.namespace]
+"/雪"={from="init/object.entry",rights=["write","wait","transit"]}
+"#;
+    fn parse(text: &str) -> Result<Formation> {
+        compile(text.parse::<Table>().map_err(|e| e.to_string())?)
+    }
+    #[test]
+    fn compiles_explicit_resources_and_namespace() {
+        let f = parse(SOURCE).unwrap();
+        f.validate(|_| true).unwrap();
+        assert_eq!(f.resources.len(), 2);
+        assert!(f.resources[1].terminal_revoke);
+        assert_eq!(f.instances[0].namespace[0].prefix, "/雪");
+        assert_eq!(Formation::decode(&f.encode().unwrap()).unwrap(), f);
+        let f = parse(&SOURCE.replace("terminal_revoke=true", "")).unwrap();
+        assert!(!f.resources[1].terminal_revoke);
+    }
+    #[test]
+    fn legacy_fields_and_export_routes_are_not_adapted() {
+        for source in [
+            "finish='stay'",
+            "[instance.x]\nimage='srv_x'\nkind='resident'",
+            "[instance.x]\nimage='srv_x'\nafter=[]",
+            "[instance.x]\nimage='srv_x'\nstart_timeout_ms=1",
+            "[instance.x]\nimage='srv_x'\nstop_timeout_ms=1",
+            "[instance.x.exports.a]\nkind='mailbox_sender'\nrights=['write']",
+            "[instance.x.inputs.a]\nfrom='init/platform.root'\nrevoke='init/object.admin'",
+        ] {
+            assert!(parse(source).is_err(), "accepted old field: {source}");
+        }
+        assert!(parse(&SOURCE.replace("init/object.inbox", "provider/inbox")).is_err());
+    }
+    #[test]
+    fn malformed_resource_fields_and_rights_rejected() {
+        for source in [
+            SOURCE.replace("payer=\"init\"", ""),
+            SOURCE.replace("terminal_revoke=true", "terminal_revoke='true'"),
+            SOURCE.replace("kind=\"sender\"", "kind=\"notification\""),
+            SOURCE.replace("badge=17", "badge=-1"),
+            SOURCE.replace("rights=[\"read\",\"wait\"]", "rights=[\"unknown\"]"),
+        ] {
+            assert!(parse(&source).is_err());
+        }
+    }
+    #[test]
+    fn layering_preserves_declaration_order_and_overrides_only_named_values() {
+        let mut base: Table = SOURCE.parse().unwrap();
+        merge(
+            &mut base,
+            "[resource.entry]\nbadge=23\n[instance.other]\nimage='srv_other'"
+                .parse()
+                .unwrap(),
+        );
+        let f = compile(base).unwrap();
+        f.validate(|_| true).unwrap();
+        assert_eq!(
+            f.instances
+                .iter()
+                .map(|i| i.name.as_str())
+                .collect::<Vec<_>>(),
+            ["host", "other"]
+        );
+        assert!(matches!(
+            f.resources[1].kind,
+            ResourceKind::Sender { badge: 23, .. }
+        ));
     }
 }

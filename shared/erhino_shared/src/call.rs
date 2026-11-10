@@ -183,6 +183,9 @@ pub enum SystemCall {
 
     // -----消息-----
     /// 创建唯一 Mailbox receiver-owner。
+    /// a0=付款 Pool（CREATE，或 object::CURRENT_PROCESS_POOL），a1=receiver rights，
+    /// a2=*mut Handle；不消费 Pool。Core、固定队列、Receiver 和维护均由选定 Pool 付款。
+    /// 失败不安装输出，未发布对象及费用完整回滚；本地表项仍由持有进程付款。
     MailboxCreate = 0x40,
     /// 向 sender Handle 指向的邮箱原子投递消息和 Handle moves。
     Send = 0x41,
@@ -194,7 +197,11 @@ pub enum SystemCall {
     Discard = 0x44,
     /// 从具 DUPLICATE 权的 sender 派生一次性投递权（send-once）。
     MailboxMakeSendOnce = 0x45,
-    /// 由 mailbox owner 铸造带不可变 badge 的 sender capability。
+    /// 由 mailbox owner 铸造带不可变 badge 的 sender capability 与配对 Lifetime。
+    /// a0=receiver（MANAGE），a1=付款 Pool（CREATE，或 object::CURRENT_PROCESS_POOL），
+    /// a2=badge，a3=sender rights，a4=*mut SenderResult；不消费 receiver/Pool。
+    /// Sender、Lifetime 及其维护均由选定 Pool 付款，不默认继承 Mailbox 的付款者。
+    /// 两项输出原子安装；失败回滚全部未发布 owner/费用，存活引用不因付款者退出提前退款。
     MailboxMintSender = 0x46,
 
     // -----Process memory-----

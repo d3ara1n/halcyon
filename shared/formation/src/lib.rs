@@ -1,195 +1,156 @@
-//! 组态：一份完整初始系统组成的数据模型、二进制编码、静态校验与启动顺序。
-//!
-//! 组态由 host 侧编译器从组态源生成，init 读取 initfs 根的 `formation` 执行；二者调用同一
-//! [`Formation::validate`]，使组态错误在任何副作用之前被拒绝。本 crate 只描述组成，不认识任何
-//! 服务的协议、导出业务语义或设定键。名字语法与保留名见组态计划「命名」一节。
-
+//! 组态 v2：静态资源、显式付款与完整初始视图。
+//! 不解释服务协议，不包含业务拓扑或就绪/停止政策。
 #![cfg_attr(not(test), no_std)]
-
 extern crate alloc;
-
 use alloc::{string::String, vec::Vec};
 use core::fmt;
-use erhino_shared::object::{ObjectKind, Rights};
-
-/// 组态文件魔数与版本。
+use erhino_shared::object::Rights;
 pub const MAGIC: [u8; 8] = *b"ERFORMTN";
-pub const VERSION: u32 = 1;
-/// 名字总长上限（字节）。
+pub const VERSION: u32 = 2;
 pub const MAX_NAME: usize = 32;
 pub const MAX_INSTANCES: usize = 64;
 pub const MAX_JOBS: usize = 32;
 pub const MAX_POOLS: usize = 32;
-pub const MAX_EXPORTS: usize = 32;
-/// 每实例的组态输入上限：出生 grant 上限扣除两个生命周期保留输入。
-pub const MAX_INPUTS: usize = erhino_shared::proc::PROCESS_MAX_GRANTS - LIFECYCLE_INPUTS.len();
-/// init 为每个实例提供的生命周期保留输入；组态不得声明同名输入或导出。
-pub const LIFECYCLE_INPUTS: [&str; 2] = ["instance.report", "instance.stop"];
-/// 保留实例名：`init` 指 init 内建来源，`self` 指引用方实例自身。
+pub const MAX_INPUTS: usize = erhino_shared::proc::PROCESS_MAX_GRANTS;
 pub const RESERVED_INSTANCES: [&str; 2] = ["init", "self"];
-/// init 内建、所有实例 Job 默认所在的 Job。
 pub const SERVICES_JOB: &str = "services";
-
-/// 全部 task 正常完成后的动作。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum Finish {
-    Stay = 0,
-    Shutdown = 1,
-    Reboot = 2,
-}
-
-/// 实例种类：常驻须 Ready 并经正常停止；任务以 Completed 结束即成功。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum Kind {
-    Resident = 0,
-    Task = 1,
-}
-
-/// 双维额度：页与 metadata 字节。实例映像页由 init 按 ELF load runs 另加。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Budget {
     pub work_pages: u64,
     pub metadata_bytes: u64,
 }
-
-/// init 从根 Pool 派生并持有至系统结束的具名 Pool。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pool {
     pub name: String,
     pub budget: Budget,
 }
-
-/// init 按组态建立的具名 Job。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Job {
     pub name: String,
-    /// 父 Job：`services` 或另一具名 job。
     pub parent: String,
-    /// 付款者：具名 Pool 名或实例名（取该实例的 Pool）。
     pub payer: String,
 }
-
-/// 路由来源。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResourceOutput {
+    Main,
+    Lifetime,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResourceKind {
+    Mailbox {
+        rights: Rights,
+    },
+    Sender {
+        mailbox: String,
+        badge: u64,
+        rights: Rights,
+    },
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resource {
+    pub name: String,
+    pub payer: String,
+    pub kind: ResourceKind,
+    /// 显式声明该 sender 实现终局撤销协议，名字不产生协议知识。
+    pub terminal_revoke: bool,
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Source {
     PlatformDescription,
-    /// 平台根列表，整表路由。
     PlatformRoot,
-    /// initfs `image/<组件名>`，封存为只读 MemoryObject。
     Image(String),
     Job(String),
-    /// 具名 Pool 的 CREATE 别名。
     Pool(String),
-    /// 本实例 Pool 的 CREATE 别名。
     SelfPool,
-    /// 另一实例的导出。
-    Export {
-        instance: String,
-        export: String,
+    Resource {
+        name: String,
+        output: ResourceOutput,
     },
 }
-
 impl Source {
-    /// 解析组态源中的来源字符串：`init/…`、`self/memory.pool` 或 `<实例>/<导出>`。
     pub fn parse(text: &str) -> Option<Self> {
-        let (instance, name) = text.split_once('/')?;
-        Some(match instance {
-            "init" => match name {
-                "platform.description" => Self::PlatformDescription,
-                "platform.root" => Self::PlatformRoot,
-                _ => {
-                    let (kind, item) = name.split_once('.')?;
-                    if !segment(item.as_bytes()) {
-                        return None;
-                    }
-                    match kind {
-                        "image" if component(item) => Self::Image(item.into()),
-                        "job" => Self::Job(item.into()),
-                        "pool" => Self::Pool(item.into()),
-                        _ => return None,
-                    }
+        let (owner, name) = text.split_once('/')?;
+        if owner == "self" && name == "memory.pool" {
+            return Some(Self::SelfPool);
+        }
+        if owner != "init" {
+            return None;
+        }
+        Some(match name {
+            "platform.description" => Self::PlatformDescription,
+            "platform.root" => Self::PlatformRoot,
+            _ => {
+                let (kind, item) = name.split_once('.')?;
+                if !valid_name(item) {
+                    return None;
                 }
-            },
-            "self" if name == "memory.pool" => Self::SelfPool,
-            _ if !RESERVED_INSTANCES.contains(&instance)
-                && valid_name(instance)
-                && valid_name(name) =>
-            {
-                Self::Export {
-                    instance: instance.into(),
-                    export: name.into(),
+                match kind {
+                    "image" if component(item) => Self::Image(item.into()),
+                    "job" => Self::Job(item.into()),
+                    "pool" => Self::Pool(item.into()),
+                    "object" => Self::Resource {
+                        name: item.into(),
+                        output: ResourceOutput::Main,
+                    },
+                    "lifetime" => Self::Resource {
+                        name: item.into(),
+                        output: ResourceOutput::Lifetime,
+                    },
+                    _ => return None,
                 }
             }
-            _ => return None,
         })
     }
 }
-
 impl fmt::Display for Source {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::PlatformDescription => f.write_str("init/platform.description"),
             Self::PlatformRoot => f.write_str("init/platform.root"),
-            Self::Image(name) => write!(f, "init/image.{name}"),
-            Self::Job(name) => write!(f, "init/job.{name}"),
-            Self::Pool(name) => write!(f, "init/pool.{name}"),
+            Self::Image(n) => write!(f, "init/image.{n}"),
+            Self::Job(n) => write!(f, "init/job.{n}"),
+            Self::Pool(n) => write!(f, "init/pool.{n}"),
             Self::SelfPool => f.write_str("self/memory.pool"),
-            Self::Export { instance, export } => write!(f, "{instance}/{export}"),
+            Self::Resource { name, output } => write!(
+                f,
+                "init/{}.{name}",
+                match output {
+                    ResourceOutput::Main => "object",
+                    ResourceOutput::Lifetime => "lifetime",
+                }
+            ),
         }
     }
 }
-
-/// 一条路由：把来源接到本实例的某输入。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Input {
     pub name: String,
     pub source: Source,
-    /// 衰减后的权利；缺省时沿用来源权利。
     pub rights: Option<Rights>,
-    /// 撤销管理端，必须是同一提供方 `<导出>.admin`。
-    pub revoke: Option<Source>,
 }
-
-/// 实例交出的命名能力及其最小要求。
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Export {
-    pub name: String,
-    /// `ObjectKind` 的 ABI 判别值。
-    pub kind: u32,
+pub struct NamespaceBinding {
+    pub prefix: String,
+    pub source: Source,
     pub rights: Rights,
 }
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Instance {
     pub name: String,
-    /// initfs `image/<组件名>` 的组件名。
     pub image: String,
-    pub kind: Kind,
-    /// 具名 job；缺省时 init 在 `services` 下为该实例新建 Job。
     pub job: Option<String>,
     pub pool: Budget,
     pub inputs: Vec<Input>,
-    pub exports: Vec<Export>,
-    /// `settings` 编码的实例设定。
+    pub namespace: Vec<NamespaceBinding>,
     pub settings: Vec<u8>,
-    /// 0 表示无期限；resident 两者均须为正。
-    pub start_timeout_ms: u64,
-    pub stop_timeout_ms: u64,
-    /// 无数据依赖时的顺序约束。
-    pub after: Vec<String>,
 }
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Formation {
-    pub finish: Finish,
     pub pools: Vec<Pool>,
     pub jobs: Vec<Job>,
+    pub resources: Vec<Resource>,
     pub instances: Vec<Instance>,
 }
-
-/// 组态错误：格式错误或静态校验失败；`subject` 指出出错的名字或来源。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
     Format(&'static str),
@@ -198,25 +159,20 @@ pub enum Error {
         subject: String,
     },
 }
-
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Format(reason) => write!(f, "formation format error: {reason}"),
+            Self::Format(r) => write!(f, "formation format error: {r}"),
             Self::Invalid { reason, subject } => write!(f, "{reason}: {subject}"),
         }
     }
 }
-
 fn invalid(reason: &'static str, subject: impl fmt::Display) -> Error {
     Error::Invalid {
         reason,
         subject: alloc::format!("{subject}"),
     }
 }
-
-// —— 名字语法 ——
-
 fn segment(bytes: &[u8]) -> bool {
     !bytes.is_empty()
         && bytes[0].is_ascii_lowercase()
@@ -231,7 +187,7 @@ fn index(bytes: &[u8]) -> bool {
         && (bytes.len() == 1 || bytes[0] != b'0')
 }
 
-/// 实例、输入、导出与 job 名：`.` 连接的小写段，末段可为十进制序号，总长不超过 32 字节。
+/// 实例、输入、资源与 job 名：`.` 连接的小写段，末段可为十进制序号，总长不超过 32 字节。
 pub fn valid_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     if bytes.is_empty() || bytes.len() > MAX_NAME {
@@ -255,53 +211,6 @@ fn component(name: &str) -> bool {
     name.len() <= MAX_NAME && segment(name.as_bytes())
 }
 
-// —— 对象类型名 ——
-
-const KINDS: [(&str, ObjectKind); 27] = [
-    ("job", ObjectKind::Job),
-    ("memory_pool", ObjectKind::MemoryPool),
-    ("memory_object", ObjectKind::MemoryObject),
-    ("process_builder", ObjectKind::ProcessBuilder),
-    ("process_control", ObjectKind::ProcessControl),
-    ("thread_control", ObjectKind::ThreadControl),
-    ("mailbox_receiver", ObjectKind::MailboxReceiver),
-    ("notification_owner", ObjectKind::NotificationOwner),
-    ("tunnel_endpoint", ObjectKind::TunnelEndpoint),
-    ("tunnel_invitation", ObjectKind::TunnelInvitation),
-    ("system_reset", ObjectKind::SystemReset),
-    ("mailbox_sender", ObjectKind::MailboxSender),
-    ("lifetime_observer", ObjectKind::LifetimeObserver),
-    ("delivery", ObjectKind::Delivery),
-    ("wait_set", ObjectKind::WaitSet),
-    ("mailbox_once_sender", ObjectKind::MailboxOnceSender),
-    ("notification_signaler", ObjectKind::NotificationSignaler),
-    ("reply_observer", ObjectKind::ReplyObserver),
-    ("thread_start_ticket", ObjectKind::ThreadStartTicket),
-    ("notification_observer", ObjectKind::NotificationObserver),
-    ("mmio_control", ObjectKind::MmioControl),
-    ("mmio_use", ObjectKind::MmioUse),
-    ("irq_control", ObjectKind::IrqControl),
-    ("irq_use", ObjectKind::IrqUse),
-    ("dma_domain_control", ObjectKind::DmaDomainControl),
-    ("dma_use", ObjectKind::DmaUse),
-    ("dma_mapping", ObjectKind::DmaMapping),
-];
-
-/// 组态源中的对象类型名到 ABI 判别值。
-pub fn kind_by_name(name: &str) -> Option<u32> {
-    KINDS
-        .iter()
-        .find(|(text, _)| *text == name)
-        .map(|(_, kind)| *kind as u32)
-}
-
-pub fn kind_name(kind: u32) -> Option<&'static str> {
-    KINDS
-        .iter()
-        .find(|(_, value)| *value as u32 == kind)
-        .map(|(text, _)| *text)
-}
-
 const RIGHTS: [(&str, Rights); 10] = [
     ("read", Rights::READ),
     ("write", Rights::WRITE),
@@ -322,8 +231,6 @@ pub fn right_by_name(name: &str) -> Option<Rights> {
         .find(|(text, _)| *text == name)
         .map(|(_, right)| *right)
 }
-
-// —— 编码 ——
 
 struct Writer(Vec<u8>);
 
@@ -370,10 +277,13 @@ impl Writer {
                 self.str(name)?;
             }
             Source::SelfPool => self.u8(5),
-            Source::Export { instance, export } => {
+            Source::Resource { name, output } => {
                 self.u8(6);
-                self.str(instance)?;
-                self.str(export)?;
+                self.str(name)?;
+                self.u8(match output {
+                    ResourceOutput::Main => 0,
+                    ResourceOutput::Lifetime => 1,
+                });
             }
         }
         Ok(())
@@ -452,9 +362,13 @@ impl<'a> Reader<'a> {
             3 => Source::Job(self.string()?),
             4 => Source::Pool(self.string()?),
             5 => Source::SelfPool,
-            6 => Source::Export {
-                instance: self.string()?,
-                export: self.string()?,
+            6 => Source::Resource {
+                name: self.string()?,
+                output: match self.u8()? {
+                    0 => ResourceOutput::Main,
+                    1 => ResourceOutput::Lifetime,
+                    _ => return Err(Error::Format("unknown resource output")),
+                },
             },
             _ => return Err(Error::Format("unknown source tag")),
         })
@@ -480,76 +394,76 @@ impl Formation {
         let mut w = Writer(Vec::new());
         w.0.extend_from_slice(&MAGIC);
         w.u32(VERSION);
-        w.u8(self.finish as u8);
         w.len(self.pools.len())?;
-        for pool in &self.pools {
-            w.str(&pool.name)?;
-            w.budget(pool.budget);
+        for p in &self.pools {
+            w.str(&p.name)?;
+            w.budget(p.budget);
         }
         w.len(self.jobs.len())?;
-        for job in &self.jobs {
-            w.str(&job.name)?;
-            w.str(&job.parent)?;
-            w.str(&job.payer)?;
+        for j in &self.jobs {
+            w.str(&j.name)?;
+            w.str(&j.parent)?;
+            w.str(&j.payer)?;
+        }
+        w.len(self.resources.len())?;
+        for r in &self.resources {
+            w.str(&r.name)?;
+            w.str(&r.payer)?;
+            w.u8(u8::from(r.terminal_revoke));
+            match &r.kind {
+                ResourceKind::Mailbox { rights } => {
+                    w.u8(0);
+                    w.u64(rights.raw());
+                }
+                ResourceKind::Sender {
+                    mailbox,
+                    badge,
+                    rights,
+                } => {
+                    w.u8(1);
+                    w.str(mailbox)?;
+                    w.u64(*badge);
+                    w.u64(rights.raw());
+                }
+            }
         }
         w.len(self.instances.len())?;
-        for instance in &self.instances {
-            w.str(&instance.name)?;
-            w.str(&instance.image)?;
-            w.u8(instance.kind as u8);
-            match &instance.job {
-                Some(job) => {
-                    w.u8(1);
-                    w.str(job)?;
-                }
+        for i in &self.instances {
+            w.str(&i.name)?;
+            w.str(&i.image)?;
+            match &i.job {
                 None => w.u8(0),
+                Some(j) => {
+                    w.u8(1);
+                    w.str(j)?;
+                }
             }
-            w.budget(instance.pool);
-            w.len(instance.inputs.len())?;
-            for input in &instance.inputs {
+            w.budget(i.pool);
+            w.len(i.inputs.len())?;
+            for input in &i.inputs {
                 w.str(&input.name)?;
                 w.source(&input.source)?;
                 w.optional_rights(input.rights);
-                match &input.revoke {
-                    Some(revoke) => {
-                        w.u8(1);
-                        w.source(revoke)?;
-                    }
-                    None => w.u8(0),
-                }
             }
-            w.len(instance.exports.len())?;
-            for export in &instance.exports {
-                w.str(&export.name)?;
-                w.u32(export.kind);
-                w.u64(export.rights.raw());
+            w.len(i.namespace.len())?;
+            for b in &i.namespace {
+                w.str(&b.prefix)?;
+                w.source(&b.source)?;
+                w.u64(b.rights.raw());
             }
-            w.bytes(&instance.settings)?;
-            w.u64(instance.start_timeout_ms);
-            w.u64(instance.stop_timeout_ms);
-            w.len(instance.after.len())?;
-            for after in &instance.after {
-                w.str(after)?;
-            }
+            w.bytes(&i.settings)?;
         }
         Ok(w.0)
     }
-
-    /// 解码组态文件；只核格式，组成的合法性由 [`Formation::validate`] 判定。
+    /// 仅解码格式；发布前必须校验语义及实际平台展开后的授权数。
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
         let mut r = Reader { bytes, pos: 0 };
-        if r.take(MAGIC.len())? != MAGIC {
+        if r.take(8)? != MAGIC {
             return Err(Error::Format("bad magic"));
         }
         if r.u32()? != VERSION {
             return Err(Error::Format("unsupported version"));
         }
-        let finish = match r.u8()? {
-            0 => Finish::Stay,
-            1 => Finish::Shutdown,
-            2 => Finish::Reboot,
-            _ => return Err(Error::Format("unknown finish")),
-        };
         let mut pools = Vec::new();
         for _ in 0..r.count(MAX_POOLS)? {
             pools.push(Pool {
@@ -565,15 +479,37 @@ impl Formation {
                 payer: r.string()?,
             });
         }
+        let mut resources = Vec::new();
+        for _ in 0..r.count(usize::MAX)? {
+            let name = r.string()?;
+            let payer = r.string()?;
+            let terminal_revoke = match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return Err(Error::Format("bad boolean")),
+            };
+            let kind = match r.u8()? {
+                0 => ResourceKind::Mailbox {
+                    rights: r.rights()?,
+                },
+                1 => ResourceKind::Sender {
+                    mailbox: r.string()?,
+                    badge: r.u64()?,
+                    rights: r.rights()?,
+                },
+                _ => return Err(Error::Format("unknown resource kind")),
+            };
+            resources.push(Resource {
+                name,
+                payer,
+                kind,
+                terminal_revoke,
+            });
+        }
         let mut instances = Vec::new();
         for _ in 0..r.count(MAX_INSTANCES)? {
             let name = r.string()?;
             let image = r.string()?;
-            let kind = match r.u8()? {
-                0 => Kind::Resident,
-                1 => Kind::Task,
-                _ => return Err(Error::Format("unknown instance kind")),
-            };
             let job = match r.u8()? {
                 0 => None,
                 1 => Some(r.string()?),
@@ -582,85 +518,60 @@ impl Formation {
             let pool = r.budget()?;
             let mut inputs = Vec::new();
             for _ in 0..r.count(MAX_INPUTS)? {
-                let name = r.string()?;
-                let source = r.source()?;
-                let rights = r.optional_rights()?;
-                let revoke = match r.u8()? {
-                    0 => None,
-                    1 => Some(r.source()?),
-                    _ => return Err(Error::Format("bad option tag")),
-                };
                 inputs.push(Input {
-                    name,
-                    source,
-                    rights,
-                    revoke,
+                    name: r.string()?,
+                    source: r.source()?,
+                    rights: r.optional_rights()?,
                 });
             }
-            let mut exports = Vec::new();
-            for _ in 0..r.count(MAX_EXPORTS)? {
-                exports.push(Export {
-                    name: r.string()?,
-                    kind: r.u32()?,
+            let mut namespace = Vec::new();
+            for _ in 0..r.count(MAX_INPUTS)? {
+                namespace.push(NamespaceBinding {
+                    prefix: r.string()?,
+                    source: r.source()?,
                     rights: r.rights()?,
                 });
             }
             let settings = r.bytes()?.to_vec();
-            let start_timeout_ms = r.u64()?;
-            let stop_timeout_ms = r.u64()?;
-            let mut after = Vec::new();
-            for _ in 0..r.count(MAX_INSTANCES)? {
-                after.push(r.string()?);
-            }
             instances.push(Instance {
                 name,
                 image,
-                kind,
                 job,
                 pool,
                 inputs,
-                exports,
+                namespace,
                 settings,
-                start_timeout_ms,
-                stop_timeout_ms,
-                after,
             });
         }
         if r.pos != bytes.len() {
             return Err(Error::Format("trailing bytes"));
         }
         Ok(Self {
-            finish,
             pools,
             jobs,
+            resources,
             instances,
         })
     }
-}
-
-// —— 静态校验与顺序 ——
-
-impl Formation {
     pub fn instance(&self, name: &str) -> Option<&Instance> {
-        self.instances.iter().find(|instance| instance.name == name)
+        self.instances.iter().find(|i| i.name == name)
     }
-
     pub fn pool(&self, name: &str) -> Option<&Pool> {
-        self.pools.iter().find(|pool| pool.name == name)
+        self.pools.iter().find(|p| p.name == name)
     }
-
     pub fn job(&self, name: &str) -> Option<&Job> {
-        self.jobs.iter().find(|job| job.name == name)
+        self.jobs.iter().find(|j| j.name == name)
     }
-
-    /// 全部具名 Pool 与实例工作集的合计；init 另加实例映像页后与根 Pool 比较。
+    pub fn resource(&self, name: &str) -> Option<&Resource> {
+        self.resources.iter().find(|r| r.name == name)
+    }
     pub fn total_budget(&self) -> Result<Budget, Error> {
         let mut total = Budget::default();
         for budget in self
             .pools
             .iter()
-            .map(|pool| pool.budget)
-            .chain(self.instances.iter().map(|instance| instance.pool))
+            .map(|p| p.budget)
+            .chain(self.instances.iter().map(|i| i.pool))
         {
             total.work_pages = total
                 .work_pages
@@ -673,277 +584,305 @@ impl Formation {
         }
         Ok(total)
     }
-
-    /// 实例 `index` 必须在其后启动的前驱（按声明序下标）。
-    fn predecessors(&self, index: usize) -> Vec<usize> {
-        let instance = &self.instances[index];
-        let mut names: Vec<&str> = Vec::new();
-        for input in &instance.inputs {
-            for source in core::iter::once(&input.source).chain(input.revoke.as_ref()) {
-                if let Source::Export { instance, .. } = source {
-                    names.push(instance);
+    fn payer(&self, name: &str) -> Result<(), Error> {
+        if name == "init" || self.pool(name).is_some() || self.instance(name).is_some() {
+            Ok(())
+        } else {
+            Err(invalid("unknown payer", name))
+        }
+    }
+    /// 默认权利的唯一真值；施工母本所需的临时 GRANT/DUPLICATE 不混入资源声明。
+    pub fn source_rights(&self, source: &Source) -> Result<Rights, Error> {
+        let rights = match source {
+            Source::PlatformDescription | Source::Image(_) => {
+                Rights::READ | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT
+            }
+            Source::PlatformRoot => {
+                Rights::READ
+                    | Rights::WRITE
+                    | Rights::WAIT
+                    | Rights::MANAGE
+                    | Rights::CREATE
+                    | Rights::DUPLICATE
+                    | Rights::TRANSIT
+                    | Rights::GRANT
+            }
+            Source::Job(_) => {
+                Rights::CREATE
+                    | Rights::MANAGE
+                    | Rights::READ
+                    | Rights::WAIT
+                    | Rights::DUPLICATE
+                    | Rights::TRANSIT
+                    | Rights::GRANT
+            }
+            Source::Pool(_) | Source::SelfPool => {
+                Rights::READ | Rights::CREATE | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT
+            }
+            Source::Resource { name, output } => {
+                let r = self
+                    .resource(name)
+                    .ok_or_else(|| invalid("unknown resource", name))?;
+                match (&r.kind, output) {
+                    (ResourceKind::Mailbox { rights }, ResourceOutput::Main)
+                    | (ResourceKind::Sender { rights, .. }, ResourceOutput::Main) => *rights,
+                    (ResourceKind::Sender { .. }, ResourceOutput::Lifetime) => Rights::WAIT,
+                    _ => return Err(invalid("mailbox has no lifetime output", name)),
                 }
             }
+        };
+        Ok(rights)
+    }
+    fn validate_source(
+        &self,
+        source: &Source,
+        rights: Option<Rights>,
+        image_exists: &impl Fn(&str) -> bool,
+    ) -> Result<(), Error> {
+        match source {
+            Source::Image(name) if !component(name) || !image_exists(name) => {
+                return Err(invalid("missing image", name));
+            }
+            Source::Job(name) if name != SERVICES_JOB && self.job(name).is_none() => {
+                return Err(invalid("unknown job source", name));
+            }
+            Source::Pool(name) if self.pool(name).is_none() => {
+                return Err(invalid("unknown pool source", name));
+            }
+            _ => {}
         }
-        names.extend(instance.after.iter().map(String::as_str));
-        if let Some(job) = instance.job.as_deref().and_then(|job| self.job(job))
-            && job.payer != instance.name
-            && self.instance(&job.payer).is_some()
+        let available = self.source_rights(source)?;
+        if let Some(rights) = rights
+            && (!rights.is_known() || !available.contains(rights))
         {
-            names.push(&job.payer);
+            return Err(invalid("route rights exceed source", source));
         }
-        let mut result: Vec<usize> = names
-            .into_iter()
-            .filter_map(|name| self.instances.iter().position(|other| other.name == name))
-            .collect();
-        result.sort_unstable();
-        result.dedup();
-        result
+        Ok(())
     }
-
-    /// 启动顺序：依赖拓扑序，同层按声明序；停止取其反序。有环时报错。
-    pub fn order(&self) -> Result<Vec<usize>, Error> {
-        let count = self.instances.len();
-        let predecessors: Vec<Vec<usize>> = (0..count).map(|i| self.predecessors(i)).collect();
-        let mut placed = alloc::vec![false; count];
-        let mut order = Vec::with_capacity(count);
-        while order.len() < count {
-            let next = (0..count)
-                .find(|&i| !placed[i] && predecessors[i].iter().all(|&p| placed[p]))
-                .ok_or_else(|| {
-                    let stuck = (0..count).find(|&i| !placed[i]).expect("unplaced remains");
-                    invalid("instance dependency cycle", &self.instances[stuck].name)
-                })?;
-            placed[next] = true;
-            order.push(next);
+    /// 实际平台根数由 init 在任何对象工厂前传入；host 静态校验只使用零展开下界。
+    pub fn validate_grants(&self, platform_roots: usize) -> Result<(), Error> {
+        for i in &self.instances {
+            let mut count = i.namespace.len();
+            for input in &i.inputs {
+                count = count
+                    .checked_add(if input.source == Source::PlatformRoot {
+                        platform_roots
+                    } else {
+                        1
+                    })
+                    .ok_or_else(|| invalid("grant count overflows", &i.name))?;
+            }
+            if count > MAX_INPUTS {
+                return Err(invalid("too many expanded grants", &i.name));
+            }
+            // 数量先通过 ABI 上界，再展开名字，避免伪造平台数驱动无界分配。
+            let mut names = Vec::with_capacity(count);
+            for input in &i.inputs {
+                if input.source == Source::PlatformRoot {
+                    for n in 0..platform_roots {
+                        let name = alloc::format!("{}.{n}", input.name);
+                        if name.len() > MAX_NAME {
+                            return Err(invalid("expanded input name too long", &name));
+                        }
+                        names.push(name);
+                    }
+                } else {
+                    names.push(input.name.clone());
+                }
+            }
+            for n in 0..i.namespace.len() {
+                names.push(oal::namespace::input_name(n));
+            }
+            names.sort_unstable();
+            if names.windows(2).any(|p| p[0] == p[1]) {
+                return Err(invalid("duplicate expanded input name", &i.name));
+            }
         }
-        Ok(order)
+        Ok(())
     }
-
-    /// 静态校验；`image_exists` 由调用方按 initfs 或 host 映像目录回答组件是否存在。
     pub fn validate(&self, image_exists: impl Fn(&str) -> bool) -> Result<(), Error> {
-        if self.instances.len() > MAX_INSTANCES {
-            return Err(invalid("too many instances", self.instances.len()));
+        if self.instances.len() > MAX_INSTANCES
+            || self.pools.len() > MAX_POOLS
+            || self.jobs.len() > MAX_JOBS
+        {
+            return Err(invalid("too many declarations", "formation"));
         }
-        if self.pools.len() > MAX_POOLS {
-            return Err(invalid("too many pools", self.pools.len()));
-        }
-        if self.jobs.len() > MAX_JOBS {
-            return Err(invalid("too many jobs", self.jobs.len()));
-        }
-        self.validate_names()?;
-        self.validate_jobs()?;
-        for instance in &self.instances {
-            self.validate_instance(instance, &image_exists)?;
-        }
-        self.total_budget()?;
-        self.order()?;
-        if self.finish != Finish::Stay && !self.instances.iter().any(|i| i.kind == Kind::Task) {
-            return Err(invalid(
-                "finish action requires at least one task",
-                "finish",
-            ));
-        }
-        Ok(())
-    }
-
-    fn validate_names(&self) -> Result<(), Error> {
-        for (index, instance) in self.instances.iter().enumerate() {
-            if !valid_name(&instance.name) || RESERVED_INSTANCES.contains(&instance.name.as_str()) {
-                return Err(invalid("invalid instance name", &instance.name));
+        for (n, i) in self.instances.iter().enumerate() {
+            if !valid_name(&i.name) || RESERVED_INSTANCES.contains(&i.name.as_str()) {
+                return Err(invalid("invalid instance name", &i.name));
             }
-            if self.instances[..index]
-                .iter()
-                .any(|other| other.name == instance.name)
+            if self.instances[..n].iter().any(|p| p.name == i.name) || self.pool(&i.name).is_some()
             {
-                return Err(invalid("duplicate instance", &instance.name));
-            }
-            // job 付款者按名字解析到 Pool 或实例，两个命名空间不得重叠。
-            if self.pool(&instance.name).is_some() {
-                return Err(invalid("instance name collides with pool", &instance.name));
+                return Err(invalid("duplicate instance or pool name", &i.name));
             }
         }
-        for (index, pool) in self.pools.iter().enumerate() {
-            if !component(&pool.name) {
-                return Err(invalid("invalid pool name", &pool.name));
+        for (n, p) in self.pools.iter().enumerate() {
+            if !component(&p.name) || RESERVED_INSTANCES.contains(&p.name.as_str()) {
+                return Err(invalid("invalid pool name", &p.name));
             }
-            if self.pools[..index]
-                .iter()
-                .any(|other| other.name == pool.name)
-            {
-                return Err(invalid("duplicate pool", &pool.name));
+            if self.pools[..n].iter().any(|q| q.name == p.name) {
+                return Err(invalid("duplicate pool", &p.name));
             }
         }
-        for (index, job) in self.jobs.iter().enumerate() {
-            if !component(&job.name) || job.name == SERVICES_JOB {
-                return Err(invalid("invalid job name", &job.name));
+        for (n, j) in self.jobs.iter().enumerate() {
+            if !component(&j.name) || j.name == SERVICES_JOB {
+                return Err(invalid("invalid job name", &j.name));
             }
-            if self.jobs[..index]
-                .iter()
-                .any(|other| other.name == job.name)
-            {
-                return Err(invalid("duplicate job", &job.name));
+            if self.jobs[..n].iter().any(|q| q.name == j.name) {
+                return Err(invalid("duplicate job", &j.name));
             }
-        }
-        Ok(())
-    }
-
-    fn validate_jobs(&self) -> Result<(), Error> {
-        for job in &self.jobs {
-            if self.pool(&job.payer).is_none() && self.instance(&job.payer).is_none() {
-                return Err(invalid("job payer is neither pool nor instance", &job.name));
-            }
-            // 父链必须终止于 services，不得成环。
-            let mut parent = job.parent.as_str();
+            self.payer(&j.payer)?;
+            let mut parent = j.parent.as_str();
             for _ in 0..=self.jobs.len() {
                 if parent == SERVICES_JOB {
                     break;
                 }
-                parent = self
+                parent = &self
                     .job(parent)
-                    .ok_or_else(|| invalid("unknown parent job", &job.name))?
-                    .parent
-                    .as_str();
+                    .ok_or_else(|| invalid("unknown parent job", &j.name))?
+                    .parent;
             }
             if parent != SERVICES_JOB {
-                return Err(invalid("job parent cycle", &job.name));
+                return Err(invalid("job parent cycle", &j.name));
             }
         }
-        Ok(())
-    }
-
-    fn validate_instance(
-        &self,
-        instance: &Instance,
-        image_exists: &impl Fn(&str) -> bool,
-    ) -> Result<(), Error> {
-        let name = &instance.name;
-        if !component(&instance.image) || !image_exists(&instance.image) {
-            return Err(invalid("missing image", &instance.image));
-        }
-        if let Some(job) = &instance.job
-            && self.job(job).is_none()
-        {
-            return Err(invalid("unknown job", job));
-        }
-        if instance.kind == Kind::Resident
-            && (instance.start_timeout_ms == 0 || instance.stop_timeout_ms == 0)
-        {
-            return Err(invalid("resident instance requires both timeouts", name));
-        }
-        if instance.inputs.len() > MAX_INPUTS {
-            return Err(invalid("too many inputs", name));
-        }
-        if instance.exports.len() > MAX_EXPORTS {
-            return Err(invalid("too many exports", name));
-        }
-        for (index, export) in instance.exports.iter().enumerate() {
-            if !valid_name(&export.name) || LIFECYCLE_INPUTS.contains(&export.name.as_str()) {
-                return Err(invalid("invalid export name", &export.name));
+        for (n, r) in self.resources.iter().enumerate() {
+            if !valid_name(&r.name) {
+                return Err(invalid("invalid resource name", &r.name));
             }
-            if instance.exports[..index]
-                .iter()
-                .any(|other| other.name == export.name)
+            if self.resources[..n].iter().any(|q| q.name == r.name) {
+                return Err(invalid("duplicate resource", &r.name));
+            }
+            self.payer(&r.payer)?;
+            let (rights, allowed) = match &r.kind {
+                ResourceKind::Mailbox { rights } => {
+                    if r.terminal_revoke {
+                        return Err(invalid("terminal revoke requires sender", &r.name));
+                    }
+                    (
+                        *rights,
+                        Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
+                    )
+                }
+                ResourceKind::Sender {
+                    mailbox, rights, ..
+                } => {
+                    if !self
+                        .resource(mailbox)
+                        .is_some_and(|m| matches!(m.kind, ResourceKind::Mailbox { .. }))
+                    {
+                        return Err(invalid("sender requires mailbox resource", &r.name));
+                    }
+                    if r.terminal_revoke
+                        && !rights.contains(
+                            Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
+                        )
+                    {
+                        return Err(invalid(
+                            "terminal revoke sender lacks required rights",
+                            &r.name,
+                        ));
+                    }
+                    (
+                        *rights,
+                        Rights::WRITE
+                            | Rights::WAIT
+                            | Rights::TRANSIT
+                            | Rights::GRANT
+                            | Rights::DUPLICATE,
+                    )
+                }
+            };
+            if !rights.is_known() || !allowed.contains(rights) {
+                return Err(invalid("invalid resource rights", &r.name));
+            }
+        }
+        for i in &self.instances {
+            if !component(&i.image) || !image_exists(&i.image) {
+                return Err(invalid("missing image", &i.image));
+            }
+            if let Some(job) = &i.job
+                && self.job(job).is_none()
             {
-                return Err(invalid("duplicate export", &export.name));
+                return Err(invalid("unknown job", job));
             }
-            if kind_name(export.kind).is_none() || !export.rights.is_known() {
-                return Err(invalid("invalid export kind or rights", &export.name));
+            if i.inputs.len() > MAX_INPUTS {
+                return Err(invalid("too many inputs", &i.name));
             }
-        }
-        for (index, input) in instance.inputs.iter().enumerate() {
-            if !valid_name(&input.name) || LIFECYCLE_INPUTS.contains(&input.name.as_str()) {
-                return Err(invalid("invalid input name", &input.name));
-            }
-            if instance.inputs[..index]
-                .iter()
-                .any(|other| other.name == input.name)
-            {
-                return Err(invalid("duplicate input", &input.name));
-            }
-            self.validate_source(instance, &input.source, input.rights)?;
-            if let Some(revoke) = &input.revoke {
-                let (
-                    Source::Export {
-                        instance: provider,
-                        export,
-                    },
-                    Source::Export {
-                        instance: admin_provider,
-                        export: admin,
-                    },
-                ) = (&input.source, revoke)
-                else {
-                    return Err(invalid("revoke requires an export route", &input.name));
-                };
-                if provider != admin_provider || admin.strip_suffix(".admin") != Some(export) {
-                    return Err(invalid(
-                        "revoke must name <export>.admin of the provider",
-                        revoke,
-                    ));
-                }
-                self.validate_source(instance, revoke, None)?;
-            }
-        }
-        for after in &instance.after {
-            if after == name || self.instance(after).is_none() {
-                return Err(invalid("invalid after reference", after));
-            }
-        }
-        settings::Settings::parse(&instance.settings)
-            .map_err(|_| invalid("invalid settings encoding", name))?;
-        Ok(())
-    }
-
-    fn validate_source(
-        &self,
-        consumer: &Instance,
-        source: &Source,
-        rights: Option<Rights>,
-    ) -> Result<(), Error> {
-        match source {
-            Source::PlatformDescription | Source::PlatformRoot | Source::SelfPool => {}
-            Source::Image(image) => {
-                if !component(image) {
-                    return Err(invalid("invalid image source", source));
-                }
-            }
-            Source::Job(job) => {
-                if job != SERVICES_JOB && self.job(job).is_none() {
-                    return Err(invalid("unknown job source", source));
-                }
-            }
-            Source::Pool(pool) => {
-                if self.pool(pool).is_none() {
-                    return Err(invalid("unknown pool source", source));
-                }
-            }
-            Source::Export { instance, export } => {
-                if instance == &consumer.name {
-                    return Err(invalid("instance routes its own export", source));
-                }
-                let declared = self
-                    .instance(instance)
-                    .ok_or_else(|| invalid("unknown provider instance", source))?
-                    .exports
-                    .iter()
-                    .find(|candidate| &candidate.name == export)
-                    .ok_or_else(|| invalid("undeclared export", source))?;
-                if let Some(rights) = rights
-                    && !declared.rights.contains(rights)
+            for (n, input) in i.inputs.iter().enumerate() {
+                if !valid_name(&input.name) || input.name.starts_with(oal::namespace::INPUT_PREFIX)
                 {
-                    return Err(invalid("route rights exceed the export", source));
+                    return Err(invalid("invalid or reserved input name", &input.name));
+                }
+                if i.inputs[..n].iter().any(|p| p.name == input.name) {
+                    return Err(invalid("duplicate input", &input.name));
+                }
+                self.validate_source(&input.source, input.rights, &image_exists)?;
+            }
+            let mut description = oal::namespace::Description::default();
+            for (n, b) in i.namespace.iter().enumerate() {
+                self.validate_source(&b.source, Some(b.rights), &image_exists)?;
+                let Source::Resource {
+                    name,
+                    output: ResourceOutput::Main,
+                } = &b.source
+                else {
+                    return Err(invalid("namespace requires sender main output", &b.prefix));
+                };
+                if !self
+                    .resource(name)
+                    .is_some_and(|r| matches!(r.kind, ResourceKind::Sender { .. }))
+                {
+                    return Err(invalid("namespace requires sender main output", &b.prefix));
+                }
+                if !b
+                    .rights
+                    .contains(Rights::WRITE | Rights::WAIT | Rights::TRANSIT)
+                {
+                    return Err(invalid("namespace sender lacks call rights", &b.prefix));
+                }
+                description.bindings.push(oal::namespace::Binding {
+                    prefix: b.prefix.clone(),
+                    input: oal::namespace::input_name(n),
+                });
+            }
+            description
+                .validate()
+                .map_err(|_| invalid("invalid namespace description", &i.name))?;
+            settings::Settings::parse(&i.settings)
+                .map_err(|_| invalid("invalid settings encoding", &i.name))?;
+        }
+        // Receiver 必须且只能 move 一次；Lifetime 至多一个显式 owner，不复制观察责任。
+        for r in &self.resources {
+            for output in [ResourceOutput::Main, ResourceOutput::Lifetime] {
+                let source = Source::Resource {
+                    name: r.name.clone(),
+                    output,
+                };
+                let uses = self
+                    .instances
+                    .iter()
+                    .flat_map(|i| &i.inputs)
+                    .filter(|i| i.source == source)
+                    .count();
+                match (&r.kind, output) {
+                    (ResourceKind::Mailbox { .. }, ResourceOutput::Main) if uses != 1 => {
+                        return Err(invalid(
+                            "receiver requires exactly one input owner",
+                            &r.name,
+                        ));
+                    }
+                    (ResourceKind::Sender { .. }, ResourceOutput::Lifetime) if uses > 1 => {
+                        return Err(invalid("lifetime has multiple input owners", &r.name));
+                    }
+                    _ => {}
                 }
             }
         }
-        if let Some(rights) = rights
-            && !rights.is_known()
-        {
-            return Err(invalid("unknown route rights", source));
-        }
+        self.validate_grants(0)?;
+        self.total_budget()?;
         Ok(())
     }
 }
-
 #[cfg(test)]
 mod tests;

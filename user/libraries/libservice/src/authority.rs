@@ -217,6 +217,10 @@ impl<R: RoleRights> RoleTable<R> {
             .insert_prepared(prepared.entry.with_key(context));
         Ok(())
     }
+    /// 原始索引身份检查，不把已撤销与不存在混为一谈。
+    pub fn contains_context(&self, context: u64) -> bool {
+        self.entries.get(context).is_some()
+    }
     pub fn get(&self, context: u64) -> Result<Snapshot<R>, Status> {
         let snapshot = self.entries.get(context).ok_or(Status::Permission)?;
         if self.sealed || !snapshot.active() {

@@ -1,20 +1,19 @@
-//! 唯一系统故障终局：封 services、撤销已收到的来源管理端、封平台根、有界收集后冷重启。
+//! 唯一系统故障终局：封 services、请求显式委托的静态撤销入口、封平台根、有界收集后冷重启。
 //! 终局不等待撤销完成，也不把进程 DONE 当作硬件静止证明；内核独立保留活 DMA。
-use alloc::vec::Vec;
 use erhino_shared::{
     object::Handle,
     reset::{ResetAction, ResetReason},
     time::Deadline,
 };
-use libkernel::{debug, ipc::capability::Capability, ipc::message::MailboxSender, process};
+use libkernel::{debug, ipc::message::MailboxSender, process};
 use libservice::instance::revoke;
 
-/// 终局所需的 owner；由执行器持有，故障时一次交出。
+/// 终局借用能力句柄与平台；实际 capability owners 仍在调用栈和执行器中存活。
 pub(super) struct Terminal<'a> {
     pub services: Handle,
     pub reset: Handle,
     pub platform: &'a super::platform::Platform,
-    pub admins: Vec<&'a Capability>,
+    pub admins: &'a [Handle],
 }
 
 pub(super) fn run(terminal: Terminal<'_>, reason: &str) -> ! {
@@ -29,10 +28,10 @@ pub(super) fn run(terminal: Terminal<'_>, reason: &str) -> ! {
     let deadline = libkernel::time::timeout_millis(super::executor::TERMINAL_REVOKE_MS)
         .unwrap_or(Deadline::at(0));
     let mut caller = librpc::Caller::new();
-    for admin in &terminal.admins {
+    for admin in terminal.admins {
         let revoked = (|| {
             let sender = MailboxSender::from_capability(super::executor::owned(
-                libkernel::ipc::object::duplicate(admin.as_handle(), super::executor::CALL_RIGHTS)?,
+                libkernel::ipc::object::duplicate(*admin, super::executor::CALL_RIGHTS)?,
             ))
             .map_err(|failure| failure.error)?
             .0;

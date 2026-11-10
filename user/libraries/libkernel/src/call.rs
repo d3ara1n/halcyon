@@ -662,14 +662,15 @@ pub unsafe fn sys_handle_duplicate(
 }
 
 pub unsafe fn sys_mailbox_create(
+    pool: Handle,
     owner_rights: Rights,
     output: &mut Handle,
 ) -> SystemCallResult<()> {
     sys_call(
         SystemCall::MailboxCreate,
+        pool.raw() as usize,
         owner_rights.raw() as usize,
         output as *mut Handle as usize,
-        0,
         0,
     )
     .map(|_| ())
@@ -750,16 +751,21 @@ pub unsafe fn sys_mailbox_make_send_once(
 
 pub unsafe fn sys_mailbox_mint_sender(
     owner: Handle,
+    pool: Handle,
     badge: MailboxBadge,
     rights: Rights,
     output: &mut SenderResult,
 ) -> SystemCallResult<()> {
-    sys_call(
+    sys_call6(
         SystemCall::MailboxMintSender,
-        owner.raw() as usize,
-        badge as usize,
-        rights.raw() as usize,
-        output as *mut SenderResult as usize,
+        [
+            owner.raw() as usize,
+            pool.raw() as usize,
+            badge as usize,
+            rights.raw() as usize,
+            output as *mut SenderResult as usize,
+            0,
+        ],
     )
     .map(|_| ())
 }

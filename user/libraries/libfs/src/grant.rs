@@ -162,16 +162,17 @@ impl GrantTable {
             Ok(minted) => minted,
             Err(error) => return Err(GrantIssueFailure { error, root }),
         };
-        self.prepare_minted_funded(root, policy, funding, minted)
+        self.prepare_minted_funded(mailbox, root, policy, funding, minted)
             .map_err(|failure| GrantIssueFailure {
                 error: failure.error,
                 root: failure.root,
             })
     }
 
-    /// 收编装配者已铸造但尚未公开的 sender/Lifetime 对。
+    /// 收编装配者预建的 sender/Lifetime；调用者须在全部角色安装前阻止 Ingress 收件。
     pub fn prepare_minted(
         &mut self,
+        mailbox: &Mailbox,
         root: NodeRef,
         policy: Issuance,
         account: &AccountView<FsResource>,
@@ -188,11 +189,12 @@ impl GrantTable {
                 });
             }
         };
-        self.prepare_minted_funded(root, policy, funding, minted)
+        self.prepare_minted_funded(mailbox, root, policy, funding, minted)
     }
 
     fn prepare_minted_funded(
         &mut self,
+        mailbox: &Mailbox,
         root: NodeRef,
         policy: Issuance,
         funding: Funding,
@@ -226,7 +228,7 @@ impl GrantTable {
                 });
             }
         };
-        let description = match minted.sender.description() {
+        let description = match minted.validate(mailbox, policy.sender_transport) {
             Ok(description) => description,
             Err(error) => {
                 return Err(GrantAdoptFailure {
@@ -236,16 +238,14 @@ impl GrantTable {
                 });
             }
         };
-        if description.related_object_id != self.mailbox_id
-            || !policy.sender_transport.is_subset_of(description.rights)
-        {
+        let context = description.object_id;
+        if description.related_object_id != self.mailbox_id || self.grants.get(context).is_some() {
             return Err(GrantAdoptFailure {
-                error: SystemCallError::WrongObjectType,
+                error: SystemCallError::IllegalArgument,
                 root,
                 minted,
             });
         }
-        let context = description.object_id;
         let lease = match Rc::try_new(GrantLease {
             active: Cell::new(true),
             _slot: slot,

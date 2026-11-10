@@ -17,6 +17,7 @@ pub(super) struct Root {
     source: SourceRegistration,
     context: u64,
     stopping: bool,
+    installed: bool,
     revoking: bool,
     _bytes: Charge,
 }
@@ -65,12 +66,16 @@ impl Root {
             source: SourceRegistration::new(),
             context,
             stopping: false,
+            installed: false,
             revoking: false,
             _bytes: account.acquire(
                 libfs::resource::FsResource::Bytes,
                 core::mem::size_of::<Self>(),
             )?,
         })
+    }
+    pub fn installed(&self) -> bool {
+        self.installed && !self.stopping
     }
     pub fn take_sender(&mut self) -> Option<MailboxSender> {
         if !self.stopping {
@@ -178,89 +183,9 @@ impl Root {
                     (sender, lifetime)
                 }
             };
+            self.installed = true;
             self.observer = Some(lifetime);
             self.sender = Some(sender);
-        }
-        Ok(Advance {
-            work_done: 1,
-            step: Step::Parked,
-        })
-    }
-}
-pub(super) struct Release {
-    owner: libkernel::ipc::notification::NotificationOwner,
-    source: SourceRegistration,
-    stopping: bool,
-    _fee: Charge,
-}
-impl Release {
-    pub fn admitted(&self) -> bool {
-        self.source.source().is_some()
-    }
-    pub fn new(
-        owner: libkernel::ipc::notification::NotificationOwner,
-        account: &libbudget::AccountView<libfs::resource::FsResource>,
-    ) -> Result<Self, SystemCallError> {
-        Ok(Self {
-            owner,
-            source: SourceRegistration::new(),
-            stopping: false,
-            _fee: account.acquire(libfs::resource::FsResource::WaitSource, 1)?,
-        })
-    }
-    pub fn stop(&mut self) {
-        self.stopping = true;
-    }
-    pub fn registered(&mut self, kind: u64, source: SourceId) {
-        self.source.registered(kind, source);
-    }
-    pub fn unregistered(&mut self, source: SourceId) {
-        self.source.unregistered(source);
-    }
-    pub fn refused(&mut self, kind: u64) {
-        self.source.refused(kind);
-        self.stopping = true;
-    }
-    pub fn advance(
-        &mut self,
-        world: &mut World,
-        requests: &mut Requests<'_, FileTask>,
-        input: &mut Input<'_>,
-    ) -> Result<Advance, SystemCallError> {
-        while let Some(event) = input.pull() {
-            if event
-                .observed
-                .intersects(ObjectSignals::READABLE | ObjectSignals::CLOSED)
-            {
-                world.stop = true;
-                self.stopping = true;
-            }
-        }
-        input.take_timeout();
-        if self.stopping {
-            let _ = self.source.remove(requests);
-            return Ok(Advance {
-                work_done: 1,
-                step: if self.source.is_empty() {
-                    Step::Complete
-                } else {
-                    Step::Runnable
-                },
-            });
-        }
-        if self.source.is_empty() {
-            let _ = self.source.install(
-                requests,
-                SourcePlan::new(
-                    self.owner.as_handle(),
-                    ObjectSignals::READABLE | ObjectSignals::CLOSED,
-                ),
-                1,
-            );
-            return Ok(Advance {
-                work_done: 1,
-                step: Step::Runnable,
-            });
         }
         Ok(Advance {
             work_done: 1,
@@ -278,9 +203,6 @@ pub(super) struct Retire {
     _fee: Charge,
 }
 impl Retire {
-    pub fn admitted(&self) -> bool {
-        self.source.source().is_some()
-    }
     pub fn new(
         owner: libkernel::ipc::notification::NotificationOwner,
         account: &libbudget::AccountView<libfs::resource::FsResource>,

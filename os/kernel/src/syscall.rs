@@ -651,8 +651,13 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
         SystemCall::MailboxCreate => {
             respond_result(
                 frame,
-                mailbox::create(thread, Rights::from_raw(frame.x[10]), frame.x[11] as usize)
-                    .map(|_| 0),
+                mailbox::create(
+                    thread,
+                    Handle::from_raw(frame.x[10]),
+                    Rights::from_raw(frame.x[11]),
+                    frame.x[12] as usize,
+                )
+                .map(|_| 0),
             );
             Outcome::Completed
         }
@@ -722,9 +727,10 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
                 mailbox::mint_sender(
                     thread,
                     Handle::from_raw(frame.x[10]),
-                    frame.x[11],
-                    Rights::from_raw(frame.x[12]),
-                    frame.x[13] as usize,
+                    Handle::from_raw(frame.x[11]),
+                    frame.x[12],
+                    Rights::from_raw(frame.x[13]),
+                    frame.x[14] as usize,
                 )
                 .map(|_| 0),
             );

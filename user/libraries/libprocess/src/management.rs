@@ -12,7 +12,7 @@ use erhino_shared::{
         PROCESS_MAIN_STACK_SIZE, PROCESS_MAX_GRANTS, PROCESS_PAGE_SIZE, PROCESS_USER_TOP,
         ProcessMapFlags, ProcessSnapshot, ThreadStartContext,
     },
-    startup::{EntryThreadDescriptor, StartupBlockHeader},
+    startup::EntryThreadDescriptor,
     time::Deadline,
 };
 use libkernel::process;

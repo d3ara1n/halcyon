@@ -166,12 +166,11 @@ impl<'a> Preparation<'a> {
             if request.grants.len() > PROCESS_MAX_GRANTS {
                 return Err(SpawnError::TooManyGrants);
             }
-            let block_len = core::mem::size_of::<StartupBlockHeader>()
-                .checked_add((request.grants.len() + 1) * core::mem::size_of::<Handle>())
-                .and_then(|len| len.checked_add(core::mem::size_of::<EntryThreadDescriptor>()))
-                .and_then(|len| len.checked_add(request.payload.len()))
-                .filter(|len| u32::try_from(*len).is_ok())
-                .ok_or(SpawnError::InvalidImage)?;
+            let block_len = erhino_shared::startup::compact_block_len(
+                request.grants.len() + 1,
+                request.payload.len(),
+            )
+            .ok_or(SpawnError::InvalidImage)?;
             Ok(block_len)
         })();
         let (block_len, mut failure) = match geometry {

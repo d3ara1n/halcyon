@@ -9,6 +9,7 @@ edition = "2024"
 host = ["dep:toml", "settings/encode"]
 
 [dependencies]
+oal = { path = "../oal" }
 erhino_shared = { path = "../erhino_shared" }
 settings = { path = "../settings" }
 toml = { version = "=0.8.23", optional = true, features = ["preserve_order"] }

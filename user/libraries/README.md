@@ -15,7 +15,7 @@
 依赖从知识的使用者指向提供者，形成有向无环图。上层使用下层的通用概念表达自身领域，下层不为上层预定义领域类型、状态或资源分类。依赖审视既检查 Cargo 图，也检查公共类型、回调契约、资源枚举和调用顺序要求，不能只以“没有包循环”证明分层正确。
 
 - `libbudget` 拥有账户、领域计费视图、额度、预留、扣账和退款；`libexecution` 拥有任务推进、来源观察、期限、唤醒、停止与退休。二者不解释服务角色或业务资源。
-- `liboal` 拥有开放发现表示、Boundary、Namespace 和客户端路径接续；不定义文件种类、服务记录、共同 ACL 或 backing。
+- `liboal` 拥有开放发现表示、Boundary、真实 Namespace 的采用和客户端路径接续；纯路径规则与 Namespace 出生描述由 `shared/oal` 提供，组态和 liboal 共同消费。libprocess 只提供通用出生 data sections，不反向认识 OAL；liboal 不定义文件种类、服务记录、共同 ACL 或 backing。
 - `libfs` 拥有文件协议、纯值、FsRights、文件 backing、provider 支持及客户端 Copy 组合。Copy 通过 OAL 接续、RPC 调用和 Runnel 搬运持有具体会话/清理责任，由使用侧 init 任务族组合运行；库不自建运行体，不依赖原 FAL，也不持服务目录投影。
 - `libservice` 拥有服务描述、发布授权、注册/取得、控制与生命周期；只依赖 OAL 的发现和接续表达，直接从 registry backing 生成视图，不依赖文件库或文件节点。
 - 原 `libfal` 已删除；普通文件与服务客户端直接消费各自领域协议及 OAL Namespace/walk，没有 DirectoryGrant/Position 兼容出口。

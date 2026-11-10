@@ -1,0 +1,5 @@
+[package]
+name = "oal"
+version = "0.1.0"
+edition = "2024"
+description = "OAL canonical paths and namespace descriptions"

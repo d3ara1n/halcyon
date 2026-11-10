@@ -108,8 +108,13 @@ impl ManagementTable {
         })
     }
     /// 可信发行边界接管实际 sender/Lifetime，付款视图必须来自同一个账户。
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "采用边界分别核 receiver、领域范围及同账户付款，失败完整返还输入 owner"
+    )]
     pub fn prepare_minted(
         &mut self,
+        mailbox: &Mailbox,
         root: NodeRef,
         max_rights: FsRights,
         output_transport: Rights,
@@ -125,11 +130,12 @@ impl ManagementTable {
                 return Err(SystemCallError::IllegalArgument);
             }
             let funding = Funding::new(domain, execution)?;
-            let description = minted.sender.description()?;
+            let description =
+                minted.validate(mailbox, Rights::WRITE | Rights::WAIT | Rights::TRANSIT)?;
             if description.related_object_id != self.mailbox_id
-                || !description.rights.contains(Rights::WRITE | Rights::WAIT)
+                || self.entries.get(description.object_id).is_some()
             {
-                return Err(SystemCallError::WrongObjectType);
+                return Err(SystemCallError::IllegalArgument);
             }
             let slot =
                 Counter::try_acquire(&self.slots).map_err(|_| SystemCallError::QuotaExceeded)?;

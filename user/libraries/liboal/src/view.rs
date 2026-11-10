@@ -1,12 +1,11 @@
 //! 客户端视图中的词法路径；被抵消的分量不访问远端。
 
-use crate::{FollowBudget, LocalError, path::validate_path};
+use crate::{FollowBudget, LocalError};
 use alloc::string::String;
 
 /// Namespace 前缀和显式 cwd 必须已经是规范绝对路径；不静默修正绑定。
 pub fn validate_absolute(path: &str) -> Result<(), LocalError> {
-    let relative = path.strip_prefix('/').ok_or(LocalError::InvalidPath)?;
-    validate_path(relative).map_err(|_| LocalError::InvalidPath)
+    oal::path::validate_absolute(path).map_err(|_| LocalError::InvalidPath)
 }
 
 pub fn normalize(path: &str, cwd: &str, budget: &mut FollowBudget) -> Result<String, LocalError> {

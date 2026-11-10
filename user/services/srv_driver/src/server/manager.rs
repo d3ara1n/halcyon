@@ -6,10 +6,6 @@ use libdevice::{
 };
 use libexecution::runtime::SourcePlan;
 
-/// 管理入口与公开观察入口的导出名。
-const CONTROL_EXPORT: &str = "driver.control";
-const OBSERVER_EXPORT: &str = "driver.observer";
-
 #[derive(Clone, Copy)]
 enum Operation {
     Watch,
@@ -20,8 +16,6 @@ enum Operation {
     Ack,
 }
 pub(super) struct Manager {
-    control: Option<MailboxSender>,
-    observer: Option<MailboxSender>,
     watch: Option<libdevice::client::Watch>,
     source: SourceRegistration,
     call: Option<(u64, Operation)>,
@@ -139,10 +133,8 @@ impl Manager {
         }
         Ok(())
     }
-    pub fn new(control: MailboxSender, observer: MailboxSender) -> Self {
+    pub fn new() -> Self {
         Self {
-            control: Some(control),
-            observer: Some(observer),
             watch: None,
             source: SourceRegistration::new(),
             call: None,
@@ -396,32 +388,6 @@ impl Manager {
         }
         if self.source.is_installing() {
             return Ok(advance(Step::Runnable));
-        }
-        if self.watch.is_some() && !world.ready {
-            let reporter = world
-                .reporter
-                .as_mut()
-                .ok_or(SystemCallError::ObjectClosed)?;
-            for (name, sender) in [
-                (CONTROL_EXPORT, &mut self.control),
-                (OBSERVER_EXPORT, &mut self.observer),
-            ] {
-                let sender = sender.take().expect("driver startup entry missing");
-                reporter
-                    .export(
-                        name,
-                        sender.into_capability(),
-                        TRANSPORT,
-                        Deadline::INFINITE,
-                    )
-                    .map_err(|(_, error)| error)?;
-            }
-            reporter.ready(&[], Deadline::INFINITE)?;
-            world.ready = true;
-            libkernel::debug!(
-                "driver manager ready; declarations={}, device Watch installed",
-                world.catalog.count()
-            );
         }
         let operation = retired.or(self.next).or(if world.discovery_dirty {
             Some(Operation::Query)

@@ -8,7 +8,7 @@
 
 1. [全项目重构总纲：剩余切面与接续顺序](todo-2026-09-29-system-redesign.md#剩余切面与接续顺序)。本轮整理范围见[活跃资料清理](todo-2026-09-29-system-redesign.md#活跃资料清理2026-10-27)，后续代码/Review按各自记录接手；主线设计入口如下。
 2. [OAL、fs 与服务目录改造](todo-2026-10-07-fal-service-redesign.md#当前接力)：本轮实施已提交；[固定交付独立 Review](archived/todo-2026-10-11-oal-fs-service-review.md)已完成，报告记录的证据缺口继续由主计划和既有 owner 承接；通用等待与付款前置分别由 [Notification 观察角色](todo-2026-10-10-notification-observer-roles.md#当前接力与范围)和[执行付款](archived/todo-2026-10-10-execution-funding.md#当前接力与范围)拥有。
-3. [正式用户态环境的接续](todo-2026-10-07-service-assembly.md#当前接力)：首个交互应用的输入输出、装配与生命周期设计；已有 [initfs 组态与统一服务契约](todo-2026-10-28-init-formation.md#当前接力)作为前置。
+3. [静态入口与 OAL 组态装配 IF2](todo-2026-10-28-init-formation.md#if2-交付与接力)：从本案当前审阅/清理与条件提交接力进入；正式运行仍由用户另选范围；[pm 与正式用户态接续](todo-2026-10-07-service-assembly.md#当前接力)在引用新出生接口前重核详细设计，电源管理与新故障机制后置。
 
 扩展参考：[用户态设施与驱动缺口盘点](ref-2026-11-10-userland-facilities.md)；固定基线的能力地图与候选路线，不是施工入口或新增排期。
 
@@ -44,11 +44,11 @@ host 验证与正式运行按[构建与验证手册](BUILD-AND-TEST.md)选择；
 | 任务 | 排期条件 |
 |---|---|
 | [服务装配其余后续](todo-2026-10-07-service-assembly.md#条件后续与设计交付检查) | 真实应用、独立管理器或恢复需求触发对应条件项；initfs 组态由独立计划承接 |
-| [系统关机编排](todo-2026-09-system-shutdown-orchestration.md#通用关机的剩余范围) | 非持久静态部署停止已收口；持久服务出现前闭合 drain/flush、恢复与停止依赖 |
+| [系统关机编排](todo-2026-09-system-shutdown-orchestration.md#服务系统定位与职责修订) | IF2 已移除 init 正常停机链；正常电源操作接入前闭合新 owner 的请求、停止与监管衔接，持久服务另需 drain/flush |
 | [不可信域metadata硬隔离](todo-2026-09-14-kernel-memory-budget.md) | 开放不可信创建域或承诺独立硬容量隔离前；已有双维Pool付款不重做 |
 | [文件扩展操作](todo-2026-09-fal-extended-operations.md) | 范围外操作出现真实消费者 |
 | [平台保留内存生命周期](todo-2026-09-platform-reserved-memory-lifecycle.md) | 平台/设备消费动态保留区、memory-region 或 reusable 前 |
-| [电源管理服务](todo-2026-09-power-management-service.md) | 独立电源管理需求明确后 |
+| [电源管理服务](todo-2026-09-power-management-service.md) | 用户选择接续正常电源功能时启动；开放正常请求前闭合入口、授权及与关机编排的交接，当前未接通 |
 | [内核最终架构审查](todo-2026-09-kernel-final-architecture-review.md) | 主要用户态消费者及计划所列主线前置完成后 |
 | [Halcyon std 平台层](todo-2026-09-28-halcyon-std.md) | 出现必须依赖 std 的真实第三方需求 |
 

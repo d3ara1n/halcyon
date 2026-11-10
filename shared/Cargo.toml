@@ -11,5 +11,6 @@ members = [
     "funded_storage",
     "settings",
     "formation",
+    "oal",
 ]
 resolver = "2"

@@ -6,7 +6,7 @@
 - **[impls/](impls/)**：回头描述代码已经实现的当前面貌，供架构审计免读代码。按组件与机制解释模块、数据与控制流、所有权、生命周期、并发、失败行为及当前限制，脱离任务背景仍可独立阅读；不承载设计裁决、目标选择、质量评价或完成宣告；
 - **images/**：图源。
 
-施工以代码核实当前事实，审计读 impls；重构目标以所属计划中已确认的详细设计为依据。ideas 只表达线稿，处于施工或重构范围时默认不可据以补齐目标设计。设计决策、状态机、完整契约和实现方案写在计划，不进 ideas。
+施工以代码核实当前事实，审计读 impls；重构目标以所属计划中已确认的详细设计为依据。ideas 只表达线稿：已登记审定的范围可作为对应模块与概念关系的参考，未登记范围不可据以补齐目标设计；关系审定不代表接口、状态机或实施方案已经闭合。设计决策、完整契约和实现方案写在计划，不进 ideas。
 
 粒度判据：正常实施可能推翻的内容不属于 ideas。实施中遇到必须推翻线稿的情况，即回到设计阶段，由计划记录设计轮次后再改 ideas；单纯实施只回填 impls。
 
@@ -23,7 +23,9 @@
 | 内核边界、协作式执行与内部机制 | [kernel](ideas/kernel.md) | [internals](impls/internals.md) |
 | 系统复位 authority、语义与平台映射 | [system-reset](ideas/system-reset.md) | [internals](impls/internals.md) |
 | 对象、Capability、Handle、运输与根授权 | [object](ideas/object.md) | [MemoryObject](impls/memory-object.md)、[IPC 对象](impls/ipc.md) |
-| Bootstrap、init、StartupBlock 与 launcher | [bootstrap](ideas/bootstrap.md) | [startup](impls/startup.md) |
+| process-zero、initfs、Formation、init 与出生装载 | [bootstrap](ideas/bootstrap.md) | [startup](impls/startup.md) |
+| 受托进程管理、pm 授权与进程信息视图 | [process-management](ideas/process-management.md) | — |
+| 应用包、应用启动服务与用户术语 | [application](ideas/application.md) | — |
 | Job、进程、线程、生命周期与调度类 | [task](ideas/task.md) | [task](impls/task.md) |
 | Hart、执行需求、调度域、用户上下文与 trap | [execution-context](ideas/execution-context.md) | [execution-context](impls/execution-context.md) |
 | 内存所有权、地址空间与映射 | [mm](ideas/mm.md) | [mm](impls/mm.md) |
@@ -43,4 +45,10 @@
 | 文件领域、流与 Copy | [fs](ideas/fs.md) | [fs](impls/fs.md) |
 | 设备声明、发现/PnP、驱动接管、租约与资源机制 | [device](ideas/device.md) | [资源内部机制](impls/device.md)、[MMIO/VM 接线](impls/mm.md#映射来源与-mmio-退休原语) |
 
-应用层构想不属于系统契约，单独位于 [`ideas/applications/`](ideas/applications/)；当前包含机器人 [ECS](ideas/applications/ecs.md)。
+具体应用产品的构想不属于系统契约，单独位于 [`ideas/applications/`](ideas/applications/)；当前包含机器人 [ECS](ideas/applications/ecs.md)。它与 [application](ideas/application.md) 描述的系统应用启动/打包关系不是同一主题。
+
+## 用户态体系阅读路径
+
+先读 [bootstrap](ideas/bootstrap.md) 理解初始进程与组态，再读 [process-management](ideas/process-management.md) 理解受托进程入口；应用、服务、驱动三类调用方分别从 [application](ideas/application.md)、[service](ideas/service.md)、[device](ideas/device.md) 进入。各篇只拥有自己的关系，发现/文件访问与公共库组合分别链接 OAL、fs 和 framework，不在每篇重述。
+
+这些线稿描述目标体系，不代表对应服务已经实现。参考资格以[审定登记](../plans/todo-2026-09-29-system-redesign.md#重构设计依据与-ideas-审定登记)的精确范围为准；U1 的详细设计缺口与施工前置由[唯一工作记录](../plans/todo-2026-10-07-service-assembly.md#用户态体系线稿审定轮次-u1)承载。

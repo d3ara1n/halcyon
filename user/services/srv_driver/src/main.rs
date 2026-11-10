@@ -6,15 +6,15 @@ extern crate libruntime;
 use alloc::{string::String, vec::Vec};
 use erhino_shared::object::{ObjectKind, Rights};
 use libdriver::boot::Catalog;
-use libkernel::ipc::message::MailboxSender;
+use libkernel::ipc::message::{Mailbox, MailboxSender, MintedSender};
+use liboal::Namespace;
 use libprocess::{
     birth::Birth,
     image::{IMAGE_RIGHTS, Image},
 };
-use libservice::instance::{self, child::Reporter};
 mod server;
 
-/// 设备来源输入；由 srv_device 预签发、经组态路由。
+/// 设备来源输入；由组态接线、srv_device 采用其领域权限。
 const DEVICE_SOURCE: &str = "device.source";
 /// worker 所在 Job。
 const WORKERS: &str = "driver.workers";
@@ -26,19 +26,9 @@ fn main() {
         Birth::adopt(libruntime::startup::take().expect("driver startup context missing"))
             .expect("driver birth frame invalid");
     let catalog = Catalog::from_settings(birth.settings()).expect("driver declarations invalid");
-    let reporter = Reporter::new(
-        birth
-            .require(
-                instance::REPORT,
-                instance::REPORT_KIND,
-                instance::REPORT_RIGHTS,
-            )
-            .expect("driver report input invalid"),
-    )
-    .expect("driver report sender invalid");
-    let stop = birth
-        .require(instance::STOP, instance::STOP_KIND, instance::STOP_RIGHTS)
-        .expect("driver stop input invalid");
+    let namespace = Namespace::adopt_birth(&mut birth).expect("driver Namespace input invalid");
+    let control = adopt_endpoint(&mut birth, "driver.control");
+    let observer = adopt_endpoint(&mut birth, "driver.observer");
     let pool = birth
         .require(
             "memory.pool",
@@ -86,12 +76,47 @@ fn main() {
     birth.finish().expect("driver birth has unclaimed inputs");
     server::run(server::Startup {
         process,
-        reporter,
-        stop,
+        namespace,
+        control,
+        observer,
         pool,
         job,
         claim,
         catalog,
         images,
     });
+}
+
+/// 接收真实的独立队列与完整身份 pair；错误时 owner 沿致命出生失败释放。
+fn adopt_endpoint(birth: &mut Birth, prefix: &str) -> server::Endpoint {
+    let (mailbox, _) = Mailbox::from_capability(
+        birth
+            .require(
+                &alloc::format!("{prefix}.receiver"),
+                ObjectKind::MailboxReceiver,
+                Rights::READ | Rights::WAIT,
+            )
+            .expect("driver receiver input invalid"),
+    )
+    .map_err(|failure| failure.error)
+    .expect("driver receiver role invalid");
+    let sender = birth
+        .require(
+            &alloc::format!("{prefix}.sender"),
+            ObjectKind::MailboxSender,
+            Rights::WRITE | Rights::WAIT,
+        )
+        .expect("driver sender input invalid");
+    let lifetime = birth
+        .require(
+            &alloc::format!("{prefix}.lifetime"),
+            ObjectKind::LifetimeObserver,
+            Rights::WAIT,
+        )
+        .expect("driver Lifetime input invalid");
+    let pair =
+        MintedSender::from_capabilities(&mailbox, sender, lifetime, Rights::WRITE | Rights::WAIT)
+            .map_err(|failure| failure.error)
+            .expect("driver sender pair invalid");
+    server::Endpoint { mailbox, pair }
 }

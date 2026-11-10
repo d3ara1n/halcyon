@@ -1,6 +1,97 @@
-# System 组态：设备登记、驱动选择与内存文件宿主（承载服务 registry）。
-# 组态源选择由 Justfile 的 FORMATION_SOURCES 拥有。
-finish = "stay"
+# System：由 init 预建运输入口、显式付款及每宿主的完整初始前缀视图。
+# Namespace 是前缀路由，不合成文件根的目录枚举；资源名字不决定协议或权限。
+
+[resource."device.mailbox"]
+kind = "mailbox"
+payer = "device"
+rights = ["read", "wait", "manage"]
+
+[resource."driver.control.mailbox"]
+kind = "mailbox"
+payer = "driver"
+rights = ["read", "wait", "manage"]
+
+[resource."driver.observer.mailbox"]
+kind = "mailbox"
+payer = "driver"
+rights = ["read", "wait", "manage"]
+
+[resource."fs.file.mailbox"]
+kind = "mailbox"
+payer = "fs"
+rights = ["read", "wait", "manage"]
+
+[resource."fs.management.mailbox"]
+kind = "mailbox"
+payer = "fs"
+rights = ["read", "wait", "manage"]
+
+[resource."fs.service.mailbox"]
+kind = "mailbox"
+payer = "fs"
+rights = ["read", "wait", "manage"]
+
+[resource."device.driver"]
+kind = "sender"
+payer = "device"
+rights = ["write", "wait", "duplicate", "transit", "grant"]
+mailbox = "device.mailbox"
+
+[resource."device.driver.admin"]
+kind = "sender"
+payer = "device"
+rights = ["write", "wait", "duplicate", "transit", "grant"]
+mailbox = "device.mailbox"
+terminal_revoke = true
+
+[resource."device.view"]
+kind = "sender"
+payer = "device"
+rights = ["write", "wait", "duplicate", "transit", "grant"]
+mailbox = "device.mailbox"
+
+[resource."device.view.admin"]
+kind = "sender"
+payer = "device"
+rights = ["write", "wait", "duplicate", "transit", "grant"]
+mailbox = "device.mailbox"
+terminal_revoke = true
+
+[resource."driver.control"]
+kind = "sender"
+payer = "driver"
+rights = ["write", "wait", "duplicate", "transit", "grant"]
+mailbox = "driver.control.mailbox"
+
+[resource."driver.observer"]
+kind = "sender"
+payer = "driver"
+rights = ["write", "wait", "duplicate", "transit", "grant"]
+mailbox = "driver.observer.mailbox"
+
+[resource."fs.file"]
+kind = "sender"
+payer = "fs"
+rights = ["write", "wait", "duplicate", "transit", "grant"]
+mailbox = "fs.file.mailbox"
+
+[resource."fs.management"]
+kind = "sender"
+payer = "fs"
+rights = ["write", "wait", "duplicate", "transit", "grant"]
+mailbox = "fs.management.mailbox"
+
+[resource."fs.directory"]
+kind = "sender"
+payer = "fs"
+rights = ["write", "wait", "duplicate", "transit", "grant"]
+mailbox = "fs.service.mailbox"
+
+[resource."fs.authority"]
+kind = "sender"
+payer = "fs"
+rights = ["write", "wait", "duplicate", "transit", "grant"]
+mailbox = "fs.service.mailbox"
 
 [job.drivers]
 parent = "services"
@@ -8,32 +99,48 @@ pool = "driver"
 
 [instance.device]
 image = "srv_device"
-kind = "resident"
 pool = { work_pages = 2048, metadata_bytes = 1048576 }
-start_timeout_ms = 5000
-stop_timeout_ms = 40000
 inputs."memory.pool" = "self/memory.pool"
 inputs."platform.description" = "init/platform.description"
 inputs."platform.root" = "init/platform.root"
-exports."device.source.driver" = { kind = "mailbox_sender", rights = ["write", "wait", "duplicate", "transit", "grant"] }
-exports."device.source.driver.admin" = { kind = "mailbox_sender", rights = ["write", "wait", "duplicate", "transit", "grant"] }
-settings.sources = [{ name = "driver", scope = "root", access = ["observe", "claim", "child_register", "report_stopped"] }]
+inputs."device.receiver" = { from = "init/object.device.mailbox", rights = ["read", "wait", "manage"] }
+inputs."device.source.0" = { from = "init/object.device.driver", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+inputs."device.source_lifetime.0" = { from = "init/lifetime.device.driver", rights = ["wait"] }
+inputs."device.admin.0" = { from = "init/object.device.driver.admin", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+inputs."device.admin_lifetime.0" = { from = "init/lifetime.device.driver.admin", rights = ["wait"] }
+inputs."device.source.1" = { from = "init/object.device.view", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+inputs."device.source_lifetime.1" = { from = "init/lifetime.device.view", rights = ["wait"] }
+inputs."device.admin.1" = { from = "init/object.device.view.admin", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+inputs."device.admin_lifetime.1" = { from = "init/lifetime.device.view.admin", rights = ["wait"] }
+namespace."/" = { from = "init/object.fs.file", rights = ["write", "wait", "transit"] }
+namespace."/services" = { from = "init/object.fs.directory", rights = ["write", "wait", "transit"] }
+namespace."/devices" = { from = "init/object.device.view", rights = ["write", "wait", "transit"] }
+namespace."/drivers" = { from = "init/object.driver.observer", rights = ["write", "wait", "transit"] }
+settings.sources = [
+  { name = "driver", scope = "root", access = ["observe", "claim", "child_register", "report_stopped"] },
+  { name = "view", scope = "root", access = ["observe"] },
+]
 
 [instance.driver]
 image = "srv_driver"
-kind = "resident"
-# 管理者加三份活 worker 与一次退休重叠，每份为 libdriver::boot::WORKER_POOL。
+# 管理者、三份 worker 与一次退休重叠，沿现有正式工作集。
 pool = { work_pages = 20480, metadata_bytes = 5246976 }
-start_timeout_ms = 5000
-stop_timeout_ms = 40000
 inputs."memory.pool" = "self/memory.pool"
-inputs."device.source" = { from = "device/device.source.driver", revoke = "device/device.source.driver.admin" }
 inputs."driver.workers" = "init/job.drivers"
 inputs."driver.image.drv_pci_generic" = "init/image.drv_pci_generic"
 inputs."driver.image.drv_usb_xhci" = "init/image.drv_usb_xhci"
 inputs."driver.image.drv_usb_hid" = "init/image.drv_usb_hid"
-exports."driver.control" = { kind = "mailbox_sender", rights = ["write", "wait", "duplicate", "transit", "grant"] }
-exports."driver.observer" = { kind = "mailbox_sender", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+inputs."device.source" = { from = "init/object.device.driver", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+inputs."driver.control.receiver" = { from = "init/object.driver.control.mailbox", rights = ["read", "wait", "manage"] }
+inputs."driver.control.sender" = { from = "init/object.driver.control", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+inputs."driver.control.lifetime" = { from = "init/lifetime.driver.control", rights = ["wait"] }
+inputs."driver.observer.receiver" = { from = "init/object.driver.observer.mailbox", rights = ["read", "wait", "manage"] }
+inputs."driver.observer.sender" = { from = "init/object.driver.observer", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+inputs."driver.observer.lifetime" = { from = "init/lifetime.driver.observer", rights = ["wait"] }
+namespace."/" = { from = "init/object.fs.file", rights = ["write", "wait", "transit"] }
+namespace."/services" = { from = "init/object.fs.directory", rights = ["write", "wait", "transit"] }
+namespace."/devices" = { from = "init/object.device.view", rights = ["write", "wait", "transit"] }
+namespace."/drivers" = { from = "init/object.driver.observer", rights = ["write", "wait", "transit"] }
 settings.declarations = [
   { implementation = "drv_pci_generic", identity = "platform:pci-host-ecam-generic", priority = 1, capacity = 1, reusable = false, child_registrar = true, trusted_physical = true },
   { implementation = "drv_usb_xhci", identity = "pci:0c0330", priority = 1, capacity = 1, reusable = false, child_registrar = true, trusted_physical = true },
@@ -42,14 +149,38 @@ settings.declarations = [
 
 [instance.fs]
 image = "srv_fs"
-kind = "resident"
 pool = { work_pages = 4096, metadata_bytes = 1048576 }
-start_timeout_ms = 10000
-stop_timeout_ms = 10000
 inputs."memory.pool" = "self/memory.pool"
-exports."file.root.0" = { kind = "mailbox_sender", rights = ["write", "wait", "transit"] }
-exports."file.management.0" = { kind = "mailbox_sender", rights = ["write", "wait", "transit"] }
-exports."service.directory.0" = { kind = "mailbox_sender", rights = ["write", "wait", "transit"] }
-exports."service.authority.0" = { kind = "mailbox_sender", rights = ["write", "wait", "transit"] }
+inputs."file.receiver" = { from = "init/object.fs.file.mailbox", rights = ["read", "wait", "manage"] }
+inputs."file.management.receiver" = { from = "init/object.fs.management.mailbox", rights = ["read", "wait", "manage"] }
+inputs."service.receiver" = { from = "init/object.fs.service.mailbox", rights = ["read", "wait", "manage"] }
+inputs."file.root.0" = { from = "init/object.fs.file", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+inputs."file.root.lifetime.0" = { from = "init/lifetime.fs.file", rights = ["wait"] }
+inputs."file.management.0" = { from = "init/object.fs.management", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+inputs."file.management.lifetime.0" = { from = "init/lifetime.fs.management", rights = ["wait"] }
+inputs."service.directory.0" = { from = "init/object.fs.directory", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+inputs."service.directory.lifetime.0" = { from = "init/lifetime.fs.directory", rights = ["wait"] }
+inputs."service.authority.0" = { from = "init/object.fs.authority", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+inputs."service.authority.lifetime.0" = { from = "init/lifetime.fs.authority", rights = ["wait"] }
+namespace."/" = { from = "init/object.fs.file", rights = ["write", "wait", "transit"] }
+namespace."/services" = { from = "init/object.fs.directory", rights = ["write", "wait", "transit"] }
+namespace."/devices" = { from = "init/object.device.view", rights = ["write", "wait", "transit"] }
+namespace."/drivers" = { from = "init/object.driver.observer", rights = ["write", "wait", "transit"] }
 settings.registry = true
-settings.entries = [{ watches = 24, sessions = 16 }]
+[[instance.fs.settings.entries]]
+watches = 24
+sessions = 16
+[instance.fs.settings.entries.file]
+rights = ["traverse", "enumerate", "read_property", "write_property", "read_stream", "write_stream", "create", "remove", "watch", "describe", "derive"]
+output = ["read", "write", "signal", "wait", "manage", "transit", "duplicate", "grant"]
+[instance.fs.settings.entries.management]
+rights = ["traverse", "enumerate", "read_property", "write_property", "read_stream", "write_stream", "create", "remove", "watch", "describe", "derive"]
+output = ["read", "write", "signal", "wait", "manage", "transit", "duplicate", "grant"]
+[instance.fs.settings.entries.directory]
+scope = "/"
+rights = ["describe", "enumerate", "get_entry", "watch"]
+output = ["write", "wait", "transit", "duplicate"]
+[instance.fs.settings.entries.authority]
+scope = "/"
+rights = ["create", "replace", "delegate"]
+output = ["write", "wait", "transit", "duplicate", "grant"]

@@ -332,8 +332,6 @@ impl PlatformTask {
                 .expect("platform adapter missing")
                 .device = Some(device);
             self.entry = None;
-            world.platform_ready = true;
-            requests.wake(world.root_task)?;
             libkernel::debug!("platform PCI host registered: serial={}", device.serial());
         }
         if let Some(entry) = self.entry.as_ref() {

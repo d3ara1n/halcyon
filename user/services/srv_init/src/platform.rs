@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use erhino_shared::{
     call::SystemCallError,
     mem::MemoryProtection,
-    object::{Handle, Rights},
+    object::Handle,
     platform::{Description, ResourceKind},
 };
 use libkernel::{
@@ -14,26 +14,6 @@ use libkernel::{
     mm::{MappedRegion, Placement},
 };
 use libprocess::context::InitialGrants;
-
-/// 路由平台描述时的权利；接收方按此核验只读描述对象。
-pub(crate) const DESCRIPTION_RIGHTS: Rights = Rights::from_raw(
-    Rights::READ.raw()
-        | Rights::WAIT.raw()
-        | Rights::DUPLICATE.raw()
-        | Rights::TRANSIT.raw()
-        | Rights::GRANT.raw(),
-);
-/// 路由平台根时的权利。
-pub(crate) const ROOT_RIGHTS: Rights = Rights::from_raw(
-    Rights::READ.raw()
-        | Rights::WRITE.raw()
-        | Rights::WAIT.raw()
-        | Rights::MANAGE.raw()
-        | Rights::CREATE.raw()
-        | Rights::DUPLICATE.raw()
-        | Rights::TRANSIT.raw()
-        | Rights::GRANT.raw(),
-);
 
 pub(crate) struct Root {
     pub kind: ResourceKind,

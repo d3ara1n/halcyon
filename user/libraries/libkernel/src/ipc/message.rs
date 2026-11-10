@@ -13,7 +13,8 @@ use erhino_shared::{
     call::SystemCallError,
     message::{HandleMove, MESSAGE_HANDLE_MAX, MailboxBadge, MessageHeader, PAYLOAD_MAX},
     object::{
-        Handle, HandleDescription, HandlePair, ObjectKind, ObjectSignals, Rights, SenderResult,
+        CURRENT_PROCESS_POOL, Handle, HandleDescription, HandlePair, ObjectKind, ObjectSignals,
+        Rights, SenderResult,
     },
     time::Deadline,
     wait::WaitReason,
@@ -293,9 +294,93 @@ impl SendOnce {
     }
 }
 
+#[derive(Debug)]
 pub struct MintedSender {
     pub sender: MailboxSender,
     pub lifetime: LifetimeObserver,
+}
+
+/// 运输 pair 采用失败时，完整保留两个输入的唯一关闭责任。
+#[derive(Debug)]
+pub struct MintedSenderAdoptFailure {
+    pub sender: Capability,
+    pub lifetime: Capability,
+    pub error: SystemCallError,
+}
+
+/// 仅由实际 Query 的描述进入此边界；不从 payload、badge 或声明的裸 ID 推导配对。
+fn validate_sender_pair(
+    receiver: &HandleDescription,
+    sender: &HandleDescription,
+    lifetime: &HandleDescription,
+    required_sender_rights: Rights,
+) -> Result<(), SystemCallError> {
+    if receiver.kind != ObjectKind::MailboxReceiver as u32
+        || sender.kind != ObjectKind::MailboxSender as u32
+        || lifetime.kind != ObjectKind::LifetimeObserver as u32
+    {
+        return Err(SystemCallError::WrongObjectType);
+    }
+    if !required_sender_rights.is_known()
+        || !receiver.rights.contains(Rights::READ)
+        || !sender
+            .rights
+            .contains(Rights::WRITE | required_sender_rights)
+        || !lifetime.rights.contains(Rights::WAIT)
+    {
+        return Err(SystemCallError::RightsDenied);
+    }
+    if sender.related_object_id != receiver.object_id
+        || lifetime.related_object_id != sender.object_id
+    {
+        return Err(SystemCallError::WrongObjectType);
+    }
+    Ok(())
+}
+
+impl MintedSender {
+    /// 采用出生或消息运输的完整 sender/Lifetime pair。
+    /// Query 真实 receiver 和两个输入，核对 kind、两级关联身份及接收/发送/观察权利。
+    /// 领域角色、重复 context 与本地授权安装由调用方负责；失败不消费任一输入。
+    pub fn from_capabilities(
+        receiver: &Mailbox,
+        sender: Capability,
+        lifetime: Capability,
+        required_sender_rights: Rights,
+    ) -> Result<Self, MintedSenderAdoptFailure> {
+        let checked = (|| {
+            let receiver = super::object::query(receiver.as_handle())?;
+            let sender = sender.description()?;
+            let lifetime = lifetime.description()?;
+            validate_sender_pair(&receiver, &sender, &lifetime, required_sender_rights)
+        })();
+        match checked {
+            Ok(()) => Ok(Self {
+                sender: MailboxSender::from_minted(sender),
+                lifetime: LifetimeObserver::from_minted(lifetime),
+            }),
+            Err(error) => Err(MintedSenderAdoptFailure {
+                sender,
+                lifetime,
+                error,
+            }),
+        }
+    }
+
+    /// 在领域采用边界重新核实完整 pair，返回 sender 描述供 context ID/badge 使用。
+    /// receiver 须具 READ，sender 须具 WRITE 及 required_sender_rights，Lifetime 须具 WAIT。
+    /// 借用校验不改变任何 owner，也不证明领域角色或 context 尚未登记。
+    pub fn validate(
+        &self,
+        receiver: &Mailbox,
+        required_sender_rights: Rights,
+    ) -> Result<HandleDescription, SystemCallError> {
+        let receiver = super::object::query(receiver.as_handle())?;
+        let sender = self.sender.description()?;
+        let lifetime = self.lifetime.description()?;
+        validate_sender_pair(&receiver, &sender, &lifetime, required_sender_rights)?;
+        Ok(sender)
+    }
 }
 
 capability_role!(LifetimeObserver, LifetimeObserver, Rights::WAIT);
@@ -323,10 +408,17 @@ impl Mailbox {
         }
     }
 
+    /// 明确选择当前进程绑定 Pool；与 create_in 使用同一工厂，无失败降级。
     pub fn create(rights: Rights) -> Result<Self, SystemCallError> {
+        Self::create_in(CURRENT_PROCESS_POOL, rights)
+    }
+
+    /// Core、固定队列、Receiver 及维护由 pool 付款；真实 Pool 须具 CREATE。
+    /// Pool 只借用，本地 Handle 表项仍由本进程付款。
+    pub fn create_in(pool: Handle, rights: Rights) -> Result<Self, SystemCallError> {
         let mut owner = Handle::INVALID;
         // SAFETY: 新创建的 receiver-owner 由此对象独占。
-        unsafe { sys_mailbox_create(rights, &mut owner) }?;
+        unsafe { sys_mailbox_create(pool, rights, &mut owner) }?;
         Ok(Self { owner: Some(owner) })
     }
 
@@ -339,7 +431,18 @@ impl Mailbox {
         badge: MailboxBadge,
         rights: Rights,
     ) -> Result<MintedSender, SystemCallError> {
-        let minted = mint_sender(self.as_handle(), badge, rights)?;
+        self.mint_in(CURRENT_PROCESS_POOL, badge, rights)
+    }
+
+    /// Sender、Lifetime 及其维护由 pool 付款，不继承 Mailbox 的付款者。
+    /// receiver 须具 MANAGE，真实 Pool 须具 CREATE；两者都不被消费。
+    pub fn mint_in(
+        &self,
+        pool: Handle,
+        badge: MailboxBadge,
+        rights: Rights,
+    ) -> Result<MintedSender, SystemCallError> {
+        let minted = mint_sender_in(self.as_handle(), pool, badge, rights)?;
         Ok(MintedSender {
             sender: MailboxSender::from_minted(Capability::owned(minted.sender)),
             lifetime: LifetimeObserver::from_minted(Capability::owned(minted.lifetime)),
@@ -520,12 +623,22 @@ pub fn mint_sender(
     badge: MailboxBadge,
     rights: Rights,
 ) -> Result<SenderResult, SystemCallError> {
+    mint_sender_in(owner, CURRENT_PROCESS_POOL, badge, rights)
+}
+
+/// 原始 pair 工厂；两个输出的关闭责任一起交付调用方。
+pub fn mint_sender_in(
+    owner: Handle,
+    pool: Handle,
+    badge: MailboxBadge,
+    rights: Rights,
+) -> Result<SenderResult, SystemCallError> {
     let mut output = SenderResult {
         sender: Handle::INVALID,
         lifetime: Handle::INVALID,
     };
     // SAFETY: 此原始工厂交付两项新能力的关闭责任，不构造重复 owner。
-    unsafe { sys_mailbox_mint_sender(owner, badge, rights, &mut output) }?;
+    unsafe { sys_mailbox_mint_sender(owner, pool, badge, rights, &mut output) }?;
     Ok(output)
 }
 
@@ -558,4 +671,110 @@ pub fn wait_message_until(
 
 pub fn wait_message(mailbox: Handle) -> Result<ReceivedMessage, SystemCallError> {
     wait_message_until(mailbox, Deadline::INFINITE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn description(
+        kind: ObjectKind,
+        object_id: u64,
+        related_object_id: u64,
+        rights: Rights,
+    ) -> HandleDescription {
+        HandleDescription {
+            object_id,
+            related_object_id,
+            kind: kind as u32,
+            reserved0: 0,
+            rights,
+            badge: 7,
+            reserved: 0,
+        }
+    }
+
+    fn pair() -> [HandleDescription; 3] {
+        [
+            description(ObjectKind::MailboxReceiver, 11, 11, Rights::READ),
+            description(
+                ObjectKind::MailboxSender,
+                22,
+                11,
+                Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+            ),
+            description(ObjectKind::LifetimeObserver, 33, 22, Rights::WAIT),
+        ]
+    }
+
+    #[test]
+    fn pair_accepts_related_identities_and_requested_transport() {
+        let [receiver, sender, lifetime] = pair();
+        assert_eq!(
+            validate_sender_pair(
+                &receiver,
+                &sender,
+                &lifetime,
+                Rights::WAIT | Rights::TRANSIT
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn pair_rejects_wrong_receiver_and_unrelated_lifetime_even_with_matching_badge() {
+        let [mut receiver, sender, mut lifetime] = pair();
+        receiver.object_id = 44;
+        assert_eq!(
+            validate_sender_pair(&receiver, &sender, &lifetime, Rights::WAIT),
+            Err(SystemCallError::WrongObjectType)
+        );
+        receiver.object_id = 11;
+        lifetime.related_object_id = 55;
+        assert_eq!(
+            validate_sender_pair(&receiver, &sender, &lifetime, Rights::WAIT),
+            Err(SystemCallError::WrongObjectType)
+        );
+    }
+
+    #[test]
+    fn pair_rejects_wrong_role_at_each_position() {
+        for position in 0..3 {
+            let mut descriptions = pair();
+            descriptions[position].kind = ObjectKind::MailboxOnceSender as u32;
+            assert_eq!(
+                validate_sender_pair(
+                    &descriptions[0],
+                    &descriptions[1],
+                    &descriptions[2],
+                    Rights::WAIT,
+                ),
+                Err(SystemCallError::WrongObjectType)
+            );
+        }
+    }
+
+    #[test]
+    fn pair_requires_usable_roles_and_requested_sender_rights() {
+        for position in 0..3 {
+            let mut descriptions = pair();
+            descriptions[position].rights = Rights::NONE;
+            assert_eq!(
+                validate_sender_pair(
+                    &descriptions[0],
+                    &descriptions[1],
+                    &descriptions[2],
+                    Rights::WAIT,
+                ),
+                Err(SystemCallError::RightsDenied)
+            );
+        }
+        let [receiver, sender, lifetime] = pair();
+        for required in [Rights::DUPLICATE, Rights::from_raw(1 << 63)] {
+            assert_eq!(
+                validate_sender_pair(&receiver, &sender, &lifetime, required),
+                Err(SystemCallError::RightsDenied)
+            );
+        }
+    }
 }

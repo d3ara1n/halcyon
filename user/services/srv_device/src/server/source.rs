@@ -1,4 +1,4 @@
-//! 根和派生来源的实际 Lifetime owner；入口只在两个观察来源准入后交付。
+//! 根、静态与运行期派生来源的实际 Lifetime owner；本地表项在两份观察来源准入后安装。
 use super::*;
 use libdevice::registry::{Access, Scope, SourceIds};
 
@@ -32,7 +32,7 @@ impl Source {
                 .map_err(|failure| Error::from(failure.error))?;
         Ok(sender)
     }
-    /// 根来源由本服务自持；不导出，停止时由 [`Self::release_senders`] 与 `stop` 收束。
+    /// 根来源由本服务自持，不向外部交付；不因静态来源 Lifetime 关闭而释放。
     pub fn root(world: &World) -> Result<Self, Error> {
         Self::prepare(
             world,
@@ -63,6 +63,48 @@ impl Source {
         funding: Funding,
         binding: Option<libdevice::identity::BindingRef>,
     ) -> Result<Self, Error> {
+        let use_role = world.mailbox.mint(0, TRANSPORT)?;
+        let admin_role = world.mailbox.mint(0, TRANSPORT)?;
+        Self::prepare_roles(
+            world,
+            issuer,
+            scope,
+            access,
+            funding,
+            binding,
+            super::SourcePair {
+                source: use_role,
+                admin: admin_role,
+            },
+        )
+    }
+    /// 采用出生边界已经核配对且排除重复 context 的静态来源；复用原来源安装/退休责任。
+    pub fn prepare_minted(
+        world: &World,
+        issuer: u64,
+        scope: Scope,
+        access: Access,
+        pair: super::SourcePair,
+    ) -> Result<Self, Error> {
+        Self::prepare_roles(
+            world,
+            Some(issuer),
+            scope,
+            access,
+            world.funding.clone(),
+            None,
+            pair,
+        )
+    }
+    fn prepare_roles(
+        world: &World,
+        issuer: Option<u64>,
+        scope: Scope,
+        access: Access,
+        funding: Funding,
+        binding: Option<libdevice::identity::BindingRef>,
+        pair: super::SourcePair,
+    ) -> Result<Self, Error> {
         if let Some(issuer) = issuer {
             if let Some(reference) = binding {
                 world.registry.check_child_source(issuer, reference)?;
@@ -81,12 +123,18 @@ impl Source {
                 },
             )
             .transpose()?;
-        let use_role = world.mailbox.mint(0, TRANSPORT)?;
-        let admin_role = world.mailbox.mint(0, TRANSPORT)?;
+        let super::SourcePair {
+            source: use_role,
+            admin: admin_role,
+        } = pair;
         let ids = SourceIds {
             use_context: use_role.sender.description()?.object_id,
             admin_context: admin_role.sender.description()?.object_id,
         };
+        // Registry 的提交边界再次核验跨来源冲突；本项不可将同一身份赋予两个角色。
+        if ids.use_context == ids.admin_context {
+            return Err(Error::Conflict);
+        }
         Ok(Self {
             ids,
             issuer,
@@ -285,9 +333,6 @@ impl Source {
             match world.registry.retire_source(self.ids.use_context) {
                 Ok(()) => {
                     world.dirty = true;
-                    if self.issuer.is_none() {
-                        world.finished = true;
-                    }
                     return Ok(step(Step::Complete));
                 }
                 Err(Error::Busy) => {}

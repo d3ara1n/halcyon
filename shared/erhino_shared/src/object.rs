@@ -36,6 +36,12 @@ impl Handle {
     }
 }
 
+/// MailboxCreate/MailboxMintSender 显式选择当前进程绑定 Pool 的值。
+///
+/// 此值不是 capability，generation 为零，不可能与合法表项相撞；只有支持付款
+/// 选择的工厂解释它。Handle::INVALID 不表示默认付款，真实 Pool 必须具 CREATE。
+pub const CURRENT_PROCESS_POOL: Handle = Handle::from_raw(1);
+
 /// 对象操作权利。派生和转移只能取已有 rights 的子集。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(transparent)]
@@ -293,7 +299,14 @@ const _: () = {
 
 #[cfg(test)]
 mod tests {
-    use super::Rights;
+    use super::{CURRENT_PROCESS_POOL, Handle, Rights};
+
+    #[test]
+    fn current_process_pool_is_an_explicit_non_capability_selector() {
+        assert_ne!(CURRENT_PROCESS_POOL, Handle::INVALID);
+        assert!(!CURRENT_PROCESS_POOL.is_valid());
+        assert_eq!(CURRENT_PROCESS_POOL.generation(), 0);
+    }
 
     #[test]
     fn rights_wire_bits_are_stable_and_known() {

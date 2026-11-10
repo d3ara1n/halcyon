@@ -2,26 +2,19 @@
 //! 启动根、独立 registry 与发布接线由同一改造计划的服务装配工作包承接。
 
 use alloc::boxed::Box;
-use erhino_shared::{
-    call::SystemCallError,
-    object::{ObjectSignals, Rights},
-    time::Deadline,
-};
+use erhino_shared::{call::SystemCallError, object::ObjectSignals, time::Deadline};
 use libbudget::{AccountView, Charge};
 use libexecution::{
     SourceRegistration, TaskSubmission,
     runtime::{Advance, Input, RequestFailure, Requests, SourceId, SourcePlan, Step, Task},
 };
-use libfs::{
-    FsRights, authority::Issuance, backend::MemoryBackend, grant::GrantTable, provider,
-    resource::FsResource,
-};
+use libfs::{backend::MemoryBackend, grant::GrantTable, provider, resource::FsResource};
 use libkernel::ipc::message::{Mailbox, MessageStorage, ReceiveBuffer};
 mod boot;
 mod family;
 mod lifecycle;
 mod services;
-pub(super) use boot::{Startup, run};
+pub(super) use boot::{EntryPairs, Startup, run};
 
 const MAILBOX_SOURCE: u64 = 1;
 const REPLY_SOURCE: u64 = 2;
@@ -59,38 +52,6 @@ impl World {
     fn rpc_mut(&mut self) -> &mut librpc::dispatcher::Dispatcher {
         self.rpc.as_deref_mut().expect("provider transport missing")
     }
-    pub fn prepare_root(
-        &mut self,
-        startup_delivery: bool,
-        account: &AccountView<FsResource>,
-        execution: &AccountView<libexecution::ExecutionResource>,
-    ) -> Result<libfs::grant::PreparedGrant, libfs::grant::GrantIssueFailure> {
-        let root = self
-            .memory
-            .root()
-            .expect("file backing root missing")
-            .clone();
-        self.grants.prepare_issue(
-            &self.mailbox,
-            root,
-            Issuance {
-                rights: FsRights::ALL,
-                sender_transport: Rights::WRITE
-                    | Rights::WAIT
-                    | Rights::TRANSIT
-                    | Rights::DUPLICATE
-                    | if startup_delivery {
-                        Rights::GRANT
-                    } else {
-                        Rights::NONE
-                    },
-                output_transport: srv_fs::deployment::root_output_transport(),
-            },
-            account,
-            execution,
-            0,
-        )
-    }
 }
 
 enum FileTask {
@@ -101,7 +62,6 @@ enum FileTask {
     ServiceIngress(services::Ingress),
     ServiceRequest(Box<libservice::provider::Request>),
     Maintenance(libservice::maintenance::Maintenance),
-    Release(lifecycle::Release),
     Retire(lifecycle::Retire),
     Dispatcher(Transport),
 }
