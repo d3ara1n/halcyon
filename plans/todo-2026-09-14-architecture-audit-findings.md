@@ -181,7 +181,7 @@
 
 以下判断在本次审计中**确认成立**，未来 Review 不因本清单重开：
 
-- **TRANSIT / GRANT 按存储拓扑而非权限区分**——正确的抽象维度。
+- **TRANSIT / GRANT 按存储拓扑区分**——原审计认可的历史取舍；2026-11-11 用户已决定合并为 TRANSFER，并解决 Receiver 中转，原“不重开”结论对此项不再适用。实际迁移、门控环拒绝及历史合并完成宣告的更正由[运输前置](archived/todo-2026-11-11-capability-transfer.md)承接。
 - **Commit 前全预留 / Commit 后不回滚**——单一事务形状贯穿 Pool / Process / Memory / Tunnel，可审查性极高。
 - **role 不可由 rights 伪造**——一次性消灭「从权限位反推对象关系」的一类漏洞。
 - **`UserWriteLease` + release cookie 的 Map 提交承诺**——干净解决了「异步写回 vs 并发 Unmap」。

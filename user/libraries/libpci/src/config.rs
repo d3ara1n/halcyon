@@ -266,7 +266,7 @@ pub const CONFIG_USE_RIGHTS: Rights = Rights::from_raw(
         | Rights::WRITE.raw()
         | Rights::WAIT.raw()
         | Rights::DUPLICATE.raw()
-        | Rights::TRANSIT.raw(),
+        | Rights::TRANSFER.raw(),
 );
 
 #[cfg(test)]

@@ -523,7 +523,7 @@ impl KernelObject for MemoryPool {
     }
 
     fn allowed_rights(&self) -> Option<Rights> {
-        Some(Rights::CREATE | Rights::READ | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT)
+        Some(Rights::CREATE | Rights::READ | Rights::DUPLICATE | Rights::TRANSFER)
     }
 
     fn allowed_signals(&self) -> Option<erhino_shared::object::ObjectSignals> {

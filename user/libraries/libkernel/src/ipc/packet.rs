@@ -94,7 +94,7 @@ impl Packet {
             return Err(SystemCallError::IllegalArgument);
         }
         let source = capability.description()?;
-        if !source.rights.contains(Rights::TRANSIT) || !rights.is_subset_of(source.rights) {
+        if !source.rights.contains(Rights::TRANSFER) || !rights.is_subset_of(source.rights) {
             return Err(SystemCallError::RightsDenied);
         }
         Ok(())
@@ -135,7 +135,7 @@ impl Packet {
             .map(|transfer| (transfer.capability, transfer.rights))
     }
 
-    /// 消费式投递：成功即消费 Packet 与全部 transit owner，失败完整返还。
+    /// 消费式投递：成功即消费 Packet 与全部转交能力 owner，失败完整返还。
     /// 目标 role 由 MailboxSender 类型保证，重试路径不再重复 Query。
     pub fn try_send(
         self,

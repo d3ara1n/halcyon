@@ -41,6 +41,8 @@ struct ShellState {
     receipt_leases: usize,
     member_count: usize,
     reserved_members: usize,
+    /// Running 下尚未撤销的执行承诺；Created/出生预约只计资源回执。
+    published_members: usize,
     running: usize,
     retiring: bool,
     ingress_waiter: Option<WakeToken>,
@@ -54,8 +56,7 @@ pub(crate) const CONTROL_RIGHTS: Rights = Rights::from_raw(
         | Rights::WAIT.raw()
         | Rights::MANAGE.raw()
         | Rights::DUPLICATE.raw()
-        | Rights::TRANSIT.raw()
-        | Rights::GRANT.raw(),
+        | Rights::TRANSFER.raw(),
 );
 
 /// Job 与已提交 Work 持有的稳定壳；观察 capability 的消散不终止进程。
@@ -68,6 +69,7 @@ pub(crate) struct ProcessShell {
     pub(crate) record: WorkRecord,
     ingress: AtomicU64,
     state: Spinlock<ShellState>,
+    pub(crate) custody: capability::forest::Domain,
     pub(crate) reclaim: Spinlock<ReclaimState>,
     pub(crate) source: Arc<SignalSource>,
     _metadata: super::super::resources::MetadataCharge,
@@ -150,6 +152,7 @@ impl ProcessShell {
             job,
             record: WorkRecord::new(pool.maintenance_account().clone()),
             ingress: AtomicU64::new(0),
+            custody: capability::forest::Domain::new(true),
             state: Spinlock::new(
                 ranks::LIFECYCLE,
                 ShellState {
@@ -161,6 +164,7 @@ impl ProcessShell {
                     receipt_leases: 0,
                     member_count: 0,
                     reserved_members: 0,
+                    published_members: 0,
                     running: 0,
                     retiring: false,
                     ingress_waiter: None,
@@ -238,7 +242,14 @@ impl ProcessShell {
             let ptr = NonNull::from(body);
             let vm = body.vm.clone();
             assert!(self.register_ingress(), "Frozen won start gate");
+            // 初始批的执行责任由 Builder Work 一次承诺，逐槽 Ready 只兑现、不再加计。
+            assert_eq!(
+                state.published_members, 0,
+                "Building process has published members"
+            );
+            state.published_members = expected_members;
             state.state = ProcessState::Running;
+            super::super::custody::make_root(&self.custody);
             (ptr, vm)
         };
         let lease = BodyLease {
@@ -262,13 +273,78 @@ impl ProcessShell {
             core::ptr::eq(&*body.shell, self),
             "thread belongs to another Shell"
         );
-        let state = self.state.lock();
+        let mut state = self.state.lock();
         if state.state != ProcessState::Running {
             return Err(SystemCallError::ObjectClosed);
         }
-        body.members
+        let created = body
+            .members
             .start_created(key)
-            .ok_or(SystemCallError::ObjectBusy)
+            .ok_or(SystemCallError::ObjectBusy)?;
+        // Created→Ready 与最后执行器退出共用 Shell 门；此后只交付出生预付的 ReadyBatch。
+        state.published_members = state
+            .published_members
+            .checked_add(1)
+            .expect("published member count exhausted");
+        Ok(created)
+    }
+
+    /// 当前执行 owner 唯一撤销执行承诺；先定终局，再在锁外封 VM/发布回收。
+    /// Shell→Members 与 ThreadStart 同锁序，不能把递减延后至 detach/退款。
+    pub(crate) fn exit_thread(self: &Arc<Self>, key: super::members::MemberKey, slot: usize) {
+        let freeze = {
+            let mut state = self.state.lock();
+            // 执行 owner 尚未交 Departure，成员回执保证 Body 及槽仍存在。
+            let changed = state
+                .body
+                .as_deref()
+                .expect("executing thread lost Body")
+                .members
+                .exit_running(key, slot);
+            if state.state == ProcessState::Running {
+                assert!(changed, "published member exited twice");
+                assert!(
+                    state.published_members > 0,
+                    "published member count underflow"
+                );
+                state.published_members -= 1;
+                if state.published_members == 0 {
+                    self.freeze_locked(
+                        &mut state,
+                        TerminationCause::Completed,
+                        TerminationDetail::NONE,
+                    )
+                } else {
+                    Freeze::Already
+                }
+            } else {
+                // Kill/fault 等已先冻结并撤销全部承诺，不能再逐成员递减或覆盖终因。
+                assert!(
+                    state.state == ProcessState::Terminating,
+                    "thread exited outside process execution lifetime"
+                );
+                Freeze::Already
+            }
+        };
+        self.finish_freeze(freeze);
+    }
+
+    /// reap 只核对既有执行结束，不决定进程寿命，也不扣发布承诺。
+    pub(crate) fn assert_execution_ended(&self, key: super::members::MemberKey) {
+        let state = self.state.lock();
+        if state.state == ProcessState::Running {
+            state
+                .body
+                .as_deref()
+                .expect("execution owner lost Body")
+                .members
+                .assert_exiting(key);
+        } else {
+            assert!(
+                state.state == ProcessState::Terminating,
+                "execution owner reaped outside process execution lifetime"
+            );
+        }
     }
 
     /// 成员状态锁内登记 Ready 发布；调用前须已有必成的队列 admission。
@@ -478,35 +554,19 @@ impl ProcessShell {
         assert!(state.reserved_members > 0, "member reservation underflow");
         body.members.rollback(key);
         state.reserved_members -= 1;
-        let freeze = self.complete_if_empty(&mut state);
-        drop(state);
-        self.finish_freeze(freeze);
     }
 
     /// 回执已摘 Body 成员且归还短访问后，最后一个回执在 Shell 锁外唤醒回收。
     pub(crate) fn member_departed(self: &Arc<Self>) {
-        let (wake, freeze) = {
+        let wake = {
             let mut state = self.state.lock();
             assert!(state.member_count > 0, "member receipt underflow");
             state.member_count -= 1;
-            let freeze = self.complete_if_empty(&mut state);
-            (self.ready_wake(&mut state), freeze)
+            self.ready_wake(&mut state)
         };
         if let Some(wake) = wake {
             drop(mt::wake(wake));
             mt::kick();
-        }
-        self.finish_freeze(freeze);
-    }
-
-    fn complete_if_empty(&self, state: &mut ShellState) -> Freeze {
-        if state.state == ProcessState::Running
-            && state.member_count == 0
-            && state.reserved_members == 0
-        {
-            self.freeze_locked(state, TerminationCause::Completed, TerminationDetail::NONE)
-        } else {
-            Freeze::Already
         }
     }
 
@@ -569,7 +629,9 @@ impl ProcessShell {
         if state.state == ProcessState::Terminating || state.state == ProcessState::Dead {
             return Freeze::Already;
         }
+        state.published_members = 0;
         state.state = ProcessState::Terminating;
+        super::super::custody::make_root(&self.custody);
         state.cause = cause;
         state.detail = detail;
         let previous = self.ingress.fetch_or(FROZEN, Ordering::AcqRel);
@@ -611,6 +673,7 @@ impl ProcessShell {
                 && state.receipt_leases == 0
                 && state.member_count == 0
                 && state.reserved_members == 0
+                && state.published_members == 0
                 && state.running == 0,
             "Dead with private body"
         );

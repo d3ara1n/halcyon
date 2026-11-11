@@ -171,7 +171,7 @@ pub(crate) fn publish(
             (task::job::Job::object_ref(&job), task::job::JOB_RIGHTS),
             (
                 task::system_reset::SystemReset::object_ref(&reset),
-                Rights::MANAGE | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT,
+                Rights::MANAGE | Rights::DUPLICATE | Rights::TRANSFER,
             ),
             (
                 ProcessShell::object_ref(&shell),
@@ -179,7 +179,7 @@ pub(crate) fn publish(
             ),
             (
                 task::memory_pool::MemoryPool::object_ref(&pool),
-                Rights::CREATE | Rights::READ | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT,
+                Rights::CREATE | Rights::READ | Rights::DUPLICATE | Rights::TRANSFER,
             ),
             (
                 task::thread::ThreadControl::object_ref(&control),
@@ -187,7 +187,7 @@ pub(crate) fn publish(
             ),
             (
                 platform.clone() as Arc<dyn task::object::KernelObject>,
-                Rights::READ | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT,
+                Rights::READ | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSFER,
             ),
         ];
         for (object, rights) in roots {
@@ -221,8 +221,7 @@ pub(crate) fn publish(
                 | Rights::MANAGE
                 | Rights::CREATE
                 | Rights::DUPLICATE
-                | Rights::TRANSIT
-                | Rights::GRANT;
+                | Rights::TRANSFER;
             match task::handle::mint(object, rights) {
                 Ok(cap) => caps.push(cap),
                 Err(error) => {

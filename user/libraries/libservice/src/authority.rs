@@ -82,7 +82,7 @@ impl<R: RoleRights> Snapshot<R> {
     }
     /// 无显式运输请求的控制出口，只取必需位与上限允许的复制权。
     pub fn control_transport(&self) -> Result<Rights, Status> {
-        let required = Rights::WRITE | Rights::WAIT | Rights::TRANSIT;
+        let required = Rights::WRITE | Rights::WAIT | Rights::TRANSFER;
         if !self.output().contains(required) {
             return Err(Status::Permission);
         }
@@ -329,7 +329,7 @@ mod tests {
         // 检验纯授权容器预留；不模拟 kernel sender 或声称来源已登记。
         let table = AccessTable::new(1).unwrap();
         let account = account();
-        let output = Rights::WRITE | Rights::WAIT | Rights::TRANSIT;
+        let output = Rights::WRITE | Rights::WAIT | Rights::TRANSFER;
         let first = table
             .prepare(Scope::Root, AccessRights::ALL, output, account.clone())
             .unwrap();
@@ -356,7 +356,7 @@ mod tests {
         let parent = AuthorityTable::new(1).unwrap();
         let child = AuthorityTable::new(1).unwrap();
         let rights = PublishRights::CREATE | PublishRights::DELEGATE;
-        let output = Rights::WRITE | Rights::WAIT | Rights::TRANSIT;
+        let output = Rights::WRITE | Rights::WAIT | Rights::TRANSFER;
         let prepared = parent
             .prepare(Scope::Root, rights, output, account())
             .unwrap();
@@ -382,14 +382,14 @@ mod tests {
         ));
     }
     #[test]
-    fn default_control_transport_respects_complete_ceiling_and_never_adds_grant() {
-        // 由控制角色合同判定：必需位必须齐全，可选 DUP 受完整上限约束，GRANT 需显式请求。
+    fn default_control_transport_respects_complete_ceiling() {
+        // 控制出口必须具备统一转交权；可选 DUP 受完整上限约束，不隐式添加。
         let table = AuthorityTable::new(1).unwrap();
-        let required = Rights::WRITE | Rights::WAIT | Rights::TRANSIT;
+        let required = Rights::WRITE | Rights::WAIT | Rights::TRANSFER;
         for (ceiling, expected) in [
             (required, Ok(required)),
             (
-                required | Rights::DUPLICATE | Rights::GRANT,
+                required | Rights::DUPLICATE,
                 Ok(required | Rights::DUPLICATE),
             ),
             (Rights::WRITE | Rights::WAIT, Err(Status::Permission)),
@@ -409,7 +409,7 @@ mod tests {
             .prepare(
                 Scope::Root,
                 PublishRights::ALL,
-                Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+                Rights::WRITE | Rights::WAIT | Rights::TRANSFER,
                 payer.clone(),
             )
             .unwrap();
@@ -436,7 +436,7 @@ mod tests {
     fn removing_sender_index_preserves_admitted_use_but_explicit_revoke_does_not() {
         // 纯表契约验证：移除索引不是撤销；使用引用持费，显式撤销只影响同一授权。
         let mut table = AuthorityTable::new(1).unwrap();
-        let output = Rights::WRITE | Rights::WAIT | Rights::TRANSIT;
+        let output = Rights::WRITE | Rights::WAIT | Rights::TRANSFER;
         let prepared = table
             .prepare(Scope::Root, PublishRights::ALL, output, account())
             .unwrap();

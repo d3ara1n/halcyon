@@ -211,15 +211,14 @@ fn component(name: &str) -> bool {
     name.len() <= MAX_NAME && segment(name.as_bytes())
 }
 
-const RIGHTS: [(&str, Rights); 10] = [
+const RIGHTS: [(&str, Rights); 9] = [
     ("read", Rights::READ),
     ("write", Rights::WRITE),
     ("wait", Rights::WAIT),
     ("signal", Rights::SIGNAL),
-    ("transit", Rights::TRANSIT),
+    ("transfer", Rights::TRANSFER),
     ("duplicate", Rights::DUPLICATE),
     ("manage", Rights::MANAGE),
-    ("grant", Rights::GRANT),
     ("create", Rights::CREATE),
     ("execute", Rights::EXECUTE),
 ];
@@ -591,11 +590,11 @@ impl Formation {
             Err(invalid("unknown payer", name))
         }
     }
-    /// 默认权利的唯一真值；施工母本所需的临时 GRANT/DUPLICATE 不混入资源声明。
+    /// 默认权利的唯一真值；施工母本所需的临时 TRANSFER/DUPLICATE 不混入资源声明。
     pub fn source_rights(&self, source: &Source) -> Result<Rights, Error> {
         let rights = match source {
             Source::PlatformDescription | Source::Image(_) => {
-                Rights::READ | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT
+                Rights::READ | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSFER
             }
             Source::PlatformRoot => {
                 Rights::READ
@@ -604,8 +603,7 @@ impl Formation {
                     | Rights::MANAGE
                     | Rights::CREATE
                     | Rights::DUPLICATE
-                    | Rights::TRANSIT
-                    | Rights::GRANT
+                    | Rights::TRANSFER
             }
             Source::Job(_) => {
                 Rights::CREATE
@@ -613,11 +611,10 @@ impl Formation {
                     | Rights::READ
                     | Rights::WAIT
                     | Rights::DUPLICATE
-                    | Rights::TRANSIT
-                    | Rights::GRANT
+                    | Rights::TRANSFER
             }
             Source::Pool(_) | Source::SelfPool => {
-                Rights::READ | Rights::CREATE | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT
+                Rights::READ | Rights::CREATE | Rights::DUPLICATE | Rights::TRANSFER
             }
             Source::Resource { name, output } => {
                 let r = self
@@ -761,7 +758,7 @@ impl Formation {
                     }
                     (
                         *rights,
-                        Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT,
+                        Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::TRANSFER,
                     )
                 }
                 ResourceKind::Sender {
@@ -775,7 +772,7 @@ impl Formation {
                     }
                     if r.terminal_revoke
                         && !rights.contains(
-                            Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
+                            Rights::WRITE | Rights::WAIT | Rights::TRANSFER | Rights::DUPLICATE,
                         )
                     {
                         return Err(invalid(
@@ -785,11 +782,7 @@ impl Formation {
                     }
                     (
                         *rights,
-                        Rights::WRITE
-                            | Rights::WAIT
-                            | Rights::TRANSIT
-                            | Rights::GRANT
-                            | Rights::DUPLICATE,
+                        Rights::WRITE | Rights::WAIT | Rights::TRANSFER | Rights::DUPLICATE,
                     )
                 }
             };
@@ -837,7 +830,7 @@ impl Formation {
                 }
                 if !b
                     .rights
-                    .contains(Rights::WRITE | Rights::WAIT | Rights::TRANSIT)
+                    .contains(Rights::WRITE | Rights::WAIT | Rights::TRANSFER)
                 {
                     return Err(invalid("namespace sender lacks call rights", &b.prefix));
                 }

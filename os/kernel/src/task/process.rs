@@ -261,7 +261,7 @@ pub fn grant(
     let mut claimed = MetadataBuffer::try_empty(count, &funding).map_err(map_storage_error)?;
     let mut caps = MetadataBuffer::try_empty(count, &funding).map_err(map_storage_error)?;
     for grant in grants.iter() {
-        let claim = Invocation::claim(caller, grant.handle, Rights::GRANT)?;
+        let claim = Invocation::claim(caller, grant.handle, Rights::TRANSFER)?;
         if !grant.rights.is_known() || !grant.rights.is_subset_of(claim.cap().rights()) {
             return Err(SystemCallError::RightsDenied);
         }
@@ -282,27 +282,48 @@ pub fn grant(
             return Err(error);
         }
     }
-    // 输出完成后必成；失败前不收窄原 authority，逐个 claim 的 Drop 自动恢复。
-    for (claim, grant) in claimed.iter_mut().zip(grants.iter()) {
-        let mut cap = claim.take_for_transfer();
-        cap.attenuate(grant.rights)
-            .expect("validated grant rights changed");
-        claim.commit_transfer();
-        caps.push(cap);
+    // 输出只有槽数值，不是发布；最终森林准入失败时缓冲区没有有效结果。
+    // 原 Cap 与 rights 在准入成功前保持不变，所有来源 BodyLease 覆盖返还/释放。
+    for claim in claimed.iter_mut() {
+        caps.push(claim.take_for_transfer());
     }
-    let committed = body.handles.lock().commit(reservation, caps);
-    match committed {
-        Ok(capability::Commit::Installed(_)) => {}
-        Ok(capability::Commit::Released { events, .. }) => {
-            for event in events {
-                super::cap::deliver(Some(event));
+    let gates = super::custody::Gates::prepare(caps.iter());
+    let mut caps = caps.into_iter();
+    let installed = {
+        let mut table = body.handles.lock();
+        match table.validate_reserved(&reservation, caps.len()) {
+            Ok(()) => gates.transfer(Some(&target.custody), || {
+                let mut narrowed = caps.by_ref().zip(grants.iter()).map(|(mut cap, grant)| {
+                    cap.attenuate(grant.rights)
+                        .expect("validated grant rights changed");
+                    cap
+                });
+                table
+                    .commit_reserved(&reservation, &mut narrowed)
+                    .expect("validated grant reservation changed under table lock");
+                true
+            }),
+            // 沿既有提交后撤销公开的合同：消费来源并锁外释放，而非复活旧槽。
+            Err(capability::TableError::Closed) => Ok(false),
+            Err(_) => unreachable!("owned grant reservation changed under table lock"),
+        }
+    };
+    match installed {
+        Ok(true) => drop(reservation),
+        Ok(false) => body.handles.lock().rollback(reservation),
+        Err(error) => {
+            body.handles.lock().rollback(reservation);
+            for (claim, cap) in claimed.iter_mut().zip(caps) {
+                claim.restore_transfer(cap);
             }
-        }
-        Err((caps, _)) => {
-            handle::release_all(caps);
-            unreachable!("owned grant reservation changed");
+            return Err(error);
         }
     }
+    // 验证/安装后不再有可恢复失败；来源返还资格在全部目标锁/FOREST 外结算。
+    for claim in claimed.iter_mut() {
+        claim.commit_transfer();
+    }
+    handle::release_all(caps);
     Ok(())
 }
 

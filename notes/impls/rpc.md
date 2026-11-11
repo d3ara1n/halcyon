@@ -6,7 +6,7 @@
 
 `RpcPrefix` 是 16 字节 little-endian 头：版本、message kind（Request/Response/Oneway）、reserved 与非零 txid。解码拒绝未知版本/kind、非零 reserved 和零 txid。
 
-期待回复的 Request 在 Handle slot 0 放置裁剪为 `WRITE | WAIT | TRANSIT` 的 send-once；内核只运输该 capability，不理解 txid 或 request/response。`sender_pid` 只提供来源信息，immutable badge 承载服务端铸造的 session/grant 上下文。
+期待回复的 Request 在 Handle slot 0 放置裁剪为 `WRITE | WAIT | TRANSFER` 的 send-once；内核只运输该 capability，不理解 txid 或 request/response。`sender_pid` 只提供来源信息，immutable badge 承载服务端铸造的 session/grant 上下文。
 
 ## 同步 Caller
 
@@ -17,7 +17,7 @@
 3. CallWait 拥有持久扁平 WaitSet，观察 ReplyPort READABLE/CLOSED、服务 WRITABLE/CLOSED、取消 READABLE/CLOSED 与 ReplyObserver ABANDONED（PEER_CLOSED）；发送后注销旧服务来源并只留 CLOSED，仍使用同一绝对 Deadline。Unsent 在再次投递前复核取消；Sent 合法回复先于取消；到期直接查询真实来源，不把空候选视为未就绪；
 4. 接收后由纯逻辑 `validate_response` 验证 protocol id、Response kind 与 txid；任一拒绝都逐项关闭已安装 Handle、废弃当前 ReplyPort，再返回 typed rejection。
 
-同步驱动在 ServiceClosed、Wait/Receive 错误、timeout 和外部取消时废弃当前 ReplyPort；可进入 transit 的 role 都是固定上界叶 close（Tunnel Endpoint 不具 TRANSIT），reject cleanup 不建立新的异步 owner。`CallOperation::advance` 只做一次非阻塞发送或回复尝试；`wait_ready` 按未发送/已发送分别观察 service writable 或 ReplyPort，并观察 service close/cancel。成功接收回复进入 `Completed`，完成操作不能再次推进；`abort` 按阶段返还原 Request 或 ReplyCleanup。已发送操作被显式 abort 或直接 Drop 时都会隔离旧 ReplyPort，迟到回复不能进入下一调用。`CallError` 的互斥 owner 是 `Unsent(Request)`、`Reply(ReplyCleanup)` 或 None：发送前拒绝保留原请求；发送后未确认按 Sent 返回未知，关闭失败保留 typed owner 供 `retry_cleanup`。RPC 不自动重试可能有副作用的已投递请求。
+同步驱动在 ServiceClosed、Wait/Receive 错误、timeout 和外部取消时废弃当前 ReplyPort；收到的 capability 按其真实 owner 关闭；包括 Receiver 在内的容器最后关闭由内核既有维护负责分步释放，reject cleanup 不建立另一份用户态回收 owner（Tunnel Endpoint 仍不具 TRANSFER）。`CallOperation::advance` 只做一次非阻塞发送或回复尝试；`wait_ready` 按未发送/已发送分别观察 service writable 或 ReplyPort，并观察 service close/cancel。成功接收回复进入 `Completed`，完成操作不能再次推进；`abort` 按阶段返还原 Request 或 ReplyCleanup。已发送操作被显式 abort 或直接 Drop 时都会隔离旧 ReplyPort，迟到回复不能进入下一调用。`CallError` 的互斥 owner 是 `Unsent(Request)`、`Reply(ReplyCleanup)` 或 None：发送前拒绝保留原请求；发送后未确认按 Sent 返回未知，关闭失败保留 typed owner 供 `retry_cleanup`。RPC 不自动重试可能有副作用的已投递请求。
 
 分步接口由 [`CallOperation`](../../user/libraries/librpc/src/caller.rs) 直接提供。普通 `new` 使用 CallWait；`new_composed` 只准备原调用 owner，不创建私有 WaitSet。`poll_ready` 按实际电平和原期限判定，`wait_sources` 返回 reply/service/cancel/reply-observer 的有界计划，未用位置为 INVALID。宿主借用这些真实对象，必须实际注销来源后才能完成、abort 或丢弃操作；操作持有期间原 Caller 不能开始第二个调用。
 

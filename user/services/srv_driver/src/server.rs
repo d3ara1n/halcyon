@@ -55,11 +55,7 @@ const RPC_SOURCES: usize = match Dispatcher::source_capacity(CALLS) {
 };
 const WAIT_SOURCES: usize = DEVICES * 2 + PROCESSES * 2 + REQUESTS + 5 + RPC_SOURCES;
 const TRANSPORT: Rights = Rights::from_raw(
-    Rights::WRITE.raw()
-        | Rights::WAIT.raw()
-        | Rights::DUPLICATE.raw()
-        | Rights::TRANSIT.raw()
-        | Rights::GRANT.raw(),
+    Rights::WRITE.raw() | Rights::WAIT.raw() | Rights::DUPLICATE.raw() | Rights::TRANSFER.raw(),
 );
 fn advance(step: Step) -> Advance {
     Advance { work_done: 1, step }

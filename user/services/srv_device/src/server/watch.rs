@@ -16,7 +16,7 @@ impl Signal {
             notification::create(Rights::READ | Rights::WAIT | Rights::MANAGE, Rights::SIGNAL)?;
         let observer = pair
             .owner
-            .mint_observer(Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE)?;
+            .mint_observer(Rights::WAIT | Rights::TRANSFER | Rights::DUPLICATE)?;
         Ok((
             Self {
                 owner: pair.owner,

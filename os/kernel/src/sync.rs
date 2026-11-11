@@ -83,6 +83,8 @@ pub mod ranks {
     /// 维护执行全局队列（ticket 锁）：业务/对象锁之后的内层叶锁。持有期间
     /// 不取任何其他锁（含 HEAP，挂接零分配）；IPI 在解开全部锁后发送。
     pub const MAINTENANCE: Rank = Rank(660);
+    /// 托管森林：业务锁内层，仅指针/纯值；禁止分配、退款、uaccess及反取业务锁。
+    pub const CUSTODY_FOREST: Rank = Rank(655);
     /// talc 堆锁（RankedRawSpinlock 类型级注入；几乎被全部容器锁内
     /// 获取，故置顶）。
     pub const HEAP: Rank = Rank(900);

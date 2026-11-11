@@ -66,9 +66,9 @@ Builder 与 Control 在调用者表预约后，先锁外写 ProcessCreateResult�
 
 来源 Job/Pool、非消费 Builder 组装、Control Query/Kill 使用 Authorization，保持源表项可供合法并发使用；Building/冻结/Start 的领域闸门继续仲裁业务准入。Builder Start 与启动票据真正消费授权，使用独占 claim；Grant 的来源移交也使用 claim，不把目标 Builder 的非消费授权与所移交的 capability 混合。
 
-ProcessMap 复用 `vm::operation::initial_map`，由 Operation/ChangeWork 完成并以私有 DONE 回复。ProcessWrite 先从调用者拷入有界缓冲，再持 Building VM lease 通过译址校验填入目标页；允许填充最终为 RO/RX 的初始映像，入口仍封闭。ProcessGrant 先 claim 全部来源并验证权限，输出目标句柄成功后才收窄并移交 cap；任何之前的失败恢复原权限，目标表锁内不调用业务对象。
+ProcessMap 复用 `vm::operation::initial_map`，由 Operation/ChangeWork 完成并以私有 DONE 回复。ProcessWrite 先从调用者拷入有界缓冲，再持 Building VM lease 通过译址校验填入目标页；允许填充最终为 RO/RX 的初始映像，入口仍封闭。ProcessGrant 先 claim 全部来源并验证权限，写回目标槽数值后，在目标表锁→FOREST 内完成最终托管准入、裁权和安装。成环仍可在写回后失败，输出此时无效，来源恢复原 Cap/rights；目标已 shut 则消费来源并锁外释放，不复活旧槽。借用安装核心、来源 pin 与托管规则见 [IPC](ipc.md#门控容器托管森林)，目标表锁内不调用业务对象。
 
-ProcessControl就是Shell本体，关闭仅退authority；Query在Dead后仍读同一终态。Control类型上限含TRANSIT，Create/JobDerive仍按调用者及源权限明确取子集，普通监督配置不默认给运输权。Kill 在首次 Frozen 时固定原因，其后幂等；私有 Body 何时归还由回收记录决定。组装与 bootstrap 的消费者见 [`startup.md`](startup.md)。
+ProcessControl就是Shell本体，关闭仅退authority；Query在Dead后仍读同一终态。Control类型上限含TRANSFER，Create/JobDerive仍按调用者及源权限明确取子集，普通监督配置不默认给运输权。Kill 在首次 Frozen 时固定原因，其后幂等；私有 Body 何时归还由回收记录决定。组装与 bootstrap 的消费者见 [`startup.md`](startup.md)。
 
 ## Job 管理面（`task/job.rs`）
 
@@ -105,13 +105,15 @@ Job 的创建域/管理域机制面（ABI 见 `shared/erhino_shared/src/proc.rs`
 
 ## 生命周期
 
-[`ProcessShell`](../../os/kernel/src/task/process/shell.rs) 拥有 Building/Running/Terminating/Dead 与首次终因。首次冻结在 Shell gate 关闭外部准入，再锁外关闭 VM 入口并移交 active 快照、敲运行 hart 门铃，最后发布出生时的回收 WorkRecord；重复终止不覆盖终因。ProcessControl 是该 Shell 的 capability 身份，没有弱回指、重铸窗口或第二份终态快照。
+[`ProcessShell`](../../os/kernel/src/task/process/shell.rs) 拥有 Building/Running/Terminating/Dead 与首次终因。首次冻结在 Shell gate 清发布数、将托管域永久切根并关闭外部准入，再锁外关闭 VM 入口并移交 active 快照、敲运行 hart 门铃，最后发布出生时的回收 WorkRecord；重复终止不覆盖终因。ProcessControl 是该 Shell 的 capability 身份，没有弱回指、重铸窗口或第二份终态快照。
 
 构造 lease 覆盖 Job 出生提交至 Body 安装/回滚；Frozen 拒绝安装，构造者先锁外归还未发布 Box，再解除 lease。外部 Body 访问与 Ready 发布共享 ingress 计数；已登记 ThreadDeparture 每步取得短 receipt access，不跨等待。Shell 的 member_count 是未结回执真值，成员表的槽占用用于容量和身份，二者不互相代替。
 
-自然最后成员回执结算（或最后预留撤销）在同一 Shell gate 检查 Running 且两计数均零，冻结 Completed。它与 Kill/fault 争同一首因；随后复用锁外 VM 封口与回收发布。空间退休仍等待独立的 VM lease、实际运行与结果回执屏障。
+Shell 的 published_members 独占执行承诺真值：ProcessStart 在 begin_running 以非零初始成员数一次提交；Builder 分步兑现 Ready 不再加计。运行期 ThreadStart 在 Shell→Members 的 Created→Ready 成功点增加，ThreadExit 在同一 Shell 门经 Members 将当前 Running owner 置 Exiting 并唯一递减；归零同锁冻结 Completed，锁外封 VM/发布回收。Start 先赢则承诺继续，最后 Exit 先赢则迟到票据永久失效。所有冻结统一清零并保持首因，reap 只核正常 Running 路径已 Exiting，不另扣发布数。
 
-[`ProcessBuilder`](../../os/kernel/src/task/process/builder.rs) 的阶段为 Prepared/Pending/Starting/Publishing/Started/Aborted。Builder固定MANAGE|GRANT|TRANSIT，无DUPLICATE；Create铸造和类型上限使用所属module唯一常量。缓冲运输成功移动同一authority、失败返原owner，接收端可仅保留MANAGE。Pending最后authority消散以Aborted冻结Shell；已提交Start由Work继续持责任。Start 在 Job 链门确认未 seal、执行需求已绑定、有 Created 且无外部 Body 借用/成员预约，提交 Running 并关闭 Building VM 准入；成功后消费 Builder authority，独立内嵌 Work 接管。Work 通过 VM 的 arm/复检等待既有访问 lease（包括失败准备的回滚）清零，才开放 entry。Frozen 会取走 startup waiter 并唤醒该记录。
+Created、创建预约、外部票据/Control 只保资源，不保活 Running；Sleep/Wait 仍保执行承诺，不按 Ready 队列是否为空判定。member_departed/rollback_member 仅归还资源回执与唤醒，不再决定自然结束。执行终结早于实际现场/Departure/Body 退款及 Process DONE；空间退休继续等独立 VM lease、实际运行与结果回执屏障。
+
+[`ProcessBuilder`](../../os/kernel/src/task/process/builder.rs) 的阶段为 Prepared/Pending/Starting/Publishing/Started/Aborted。Builder固定MANAGE|TRANSFER，无DUPLICATE；Create铸造和类型上限使用所属module唯一常量。缓冲运输成功移动同一authority、失败返原owner，接收端可仅保留MANAGE。Pending最后authority消散以Aborted冻结Shell；已提交Start由Work继续持责任。Start 在 Job 链门确认未 seal、执行需求已绑定、有 Created 且无外部 Body 借用/成员预约，提交 Running 及初始发布数，把 Shell 的托管域永久切为独立根，并关闭 Building VM 准入；成功后消费 Builder authority，独立内嵌 Work 接管。Work 通过 VM 的 arm/复检等待既有访问 lease（包括失败准备的回滚）清零，才开放 entry。Frozen 会取走 startup waiter 并唤醒该记录。
 
 首个 Ready 发布前冻结成员槽终点与 tid 上界，每步只取一槽的旧 Created，经短 ingress 发布预付 ReadyBatch。已运行线程新建的 Pending 或复用槽的新 tid 不会被此批启动。Start 提交时把门内已接受的 BodyLease 转为不携带 Body 指针的 WorkReceipt，只保留已提交责任的 ingress；实际数据每步另借短 BodyLease。所有槽交接完或 Frozen 后，step 清 Shell 强根并结束执行；最后 Builder 引用消散，末字段先退宿主费、再归还 WorkReceipt、最后发布私有启动 DONE。因此 Frozen 不能在启动宿主实际退款前越过 WaitIngress。Start调用期间唯一authority由Invocation持有；未提交失败回Pending，由Invocation恢复/释放决定后续放弃，已提交启动由记录完成。
 
@@ -156,6 +158,7 @@ per-hart 帧。
 | PROCESS_MEMBERS | Body成员稳定槽 | Shell→Members |
 | WORK_DEBT | Thread预付ReadyBatch槽 | 取出后入队 |
 | REMOTE_CALL | 固定运输槽 | 发布可在VM门内，执行/回调门外 |
+| CUSTODY_FOREST | 门控容器托管索引 | 业务锁→FOREST；仅预付指针/纯值，无分配、uaccess、回调或反向锁 |
 | MAINTENANCE | 维护队列/Record状态 | 零分配，不取其他锁；IPI在全部门外 |
 | HEAP | talc | — |
 | SYSTEM_SUPPLY | 预清零system ticket | HEAP→O(1)票据消费 |
@@ -166,6 +169,8 @@ per-hart 帧。
 诊断输出也遵守该边界：持有 `CONNECTION`、`ADDRESS_SPACE` 或更高阶业务锁时不得调用
 console/log；需要报告的 shootdown、attach/close 等诊断先保存不可变结果，释放业务锁后再执行
 best-effort 输出。这样保留 Lock Ladder 的严格降序，不以放松 console rank 或吞掉日志错误解决违规。
+
+托管森林的唯一机制说明见 [IPC](ipc.md#门控容器托管森林)；Shell 只接 Building→Running/Terminating 的不可逆根转换。
 
 ### reserve/commit/rollback 协议
 

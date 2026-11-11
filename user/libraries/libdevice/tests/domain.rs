@@ -286,12 +286,12 @@ fn fixed_export_rights_do_not_require_giving_clients_duplicate_authority() {
         related_object_id: 0,
         kind: ObjectKind::MmioUse as u32,
         reserved0: 0,
-        rights: Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSIT,
+        rights: Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER,
         badge: 0,
         reserved: 0,
     };
     assert_eq!(descriptor.check_handle(&actual), Ok(()));
-    actual.rights = Rights::READ | Rights::WRITE | Rights::TRANSIT;
+    actual.rights = Rights::READ | Rights::WRITE | Rights::TRANSFER;
     assert_eq!(descriptor.check_handle(&actual), Err(Error::Permission));
     actual.kind = ObjectKind::MemoryObject as u32;
     assert_eq!(descriptor.check_handle(&actual), Err(Error::Permission));

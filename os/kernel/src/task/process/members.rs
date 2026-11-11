@@ -281,6 +281,30 @@ impl Members {
         true
     }
 
+    /// 当前执行 owner 的 ThreadExit；调用者持 Shell 门，与发布/冻结同序仲裁。
+    /// Frozen 扫描可能已经置 Exiting；返回值区分本次是否撤销了运行成员。
+    pub(crate) fn exit_running(&self, key: MemberKey, slot: usize) -> bool {
+        let mut inner = self.inner.lock();
+        let entry = inner.entry_mut(key);
+        match &entry.state {
+            MemberState::Running { slot: active } if *active == slot => {
+                entry.state = MemberState::Exiting;
+                true
+            }
+            MemberState::Exiting => false,
+            _ => panic!("ThreadExit without current running member"),
+        }
+    }
+
+    /// 未冻结进程的执行 owner 只能在 ThreadExit 提交后交给 reap。
+    pub(crate) fn assert_exiting(&self, key: MemberKey) {
+        let mut inner = self.inner.lock();
+        assert!(
+            matches!(&inner.entry_mut(key).state, MemberState::Exiting),
+            "execution owner reaped before ThreadExit"
+        );
+    }
+
     pub(crate) fn requeue(
         &self,
         shell: &Arc<ProcessShell>,

@@ -548,7 +548,7 @@ pub(crate) fn run(mailbox: Mailbox, startup: Startup) {
                 .description()
                 .expect("publication endpoint query failed")
                 .rights;
-            Rights::WRITE | Rights::WAIT | Rights::TRANSIT | (actual & Rights::DUPLICATE)
+            Rights::WRITE | Rights::WAIT | Rights::TRANSFER | (actual & Rights::DUPLICATE)
         })
         .unwrap_or(Rights::NONE);
     let mut publication = publication_endpoint.map(|endpoint| {

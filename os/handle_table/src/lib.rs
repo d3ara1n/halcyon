@@ -251,21 +251,23 @@ impl<T, R> HandleTable<T, R> {
     }
 
     /// 原子验证并移除一批待进入有缓冲消息的 Handle。任何验证失败都保持
-    /// 表不变；每项源 entry 必须持 TRANSIT。
+    /// 表不变；每项源 entry 必须持 TRANSFER。
     pub fn extract_moves(
         &mut self,
         moves: &[(Handle, Rights)],
     ) -> Result<Vec<Entry<T, R>>, TableError> {
-        Ok(self.prepare_extract_with(moves, Rights::TRANSIT)?.commit())
+        Ok(self.prepare_extract_with(moves, Rights::TRANSFER)?.commit())
     }
 
     /// 原子验证并移除一批待直接安装到另一 HandleTable 的 Handle。任何
-    /// 验证失败都保持表不变；每项源 entry 必须持 GRANT。
+    /// 验证失败都保持表不变；每项源 entry 必须持 TRANSFER。
     pub fn extract_grants(
         &mut self,
         grants: &[(Handle, Rights)],
     ) -> Result<Vec<Entry<T, R>>, TableError> {
-        Ok(self.prepare_extract_with(grants, Rights::GRANT)?.commit())
+        Ok(self
+            .prepare_extract_with(grants, Rights::TRANSFER)?
+            .commit())
     }
 
     /// Pin 一个提交时消费的独占 authority。验证与翻转在单临界区完成，
@@ -313,7 +315,7 @@ impl<T, R> HandleTable<T, R> {
             if !rights.is_known() {
                 return Err(TableError::RightsDenied);
             }
-            let entry = self.get(handle, Rights::GRANT)?;
+            let entry = self.get(handle, Rights::TRANSFER)?;
             if !rights.is_subset_of(entry.rights()) {
                 return Err(TableError::RightsDenied);
             }
@@ -425,7 +427,7 @@ impl<T, R> HandleTable<T, R> {
         &'a mut self,
         moves: &'a [(Handle, Rights)],
     ) -> Result<PreparedExtraction<'a, T, R>, TableError> {
-        self.prepare_extract_with(moves, Rights::TRANSIT)
+        self.prepare_extract_with(moves, Rights::TRANSFER)
     }
 
     fn prepare_extract_with<'a>(
@@ -753,7 +755,7 @@ mod tests {
         assert_eq!(*table.get(copy, Rights::WRITE).unwrap().object(), 7);
         assert_eq!(
             table
-                .duplicate(source, Rights::WRITE | Rights::TRANSIT)
+                .duplicate(source, Rights::WRITE | Rights::TRANSFER)
                 .unwrap_err(),
             TableError::RightsDenied
         );
@@ -766,11 +768,11 @@ mod tests {
             .insert(entry(
                 7,
                 Role::Sender,
-                Rights::WRITE | Rights::TRANSIT | Rights::DUPLICATE,
+                Rights::WRITE | Rights::TRANSFER | Rights::DUPLICATE,
             ))
             .unwrap();
         let copy = table
-            .duplicate(source, Rights::WRITE | Rights::TRANSIT)
+            .duplicate(source, Rights::WRITE | Rights::TRANSFER)
             .unwrap();
         assert_eq!(*table.get(copy, Rights::WRITE).unwrap().object(), 7);
         let moved = table.extract_moves(&[(copy, Rights::WRITE)]).unwrap();
@@ -782,7 +784,7 @@ mod tests {
     fn failed_move_keeps_every_source() {
         let mut table = HandleTable::try_new().unwrap();
         let a = table
-            .insert(entry(1, Role::Sender, Rights::WRITE | Rights::TRANSIT))
+            .insert(entry(1, Role::Sender, Rights::WRITE | Rights::TRANSFER))
             .unwrap();
         let b = table.insert(entry(2, Role::Owner, Rights::READ)).unwrap();
         assert_eq!(
@@ -796,36 +798,49 @@ mod tests {
     }
 
     #[test]
-    fn transit_and_direct_grant_require_distinct_rights() {
+    fn messages_and_direct_grants_share_transfer_authority() {
         let mut table = HandleTable::try_new().unwrap();
-        let owner = table
-            .insert(entry(1, Role::Owner, Rights::READ | Rights::GRANT))
+        for direct in [false, true] {
+            let owner = table
+                .insert(entry(1, Role::Owner, Rights::READ | Rights::TRANSFER))
+                .unwrap();
+            let moved = if direct {
+                table.extract_grants(&[(owner, Rights::READ)])
+            } else {
+                table.extract_moves(&[(owner, Rights::READ)])
+            }
             .unwrap();
-        assert_eq!(
-            table.extract_moves(&[(owner, Rights::READ)]).unwrap_err(),
-            TableError::RightsDenied
-        );
-        assert!(table.get(owner, Rights::READ).is_ok());
-        let granted = table.extract_grants(&[(owner, Rights::READ)]).unwrap();
-        assert_eq!(granted[0].rights(), Rights::READ);
+            assert_eq!(moved[0].rights(), Rights::READ);
+            assert_eq!(*moved[0].role(), Role::Owner);
+            assert!(table.get(owner, Rights::READ).is_err());
 
-        let sender = table
-            .insert(entry(2, Role::Sender, Rights::WRITE | Rights::TRANSIT))
-            .unwrap();
-        assert_eq!(
-            table
-                .extract_grants(&[(sender, Rights::WRITE)])
-                .unwrap_err(),
-            TableError::RightsDenied
-        );
-        assert!(table.get(sender, Rights::WRITE).is_ok());
+            // 转交不授予复制权；收窄掉 TRANSFER 后两种出口都拒绝继续转交。
+            let installed = table.insert(moved.into_iter().next().unwrap()).unwrap();
+            assert_eq!(
+                table.duplicate(installed, Rights::READ),
+                Err(TableError::RightsDenied)
+            );
+            assert_eq!(
+                table
+                    .extract_moves(&[(installed, Rights::READ)])
+                    .unwrap_err(),
+                TableError::RightsDenied
+            );
+            assert_eq!(
+                table
+                    .extract_grants(&[(installed, Rights::READ)])
+                    .unwrap_err(),
+                TableError::RightsDenied
+            );
+            assert!(table.get(installed, Rights::READ).is_ok());
+        }
     }
 
     #[test]
     fn successful_move_retires_source_values() {
         let mut table = HandleTable::try_new().unwrap();
         let a = table
-            .insert(entry(1, Role::Sender, Rights::WRITE | Rights::TRANSIT))
+            .insert(entry(1, Role::Sender, Rights::WRITE | Rights::TRANSFER))
             .unwrap();
         let moved = table.extract_moves(&[(a, Rights::WRITE)]).unwrap();
         assert_eq!(moved[0].rights(), Rights::WRITE);
@@ -936,7 +951,7 @@ mod pin_tests {
     type Table = HandleTable<u32, u8>;
 
     fn entry(value: u32) -> Entry<u32, u8> {
-        Entry::new(value, 1, Rights::READ | Rights::GRANT)
+        Entry::new(value, 1, Rights::READ | Rights::TRANSFER)
     }
 
     #[test]
@@ -966,15 +981,15 @@ mod pin_tests {
             .pin_transfer(protected, Rights::READ, &[(grant, Rights::READ)], 9)
             .unwrap();
         table.unpin(9);
-        let restored = table.get(grant, Rights::READ | Rights::GRANT).unwrap();
+        let restored = table.get(grant, Rights::READ | Rights::TRANSFER).unwrap();
         assert_eq!(*restored.object(), 21);
-        assert_eq!(restored.rights(), Rights::READ | Rights::GRANT);
+        assert_eq!(restored.rights(), Rights::READ | Rights::TRANSFER);
         assert_eq!(
             table
-                .get(protected, Rights::READ | Rights::GRANT)
+                .get(protected, Rights::READ | Rights::TRANSFER)
                 .unwrap()
                 .rights(),
-            Rights::READ | Rights::GRANT
+            Rights::READ | Rights::TRANSFER
         );
 
         table
@@ -991,9 +1006,14 @@ mod pin_tests {
     fn transfer_pin_validates_before_mutating() {
         let mut table = Table::try_new().unwrap();
         let protected = table.insert(entry(30)).unwrap();
-        let no_grant = table.insert(Entry::new(31, 1, Rights::READ)).unwrap();
+        let no_transfer = table.insert(Entry::new(31, 1, Rights::READ)).unwrap();
         assert!(matches!(
-            table.pin_transfer(protected, Rights::READ, &[(no_grant, Rights::GRANT)], 5),
+            table.pin_transfer(
+                protected,
+                Rights::READ,
+                &[(no_transfer, Rights::TRANSFER)],
+                5
+            ),
             Err(TableError::RightsDenied)
         ));
         assert!(table.get(protected, Rights::READ).is_ok());

@@ -8,6 +8,7 @@
 
 extern crate alloc;
 
+pub mod forest;
 mod holders;
 pub mod signal;
 mod table;

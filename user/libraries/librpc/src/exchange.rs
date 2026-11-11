@@ -168,7 +168,7 @@ impl Request {
             return Err(SystemCallError::ObjectBusy);
         }
         let packet = self.packet.as_mut().ok_or(SystemCallError::ObjectBusy)?;
-        let rights = Rights::WRITE | Rights::WAIT | Rights::TRANSIT;
+        let rights = Rights::WRITE | Rights::WAIT | Rights::TRANSFER;
         let permit = send_once(source, rights)?;
         packet
             .push_front(permit.reply.into_capability(), rights)

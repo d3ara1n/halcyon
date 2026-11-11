@@ -271,7 +271,7 @@ fn watch(response: Response<'_>, handles: &mut HandleSet) -> Result<Watch, Clien
     let (waiter, description) =
         libkernel::ipc::notification::NotificationObserver::from_capability(handles.take(1)?)
             .map_err(|f| ClientError::System(f.error))?;
-    if !description.rights.contains(Rights::WAIT | Rights::TRANSIT) {
+    if !description.rights.contains(Rights::WAIT | Rights::TRANSFER) {
         return Err(ClientError::Protocol);
     }
     Ok(Watch {
@@ -284,7 +284,7 @@ fn sender(handles: &mut HandleSet, index: usize) -> Result<MailboxSender, Client
     let (sender, description) = MailboxSender::from_capability(cap).map_err(ClientError::Adopt)?;
     if !description
         .rights
-        .contains(Rights::WRITE | Rights::WAIT | Rights::TRANSIT)
+        .contains(Rights::WRITE | Rights::WAIT | Rights::TRANSFER)
     {
         return Err(ClientError::Protocol);
     }

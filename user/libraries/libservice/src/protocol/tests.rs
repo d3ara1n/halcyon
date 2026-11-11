@@ -33,7 +33,7 @@ fn register_golden_uses_full_transport_and_exact_slots() {
     body.extend((desc.len() as u32).to_le_bytes());
     body.extend(desc);
     body.extend(
-        (Rights::WRITE | Rights::WAIT | Rights::TRANSIT)
+        (Rights::WRITE | Rights::WAIT | Rights::TRANSFER)
             .raw()
             .to_le_bytes(),
     );
@@ -51,11 +51,13 @@ fn register_golden_uses_full_transport_and_exact_slots() {
     ));
     assert!(matches!(decode_request(&frame, 1), Err(Status::Invalid)));
     let last = body.len() - 8;
-    body[last..].copy_from_slice(&u64::MAX.to_le_bytes());
-    assert!(matches!(
-        decode_request(&header(2, &body), 3),
-        Err(Status::Invalid)
-    ));
+    for unknown in [1u64 << 8, u64::MAX] {
+        body[last..].copy_from_slice(&unknown.to_le_bytes());
+        assert!(matches!(
+            decode_request(&header(2, &body), 3),
+            Err(Status::Invalid)
+        ));
+    }
 }
 #[test]
 fn descriptor_count_duplicates_and_version_range_are_rejected() {

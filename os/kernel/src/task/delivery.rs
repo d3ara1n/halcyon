@@ -53,7 +53,7 @@ impl KernelObject for Delivery {
         self.sender_id
     }
     fn allowed_rights(&self) -> Option<Rights> {
-        Some(Rights::TRANSIT | Rights::GRANT)
+        Some(Rights::TRANSFER)
     }
     fn on_last_capability(&self) {
         let usage = self.usage.lock().take();

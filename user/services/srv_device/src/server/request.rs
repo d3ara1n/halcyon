@@ -945,7 +945,7 @@ impl Request {
         )?;
         self.push(
             observer.into_capability(),
-            Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT,
+            Rights::WAIT | Rights::DUPLICATE | Rights::TRANSFER,
         )?;
         match target {
             libdevice::registry::WatchTarget::Binding(snapshot) => {

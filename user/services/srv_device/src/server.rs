@@ -72,14 +72,10 @@ const POLICY: binding_work::Policy = binding_work::Policy {
     stop_ns: 20_000_000_000,
 };
 pub(super) const TRANSPORT: Rights = Rights::from_raw(
-    Rights::WRITE.raw()
-        | Rights::WAIT.raw()
-        | Rights::DUPLICATE.raw()
-        | Rights::TRANSIT.raw()
-        | Rights::GRANT.raw(),
+    Rights::WRITE.raw() | Rights::WAIT.raw() | Rights::DUPLICATE.raw() | Rights::TRANSFER.raw(),
 );
 pub(super) const ENTRY_RIGHTS: Rights = Rights::from_raw(
-    Rights::WRITE.raw() | Rights::WAIT.raw() | Rights::DUPLICATE.raw() | Rights::TRANSIT.raw(),
+    Rights::WRITE.raw() | Rights::WAIT.raw() | Rights::DUPLICATE.raw() | Rights::TRANSFER.raw(),
 );
 pub(super) fn step(next: Step) -> Advance {
     Advance {

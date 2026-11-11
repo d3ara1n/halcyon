@@ -35,7 +35,7 @@ const SUPERVISOR_RIGHTS: Rights = Rights::from_raw(
         | Rights::WAIT.raw()
         | Rights::MANAGE.raw()
         | Rights::DUPLICATE.raw()
-        | Rights::GRANT.raw(),
+        | Rights::TRANSFER.raw(),
 );
 pub(super) const JOB_RIGHTS: Rights = Rights::from_raw(
     Rights::CREATE.raw()
@@ -43,18 +43,13 @@ pub(super) const JOB_RIGHTS: Rights = Rights::from_raw(
         | Rights::READ.raw()
         | Rights::WAIT.raw()
         | Rights::DUPLICATE.raw()
-        | Rights::TRANSIT.raw()
-        | Rights::GRANT.raw(),
+        | Rights::TRANSFER.raw(),
 );
 const POOL_RIGHTS: Rights = Rights::from_raw(
-    Rights::READ.raw()
-        | Rights::CREATE.raw()
-        | Rights::DUPLICATE.raw()
-        | Rights::TRANSIT.raw()
-        | Rights::GRANT.raw(),
+    Rights::READ.raw() | Rights::CREATE.raw() | Rights::DUPLICATE.raw() | Rights::TRANSFER.raw(),
 );
 pub(super) const CALL_RIGHTS: Rights =
-    Rights::from_raw(Rights::WRITE.raw() | Rights::WAIT.raw() | Rights::TRANSIT.raw());
+    Rights::from_raw(Rights::WRITE.raw() | Rights::WAIT.raw() | Rights::TRANSFER.raw());
 pub(super) const TERMINAL_REVOKE_MS: u64 = 5_000;
 const FORMATION_ENTRY: &str = "formation";
 
@@ -394,7 +389,7 @@ impl<'a> Executor<'a> {
             if let ResourceKind::Mailbox { rights } = definition.kind {
                 let receiver = Mailbox::create_in(
                     self.payer(&definition.payer)?,
-                    rights | Rights::MANAGE | Rights::GRANT,
+                    rights | Rights::MANAGE | Rights::TRANSFER,
                 )
                 .map_err(|_| "formation mailbox creation failed")?;
                 self.resources[index] = Some(ResourceState::Mailbox(Some(receiver)));
@@ -414,7 +409,11 @@ impl<'a> Executor<'a> {
                     _ => return Err("formation sender receiver unavailable"),
                 };
                 let minted = receiver
-                    .mint_in(payer, *badge, *rights | Rights::DUPLICATE | Rights::GRANT)
+                    .mint_in(
+                        payer,
+                        *badge,
+                        *rights | Rights::DUPLICATE | Rights::TRANSFER,
+                    )
                     .map_err(|_| "formation sender creation failed")?;
                 self.resources[index] = Some(ResourceState::Sender {
                     sender: Some(minted.sender),
@@ -472,7 +471,7 @@ impl<'a> Executor<'a> {
                         ..
                     }),
                     ResourceOutput::Main,
-                ) => object::duplicate(sender.as_handle(), input.rights | Rights::GRANT)
+                ) => object::duplicate(sender.as_handle(), input.rights | Rights::TRANSFER)
                     .map(owned)
                     .map_err(|_| "sender input alias failed"),
                 _ => Err("formation resource output unavailable"),
@@ -497,7 +496,7 @@ impl<'a> Executor<'a> {
                 .as_handle(),
             Source::Resource { .. } => return Err("resource resolution escaped ownership branch"),
         };
-        object::duplicate(handle, input.rights | Rights::GRANT)
+        object::duplicate(handle, input.rights | Rights::TRANSFER)
             .map(owned)
             .map_err(|_| "instance input alias failed")
     }

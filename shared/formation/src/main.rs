@@ -405,14 +405,14 @@ kind="sender"
 payer="host"
 mailbox="inbox"
 badge=17
-rights=["write","wait","transit","duplicate"]
+rights=["write","wait","transfer","duplicate"]
 terminal_revoke=true
 [instance.host]
 image="srv_host"
 [instance.host.inputs]
 receiver="init/object.inbox"
 [instance.host.namespace]
-"/雪"={from="init/object.entry",rights=["write","wait","transit"]}
+"/雪"={from="init/object.entry",rights=["write","wait","transfer"]}
 "#;
     fn parse(text: &str) -> Result<Formation> {
         compile(text.parse::<Table>().map_err(|e| e.to_string())?)
@@ -428,6 +428,14 @@ receiver="init/object.inbox"
         let f = parse(&SOURCE.replace("terminal_revoke=true", "")).unwrap();
         assert!(!f.resources[1].terminal_revoke);
     }
+    #[test]
+    fn system_formation_uses_current_rights_contract() {
+        // 捕获正式组态保留旧权利名；不声称实际映像已构建。
+        let f = parse(include_str!("../../../user/formations/system.toml")).unwrap();
+        f.validate(|_| true).unwrap();
+        assert_eq!(Formation::decode(&f.encode().unwrap()).unwrap(), f);
+    }
+
     #[test]
     fn legacy_fields_and_export_routes_are_not_adapted() {
         for source in [
@@ -451,6 +459,8 @@ receiver="init/object.inbox"
             SOURCE.replace("kind=\"sender\"", "kind=\"notification\""),
             SOURCE.replace("badge=17", "badge=-1"),
             SOURCE.replace("rights=[\"read\",\"wait\"]", "rights=[\"unknown\"]"),
+            SOURCE.replace("transfer", "transit"),
+            SOURCE.replace("transfer", "grant"),
         ] {
             assert!(parse(&source).is_err());
         }

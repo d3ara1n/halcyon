@@ -1,10 +1,10 @@
 # 消息
 
-消息是 IPC 的控制面：有界、单向、内核缓冲的 Mailbox 记录，承载小批量 payload、内核生成的来源 envelope，以及原子 TRANSIT 的 Handle。大块数据走 [Tunnel](tunnel.md)，状态观察走 [wait](wait.md)。
+消息是 IPC 的控制面：有界、单向、内核缓冲的 Mailbox 记录，承载小批量 payload、内核生成的来源 envelope，以及原子转交的 Handle。大块数据走 [Tunnel](tunnel.md)，状态观察走 [wait](wait.md)。
 
 ## 队列与发送授权
 
-Mailbox 是具有唯一 receiver-owner 的接收队列。创建队列只交付 owner；由 owner 显式铸造发送授权，不隐含一个可调用的默认根入口。owner 不可复制，只能经直接 GRANT 安装，不能进入消息。
+Mailbox 是具有唯一 receiver-owner 的接收队列。创建队列只交付 owner；由 owner 显式铸造发送授权，不隐含一个可调用的默认根入口。owner 不可复制；具备 TRANSFER 时可经消息中转或直接安装，容器托管关系见[对象](object.md)。
 
 每次铸造产生一个独立的发送授权对象，绑定目标 Mailbox 和不可变 badge。角色由对象类型表达：MailboxReceiver、MailboxSender 与 MailboxOnceSender 是共享同一队列的不同对象类型，不在 capability 上附加 role。duplicate、移动与 rights 裁剪保持同一对象；派生 MailboxOnceSender 产生新的一次性发送对象，承接父 sender 的 badge，并配对一个 ReplyObserver，后者观察这份一次性投递权最终是已入队还是已放弃。重新铸造即产生新身份，即使目标队列和 badge 相同也不合并寿命。
 
@@ -34,7 +34,7 @@ Peek 不取得 Delivery，Discard 和队列关闭释放尚未接收的 Delivery�
 
 发送方只能提交协议 kind、长度、Handle 数及 [Deadline](time.md)，不能填写 provenance、发送授权身份或 badge。接收结果由内核构造。长度与 Handle 数交叉校验，reserved 必须为零。
 
-每条消息 payload 最多 4096 字节、业务 TRANSIT Handle 最多 8 个；每个 Mailbox 最多 16 条。Delivery 是额外的内核交付项，不压缩这 8 个业务槽。接收方必须为完整业务 Handle 集合及 Delivery 预留表空间。
+每条消息 payload 最多 4096 字节、业务转交 Handle 最多 8 个；每个 Mailbox 最多 16 条。Delivery 是额外的内核交付项，不压缩这 8 个业务槽。接收方必须为完整业务 Handle 集合及 Delivery 预留表空间。
 
 内核不解释 kind、payload、badge 或附带 Handle 的上层含义。
 

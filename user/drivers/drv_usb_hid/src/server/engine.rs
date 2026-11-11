@@ -24,7 +24,7 @@ impl Engine {
             erhino_shared::object::Rights::READ | erhino_shared::object::Rights::WAIT,
             erhino_shared::object::Rights::SIGNAL
                 | erhino_shared::object::Rights::DUPLICATE
-                | erhino_shared::object::Rights::TRANSIT,
+                | erhino_shared::object::Rights::TRANSFER,
         )?;
         Ok(Self {
             instance,
@@ -83,7 +83,7 @@ impl Engine {
                     .ok_or(Error::Closed)?
                     .peer
                     .as_handle(),
-                rights | erhino_shared::object::Rights::TRANSIT,
+                rights | erhino_shared::object::Rights::TRANSFER,
             )?;
             // SAFETY: 新 entry 的唯一关闭责任移入这次原 seq 请求。
             request

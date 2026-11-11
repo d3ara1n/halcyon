@@ -202,7 +202,7 @@ impl KernelObject for Lifetime {
         self.observed
     }
     fn allowed_rights(&self) -> Option<Rights> {
-        Some(Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT)
+        Some(Rights::WAIT | Rights::DUPLICATE | Rights::TRANSFER)
     }
     fn allowed_signals(&self) -> Option<ObjectSignals> {
         Some(ObjectSignals::CLOSED)

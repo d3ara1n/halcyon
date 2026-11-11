@@ -12,7 +12,7 @@ IPC 建立在[对象、capability 与 Handle](object.md)模型上。对象类型
 
 ## 共同边界
 
-内核负责对象授权、消息运输、映射与等待机制，不解释业务 kind、路径或共享页协议。TRANSIT 与 Building 期 GRANT 是不同的交付方式，具体角色是否可交付由其类型与实际权限决定。
+内核负责对象授权、消息运输、映射与等待机制，不解释业务 kind、路径或共享页协议。消息与 Building 期直接安装共享 TRANSFER 转交许可，具体角色是否可交付由其类型与实际权限决定。
 
 发送授权与 badge 关联业务上下文，sender PID 仅为来源信息。LifetimeObserver 观察发送授权/use 的终结，ReplyObserver 观察一次回复权的结果；它们不反向成为业务控制者。请求处理责任与回复发送权分别持有。
 

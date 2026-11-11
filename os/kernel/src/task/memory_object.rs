@@ -313,8 +313,7 @@ const MEMORY_OBJECT_RIGHTS: Rights = Rights::from_raw(
         | Rights::WAIT.raw()
         | Rights::MANAGE.raw()
         | Rights::DUPLICATE.raw()
-        | Rights::TRANSIT.raw()
-        | Rights::GRANT.raw()
+        | Rights::TRANSFER.raw()
         | Rights::EXECUTE.raw(),
 );
 

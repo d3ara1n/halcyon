@@ -60,7 +60,7 @@ impl Fixture {
         AccessSnapshot {
             root,
             rights,
-            output_transport: Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE,
+            output_transport: Rights::WRITE | Rights::WAIT | Rights::TRANSFER | Rights::DUPLICATE,
             funding: crate::Funding::new(account, execution).unwrap(),
             lease: Rc::new(GrantLease {
                 active: Cell::new(true),
@@ -379,7 +379,7 @@ fn invisible_binding_preparation_has_independent_capacity_and_last_pin_refund() 
         .backend
         .reserve_binding(
             FsRights::ALL,
-            Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+            Rights::WRITE | Rights::WAIT | Rights::TRANSFER,
             &f.account,
         )
         .unwrap();
@@ -387,7 +387,7 @@ fn invisible_binding_preparation_has_independent_capacity_and_last_pin_refund() 
         .backend
         .reserve_binding(
             FsRights::ALL,
-            Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+            Rights::WRITE | Rights::WAIT | Rights::TRANSFER,
             &f.account,
         )
         .unwrap();
@@ -804,7 +804,7 @@ fn directory_issue_rechecks_selected_scope_ceiling_and_complete_transport_limits
     let parent = Fixture::access(&f.account, &f.execution, allowed.clone(), FsRights::ALL);
     let policy = crate::authority::Issuance {
         rights: FsRights::CREATE,
-        sender_transport: Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+        sender_transport: Rights::WRITE | Rights::WAIT | Rights::TRANSFER,
         output_transport: Rights::NONE,
     };
     assert_eq!(
@@ -813,11 +813,11 @@ fn directory_issue_rechecks_selected_scope_ceiling_and_complete_transport_limits
     );
     for widened in [
         crate::authority::Issuance {
-            sender_transport: policy.sender_transport | Rights::GRANT,
+            sender_transport: policy.sender_transport | Rights::MANAGE,
             ..policy
         },
         crate::authority::Issuance {
-            output_transport: Rights::GRANT,
+            output_transport: Rights::MANAGE,
             ..policy
         },
     ] {
@@ -869,7 +869,7 @@ fn admitted_directory_use_survives_ordinary_owner_drop_but_revoke_blocks_rename(
     f.access = None;
     let policy = crate::authority::Issuance {
         rights: FsRights::CREATE,
-        sender_transport: Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+        sender_transport: Rights::WRITE | Rights::WAIT | Rights::TRANSFER,
         output_transport: Rights::NONE,
     };
     assert_eq!(
@@ -974,7 +974,7 @@ fn derived_sender_and_new_output_each_obey_full_transport_ceiling() {
     use crate::authority::Issuance;
     let f = Fixture::new();
     let mut parent = f.scope().clone();
-    let callable = Rights::WRITE | Rights::WAIT | Rights::TRANSIT;
+    let callable = Rights::WRITE | Rights::WAIT | Rights::TRANSFER;
     parent.output_transport = callable | Rights::DUPLICATE;
     let legal = Issuance {
         rights: FsRights::READ_STREAM,
@@ -984,7 +984,7 @@ fn derived_sender_and_new_output_each_obey_full_transport_ceiling() {
     assert_eq!(legal.validate_derived(&parent, FsRights::ALL), Ok(()));
     assert_eq!(
         Issuance {
-            sender_transport: callable | Rights::GRANT,
+            sender_transport: callable | Rights::MANAGE,
             ..legal
         }
         .validate_derived(&parent, FsRights::ALL),
@@ -1000,7 +1000,7 @@ fn derived_sender_and_new_output_each_obey_full_transport_ceiling() {
     );
     assert_eq!(
         Issuance {
-            sender_transport: Rights::TRANSIT,
+            sender_transport: Rights::TRANSFER,
             ..legal
         }
         .validate_policy(),

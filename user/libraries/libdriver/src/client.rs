@@ -133,7 +133,7 @@ impl Watch {
             .map_err(|failure| Error::from(failure.error))?;
         if !description
             .rights
-            .contains(Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT)
+            .contains(Rights::WAIT | Rights::DUPLICATE | Rights::TRANSFER)
         {
             return Err(Error::Permission);
         }

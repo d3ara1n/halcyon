@@ -14,11 +14,7 @@ use libkernel::{
 };
 
 pub const IMAGE_RIGHTS: Rights = Rights::from_raw(
-    Rights::READ.raw()
-        | Rights::WAIT.raw()
-        | Rights::DUPLICATE.raw()
-        | Rights::TRANSIT.raw()
-        | Rights::GRANT.raw(),
+    Rights::READ.raw() | Rights::WAIT.raw() | Rights::DUPLICATE.raw() | Rights::TRANSFER.raw(),
 );
 pub struct Image {
     object: MemoryObject,

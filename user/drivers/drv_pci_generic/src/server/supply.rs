@@ -12,8 +12,7 @@ use libpci::{
     host::{HOST_RESOURCES, HostInfo},
     platform::ROOT_RIGHTS,
 };
-const USE: Rights =
-    Rights::from_raw(ROOT_RIGHTS.raw() & !Rights::CREATE.raw() & !Rights::GRANT.raw());
+const USE: Rights = Rights::from_raw(ROOT_RIGHTS.raw() & !Rights::CREATE.raw());
 pub(super) const LIMITS: Limits = Limits {
     entries: 4,
     text_bytes: ("registersinterruptdmapci-function".len() + FunctionInfo::BYTES * 4) as u32,
@@ -399,11 +398,11 @@ impl Host {
                     .dma
                     .as_ref()
                     .ok_or(Error::NotReady)?
-                    .create_use(ROOT_RIGHTS & !Rights::GRANT)?;
+                    .create_use(ROOT_RIGHTS)?;
                 (
                     unsafe_cap(usage.into_handle()),
                     erhino_shared::object::ObjectKind::DmaUse,
-                    ROOT_RIGHTS & !Rights::GRANT,
+                    ROOT_RIGHTS,
                     0,
                 )
             }

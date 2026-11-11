@@ -33,7 +33,7 @@ fn main() {
         .require(
             "memory.pool",
             ObjectKind::MemoryPool,
-            Rights::READ | Rights::CREATE | Rights::DUPLICATE | Rights::GRANT,
+            Rights::READ | Rights::CREATE | Rights::DUPLICATE | Rights::TRANSFER,
         )
         .expect("driver Pool input invalid");
     let job = birth
@@ -48,7 +48,7 @@ fn main() {
             .require(
                 DEVICE_SOURCE,
                 ObjectKind::MailboxSender,
-                Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+                Rights::WRITE | Rights::WAIT | Rights::TRANSFER,
             )
             .expect("driver device source input invalid"),
     )

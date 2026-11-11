@@ -130,7 +130,7 @@ impl Keys {
                 )?;
                 let rights = erhino_shared::object::Rights::WAIT
                     | erhino_shared::object::Rights::DUPLICATE
-                    | erhino_shared::object::Rights::TRANSIT;
+                    | erhino_shared::object::Rights::TRANSFER;
                 let observer = pair.owner.mint_observer(rights)?;
                 // 固定槽存储与原实例来源额度在接受前已付；先接管寿命再运输真实sender。
                 self.watches[index] = Some(Watch {

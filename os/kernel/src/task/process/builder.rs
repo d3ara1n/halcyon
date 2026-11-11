@@ -21,8 +21,7 @@ use crate::sync::{Spinlock, ranks};
 use maintenance::record::Outcome;
 
 /// 启动责任可直接授予或缓冲移动，始终单一authority，不允许复制。
-pub(crate) const RIGHTS: Rights =
-    Rights::from_raw(Rights::MANAGE.raw() | Rights::GRANT.raw() | Rights::TRANSIT.raw());
+pub(crate) const RIGHTS: Rights = Rights::from_raw(Rights::MANAGE.raw() | Rights::TRANSFER.raw());
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -112,6 +111,11 @@ impl ProcessBuilder {
         let mut state = self.state.lock();
         assert!(state.phase == Phase::Prepared, "builder armed twice");
         state.phase = Phase::Pending;
+    }
+
+    /// 图准备只保活稳定域，不接受一次新的 Builder 操作；有效性在 FOREST 内读取。
+    pub(crate) fn custody_shell(&self) -> Option<Arc<ProcessShell>> {
+        self.state.lock().shell.clone()
     }
 
     pub(crate) fn process(&self) -> Result<Arc<ProcessShell>, SystemCallError> {
@@ -241,6 +245,8 @@ impl Work for ProcessBuilder {
                         None => return Outcome::Blocked,
                         Some(token) => drop(token),
                     }
+                    // 此时尚未发布首个 Ready，Running 自建线程尚无执行者；
+                    // 初始线程没有 Pending ticket，快照只包含 begin_running 的承诺批。
                     let (end, tid_ceiling) = body.members.start_snapshot();
                     let mut state = self.state.lock();
                     state.end = end;
@@ -249,6 +255,7 @@ impl Work for ProcessBuilder {
                     return Outcome::Ready;
                 }
                 Phase::Publishing if cursor < end => {
+                    // 兑现 begin_running 已一次计入的执行承诺，不走运行期 Start 的 +1。
                     if let Some(thread) = body.members.start_created_at(cursor, tid_ceiling) {
                         thread.publish_ready();
                     }

@@ -220,7 +220,7 @@ impl KernelObject for NotificationOwner {
         ObjectKind::NotificationOwner
     }
     fn allowed_rights(&self) -> Option<Rights> {
-        Some(Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT)
+        Some(Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::TRANSFER)
     }
     fn allowed_signals(&self) -> Option<ObjectSignals> {
         Some(ObjectSignals::READABLE | ObjectSignals::CLOSED)
@@ -239,7 +239,7 @@ impl KernelObject for NotificationSignaler {
         ObjectKind::NotificationSignaler
     }
     fn allowed_rights(&self) -> Option<Rights> {
-        Some(Rights::SIGNAL | Rights::WAIT | Rights::TRANSIT | Rights::GRANT | Rights::DUPLICATE)
+        Some(Rights::SIGNAL | Rights::WAIT | Rights::TRANSFER | Rights::DUPLICATE)
     }
     fn allowed_signals(&self) -> Option<ObjectSignals> {
         Some(ObjectSignals::CLOSED)
@@ -254,7 +254,7 @@ impl KernelObject for NotificationObserver {
         ObjectKind::NotificationObserver
     }
     fn allowed_rights(&self) -> Option<Rights> {
-        Some(Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT)
+        Some(Rights::WAIT | Rights::DUPLICATE | Rights::TRANSFER)
     }
     fn allowed_signals(&self) -> Option<ObjectSignals> {
         Some(ObjectSignals::READABLE | ObjectSignals::CLOSED)
@@ -277,7 +277,7 @@ pub fn mint_observer(
         .downcast_ref::<NotificationOwner>()
         .ok_or(SystemCallError::WrongObjectType)?;
     if !rights.contains(Rights::WAIT)
-        || !rights.is_subset_of(Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT)
+        || !rights.is_subset_of(Rights::WAIT | Rights::DUPLICATE | Rights::TRANSFER)
     {
         return Err(SystemCallError::RightsDenied);
     }

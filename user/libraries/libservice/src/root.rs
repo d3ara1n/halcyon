@@ -65,7 +65,7 @@ impl Root {
             let description = minted
                 .validate(
                     &state.mailbox,
-                    Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+                    Rights::WRITE | Rights::WAIT | Rights::TRANSFER,
                 )
                 .map_err(|_| Status::Invalid)?;
             let context = description.object_id;

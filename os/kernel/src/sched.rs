@@ -646,6 +646,9 @@ fn arm_user_until(quantum: u64, class_deadline: u64) {
 /// 退出 owner 先取消请求准备并正常 detach，再移交 Departure。
 /// 已登记 Operation 的回滚/已提交 Work 独立推进，不保留 Thread/UserContext。
 pub(crate) fn reap(t: AdmittedThread) {
+    // Running 的正常退出已在 syscall 撤销承诺；Frozen 路径已统一撤销全部承诺。
+    // 此处只移交执行 owner，不能以 detach/退款的延迟重新决定进程寿命。
+    t.process.assert_execution_ended(t.member());
     drop(crate::task::request::take(&t));
     crate::task::wait::detach(&t);
     t.finish_created_departure();

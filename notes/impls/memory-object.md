@@ -18,7 +18,7 @@ BackingUse、区间切分、物理投影及逐段退款详见 [mm.md 的分段 b
 
 Create/Query/Seal 使用 Body/AnySpace/uaccess/CapTable。Query/Seal 经 handle::Authorization 接受非消费授权并持调用者 BodyLease；core 快照与 seal 在表锁外，不抽取 capability，也不通过临时 Arc 延长 backing 的 root use。Create 的 caps/output 失败由 handle::install 的统一回滚接管。
 
-rights 上限为 READ/WRITE/WAIT/MANAGE/DUPLICATE/TRANSIT/GRANT/EXECUTE，没有旧 MAP 位或 role。映射来源要求 READ，可写追加 WRITE，可执行追加 EXECUTE；当前进程 mapper、Builder/bootstrap 与 Endpoint 普通 View 共用 vm::operation/AnySpace/Views 链，来源接管按各自 authority 和 rights 校验。
+rights 上限为 READ/WRITE/WAIT/MANAGE/DUPLICATE/TRANSFER/EXECUTE，没有旧 MAP 位或 role。映射来源要求 READ，可写追加 WRITE，可执行追加 EXECUTE；当前进程 mapper、Builder/bootstrap 与 Endpoint 普通 View 共用 vm::operation/AnySpace/Views 链，来源接管按各自 authority 和 rights 校验。
 
 EXECUTABLE 是唯一允许电平，普通 Close 不新增 CLOSED 信号。seal 或最后写许可退出引发状态转换时，在同一对象锁内更新来源电平，解锁后激活出生 Work；Work 每步检查一个观察节点、锁外提示目标，不写等待结果、不代摘节点。没有等待者也完成 seal，重复 seal 在 Executable 上成功且不重新打开写授权。
 

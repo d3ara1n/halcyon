@@ -29,8 +29,7 @@ const ENDPOINT_RIGHTS: Rights = Rights::from_raw(
         | Rights::SIGNAL.raw()
         | Rights::MANAGE.raw(),
 );
-const INVITATION_RIGHTS: Rights =
-    Rights::from_raw(ENDPOINT_RIGHTS.raw() | Rights::TRANSIT.raw() | Rights::GRANT.raw());
+const INVITATION_RIGHTS: Rights = Rights::from_raw(ENDPOINT_RIGHTS.raw() | Rights::TRANSFER.raw());
 const EVENTS: ObjectSignals = ObjectSignals::from_raw(
     ObjectSignals::DATA.raw()
         | ObjectSignals::PEER_ATTACHED.raw()

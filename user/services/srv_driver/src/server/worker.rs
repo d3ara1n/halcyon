@@ -96,12 +96,12 @@ impl Worker {
         let pool = memory_pool::derive(
             world.pool.as_handle(),
             libdriver::boot::WORKER_POOL,
-            Rights::READ | Rights::CREATE | Rights::DUPLICATE | Rights::GRANT,
+            Rights::READ | Rights::CREATE | Rights::DUPLICATE | Rights::TRANSFER,
         )?;
         let boot = Mailbox::create(Rights::READ | Rights::WAIT | Rights::MANAGE)?;
         let sender = boot.mint(0, TRANSPORT)?.sender;
         let expected = sender.description()?.object_id;
-        let pool_grant = object::duplicate(pool.as_handle(), Rights::CREATE | Rights::GRANT)?;
+        let pool_grant = object::duplicate(pool.as_handle(), Rights::CREATE | Rights::TRANSFER)?;
         // SAFETY: duplicate 返回独占的新 entry；仅在实际 Grant 已消费时放弃本地关闭责任。
         let pool_grant = unsafe { Capability::from_raw(pool_grant) };
         let receiver = ReceiveBuffer::new()?;
@@ -130,7 +130,7 @@ impl Worker {
         grants.try_reserve_exact(2).map_err(|_| Error::Resource)?;
         grants.push(OwnedGrant::new(
             sender.into_capability(),
-            Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+            Rights::WRITE | Rights::WAIT | Rights::TRANSFER,
         ));
         grants.push(OwnedGrant::new(pool_grant, Rights::CREATE));
         let image = world

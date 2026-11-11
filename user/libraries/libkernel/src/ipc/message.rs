@@ -701,7 +701,7 @@ mod tests {
                 ObjectKind::MailboxSender,
                 22,
                 11,
-                Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+                Rights::WRITE | Rights::WAIT | Rights::TRANSFER,
             ),
             description(ObjectKind::LifetimeObserver, 33, 22, Rights::WAIT),
         ]
@@ -715,7 +715,7 @@ mod tests {
                 &receiver,
                 &sender,
                 &lifetime,
-                Rights::WAIT | Rights::TRANSIT
+                Rights::WAIT | Rights::TRANSFER
             ),
             Ok(())
         );

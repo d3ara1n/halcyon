@@ -28,7 +28,7 @@ Frozen reaping 在 Departure 前清空请求槽。请求的 Drop 归还未提交
 
 Map 按共享 ABI 解释 guard 字节数，结果槽由 UserWriteLease 预约。调用线程在自己的用户页表下、持 VM 锁写 payload 前缀，再 atomic release store committed cookie，随后 Views/ledger 的责任 Commit 必成，不再 uaccess。PTE/ledger 发布在 Work 中按预算推进；数据与空表退款都完成后才通知成功。准备错误可以先返回，已经接管的回滚责任仍自主执行，并用 VM access 防止空间提前退出。
 
-ProcessCreate使用a0=Job、a1=Pool、a2=control rights、a3=结果地址；Control权限按显式请求校验类型上限，Builder固定MANAGE|GRANT|TRANSIT且不可复制；ProcessMap与ProcessStart返回内部完成计划。Builder/bootstrap复用统一操作链，Start的完成回执不携Body指针并阻止Frozen领先私有宿主退款。Tunnel的Endpoint来源通过普通Map，Create/Attach不持映射。具体责任与验证边界由[对象链记录](../../plans/archived/todo-2026-10-01-object-chain-kernel-integration.md)拥有。
+ProcessCreate使用a0=Job、a1=Pool、a2=control rights、a3=结果地址；Control权限按显式请求校验类型上限，Builder固定MANAGE|TRANSFER且不可复制；ProcessMap与ProcessStart返回内部完成计划。Builder/bootstrap复用统一操作链，Start的完成回执不携Body指针并阻止Frozen领先私有宿主退款。Tunnel的Endpoint来源通过普通Map，Create/Attach不持映射。具体责任与验证边界由[对象链记录](../../plans/archived/todo-2026-10-01-object-chain-kernel-integration.md)拥有。
 
 ## Fence 运输
 

@@ -401,19 +401,53 @@ impl<A: Authority, C> CapTable<A, C> {
                 events: reservation.releases,
             });
         }
-        let valid = reservation
-            .handles
-            .iter()
-            .all(|h| self.is_reserved(*h, reservation.token));
-        if !valid {
+        let mut caps = caps;
+        if let Err(error) = self.commit_reserved(&reservation, &mut caps) {
             self.rollback_handles(&reservation.handles, reservation.token);
-            return Err((caps, TableError::BadReservation));
+            return Err((caps, error));
         }
-        for (handle, cap) in reservation.handles.iter().zip(caps) {
+        Ok(Commit::Installed(reservation.handles))
+    }
+
+    /// 检查借用预约是否仍可公开。调用者须连续持有同一表同步域直到提交。
+    pub fn validate_reserved(
+        &self,
+        reservation: &Reservation<A, C>,
+        count: usize,
+    ) -> Result<(), TableError> {
+        if self.closed {
+            return Err(TableError::Closed);
+        }
+        if reservation.handles.len() != count
+            || !reservation
+                .handles
+                .iter()
+                .all(|h| self.is_reserved(*h, reservation.token))
+        {
+            return Err(TableError::BadReservation);
+        }
+        Ok(())
+    }
+
+    /// 仅移动 authority 到已验证的槽，不分配、不释放任何预约或迭代器存储。
+    ///
+    /// 调用者连续持有表同步域，并将预约、迭代器及其付款存储留在更外层，
+    /// 因而可以在额外的内层索引锁下执行实际公开。失败不消费迭代器。
+    pub fn commit_reserved<I: ExactSizeIterator<Item = Cap<A>>>(
+        &mut self,
+        reservation: &Reservation<A, C>,
+        caps: &mut I,
+    ) -> Result<(), TableError> {
+        self.validate_reserved(reservation, caps.len())?;
+        for handle in reservation.handles.iter() {
+            // 迭代器长度已经验证，内核使用持有真实存储的精确长度迭代器。
+            let cap = caps
+                .next()
+                .expect("validated capability iterator ended early");
             self.slots[handle.slot() as usize].state = SlotState::Occupied(cap);
             self.occupied += 1;
         }
-        Ok(Commit::Installed(reservation.handles))
+        Ok(())
     }
 
     /// 撤销预留；代次前进，暂存数值永不复活。

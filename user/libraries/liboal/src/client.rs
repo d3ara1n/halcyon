@@ -293,7 +293,7 @@ fn adopt_entry(
 ) -> Result<Arc<MailboxSender>, ClientError> {
     // 所有槽已按变体核对；先验证真实 role/必需位，再移交该槽的关闭责任。
     let description = handles.get(0)?.description()?;
-    let required = Rights::WRITE | Rights::WAIT | Rights::TRANSIT;
+    let required = Rights::WRITE | Rights::WAIT | Rights::TRANSFER;
     if description.kind != ObjectKind::MailboxSender as u32
         || !description.rights.contains(required)
     {

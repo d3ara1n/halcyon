@@ -343,8 +343,8 @@ impl Request {
             return Err(Status::Invalid);
         };
         backend.check(access, &selected, FsRights::WATCH)?;
-        let mandatory = Rights::WRITE | Rights::WAIT | Rights::TRANSIT;
-        let observer_required = Rights::WAIT | Rights::TRANSIT;
+        let mandatory = Rights::WRITE | Rights::WAIT | Rights::TRANSFER;
+        let observer_required = Rights::WAIT | Rights::TRANSFER;
         let output = access.output_transport();
         if !output.contains(mandatory | observer_required) {
             return Err(Status::Permission);
@@ -1099,7 +1099,7 @@ fn boundary_export(
                 return Err(Status::Permission);
             }
             let output = access.output_transport() & binding.output_transport();
-            let mandatory = Rights::WRITE | Rights::WAIT | Rights::TRANSIT;
+            let mandatory = Rights::WRITE | Rights::WAIT | Rights::TRANSFER;
             if !output.contains(mandatory) {
                 return Err(Status::Permission);
             }

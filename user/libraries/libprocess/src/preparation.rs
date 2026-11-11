@@ -473,7 +473,7 @@ impl<'a> Preparation<'a> {
                     self.builder(),
                     &[HandleGrant {
                         handle: control,
-                        rights: Rights::WAIT | Rights::DUPLICATE | Rights::GRANT | Rights::TRANSIT,
+                        rights: Rights::WAIT | Rights::DUPLICATE | Rights::TRANSFER,
                     }],
                     &mut self.granted[index..=index],
                 )?;

@@ -16,7 +16,7 @@
 
 [`resource`](../../user/libraries/libdevice/src/resource.rs) 的 Collecting 在 Claim 前按登记 Limits 预留项数组及名字/metadata 缓冲，同时冻结实际单项回复头大小，持相应实际字节 Charge；每次 push 不再分配。Prepared count 不得超过上界，索引须连续、名字为唯一单分量、总文本不得越界，每项还须能装入扣除 RPC/回复头后的载荷；全部项到齐后才能消费为 Frozen，部分表没有公开资源取得接口。Frozen 保存实际 capability owner、固定导出描述和不透明 metadata，查询不产生新业务资源。宿主在 Get 时仍须核本轮阶段与范围，停止后拒绝新取得；析构只关闭能力别名，不能代替 Provision 停止。
 
-单项 wire 使用 RPC Reader/Writer，含索引、内核 kind、固定导出 rights、供应协议标识、两份 u32 长度前缀及字节段；解码检查 reserved、尾差和恰好一个 capability 槽。单项大小按 PAYLOAD_MAX 减 RPC 和外层领域头校验；总表可多于一次消息的 handle 数。首批只接受列明的可别名内核资源和 MailboxSender 供应入口；实际 HandleDescribe 须含对应 kind、导出权及管理者重复交付所需 DUPLICATE/TRANSIT，固定导出权本身不必包含这两位。语义核验及 capability 与描述的配对仍须由实际接收任务完成。
+单项 wire 使用 RPC Reader/Writer，含索引、内核 kind、固定导出 rights、供应协议标识、两份 u32 长度前缀及字节段；解码检查 reserved、尾差和恰好一个 capability 槽。单项大小按 PAYLOAD_MAX 减 RPC 和外层领域头校验；总表可多于一次消息的 handle 数。首批只接受列明的可别名内核资源和 MailboxSender 供应入口；实际 HandleDescribe 须含对应 kind、导出权及管理者重复交付所需 DUPLICATE/TRANSFER，固定导出权本身不必包含这两位。语义核验及 capability 与描述的配对仍须由实际接收任务完成。
 
 ## 设备登记 backing 与授权
 

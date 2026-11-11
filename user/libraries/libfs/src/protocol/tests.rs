@@ -104,8 +104,8 @@ fn all_twenty_one_opcodes_have_exact_body_lengths_and_slots() {
         Request::DeriveDirectory {
             path: "x",
             rights: FsRights::DESCRIBE,
-            sender_transport: Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
-            output_transport: Rights::READ | Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+            sender_transport: Rights::WRITE | Rights::WAIT | Rights::TRANSFER,
+            output_transport: Rights::READ | Rights::WRITE | Rights::WAIT | Rights::TRANSFER,
         },
         13,
         25,
@@ -127,35 +127,39 @@ fn all_twenty_one_opcodes_have_exact_body_lengths_and_slots() {
     roundtrip(Request::CancelWatch, 21, 0);
 }
 #[test]
-fn widened_transport_masks_reject_high_unknown_bits_and_route_lengths_are_exact() {
-    // 高位必须实际读取再拒绝，不能截断后当作合法小 mask；Bind=20+path。
+fn transport_masks_reject_retired_and_high_unknown_bits_and_route_lengths_are_exact() {
+    // 退休 bit8 和高位都须实际读取再拒绝，不能截断后当作合法小 mask；Bind=20+path。
     let request = Request::DeriveDirectory {
         path: "x",
         rights: FsRights::DERIVE,
-        sender_transport: Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+        sender_transport: Rights::WRITE | Rights::WAIT | Rights::TRANSFER,
         output_transport: Rights::NONE,
     };
     let mut bytes = [0; 128];
     let used = encode_request(&request, Deadline::INFINITE, &mut bytes).unwrap();
-    bytes[HEADER_LEN + 17..HEADER_LEN + 25].copy_from_slice(&(1u64 << 32).to_le_bytes());
-    assert!(matches!(
-        decode_request(&bytes[..used], 1),
-        Err(Status::Invalid)
-    ));
+    for unknown in [1u64 << 8, 1u64 << 32] {
+        bytes[HEADER_LEN + 17..HEADER_LEN + 25].copy_from_slice(&unknown.to_le_bytes());
+        assert!(matches!(
+            decode_request(&bytes[..used], 1),
+            Err(Status::Invalid)
+        ));
+    }
     let bind = crate::route::Request::Bind {
         path: "x",
         max_rights: FsRights::DESCRIBE,
-        output_transport: Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+        output_transport: Rights::WRITE | Rights::WAIT | Rights::TRANSFER,
         replace: false,
     };
     let used = crate::route::encode_request(&bind, Deadline::INFINITE, &mut bytes).unwrap();
     assert_eq!(used, HEADER_LEN + 21);
     assert!(crate::route::decode_request(&bytes[..used], 3).is_ok());
-    bytes[HEADER_LEN + 9..HEADER_LEN + 17].copy_from_slice(&(1u64 << 32).to_le_bytes());
-    assert!(matches!(
-        crate::route::decode_request(&bytes[..used], 3),
-        Err(Status::Invalid)
-    ));
+    for unknown in [1u64 << 8, 1u64 << 32] {
+        bytes[HEADER_LEN + 9..HEADER_LEN + 17].copy_from_slice(&unknown.to_le_bytes());
+        assert!(matches!(
+            crate::route::decode_request(&bytes[..used], 3),
+            Err(Status::Invalid)
+        ));
+    }
 }
 #[test]
 fn boundary_and_io_preserve_uncommitted_path_and_partial_progress_contracts() {

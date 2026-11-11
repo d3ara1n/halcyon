@@ -22,15 +22,10 @@ pub const ROOT_RIGHTS: Rights = Rights::from_raw(
         | Rights::MANAGE.raw()
         | Rights::CREATE.raw()
         | Rights::DUPLICATE.raw()
-        | Rights::TRANSIT.raw()
-        | Rights::GRANT.raw(),
+        | Rights::TRANSFER.raw(),
 );
 pub const DESCRIPTION_RIGHTS: Rights = Rights::from_raw(
-    Rights::READ.raw()
-        | Rights::WAIT.raw()
-        | Rights::DUPLICATE.raw()
-        | Rights::TRANSIT.raw()
-        | Rights::GRANT.raw(),
+    Rights::READ.raw() | Rights::WAIT.raw() | Rights::DUPLICATE.raw() | Rights::TRANSFER.raw(),
 );
 
 pub struct DescriptionObject {

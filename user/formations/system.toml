@@ -34,63 +34,63 @@ rights = ["read", "wait", "manage"]
 [resource."device.driver"]
 kind = "sender"
 payer = "device"
-rights = ["write", "wait", "duplicate", "transit", "grant"]
+rights = ["write", "wait", "duplicate", "transfer"]
 mailbox = "device.mailbox"
 
 [resource."device.driver.admin"]
 kind = "sender"
 payer = "device"
-rights = ["write", "wait", "duplicate", "transit", "grant"]
+rights = ["write", "wait", "duplicate", "transfer"]
 mailbox = "device.mailbox"
 terminal_revoke = true
 
 [resource."device.view"]
 kind = "sender"
 payer = "device"
-rights = ["write", "wait", "duplicate", "transit", "grant"]
+rights = ["write", "wait", "duplicate", "transfer"]
 mailbox = "device.mailbox"
 
 [resource."device.view.admin"]
 kind = "sender"
 payer = "device"
-rights = ["write", "wait", "duplicate", "transit", "grant"]
+rights = ["write", "wait", "duplicate", "transfer"]
 mailbox = "device.mailbox"
 terminal_revoke = true
 
 [resource."driver.control"]
 kind = "sender"
 payer = "driver"
-rights = ["write", "wait", "duplicate", "transit", "grant"]
+rights = ["write", "wait", "duplicate", "transfer"]
 mailbox = "driver.control.mailbox"
 
 [resource."driver.observer"]
 kind = "sender"
 payer = "driver"
-rights = ["write", "wait", "duplicate", "transit", "grant"]
+rights = ["write", "wait", "duplicate", "transfer"]
 mailbox = "driver.observer.mailbox"
 
 [resource."fs.file"]
 kind = "sender"
 payer = "fs"
-rights = ["write", "wait", "duplicate", "transit", "grant"]
+rights = ["write", "wait", "duplicate", "transfer"]
 mailbox = "fs.file.mailbox"
 
 [resource."fs.management"]
 kind = "sender"
 payer = "fs"
-rights = ["write", "wait", "duplicate", "transit", "grant"]
+rights = ["write", "wait", "duplicate", "transfer"]
 mailbox = "fs.management.mailbox"
 
 [resource."fs.directory"]
 kind = "sender"
 payer = "fs"
-rights = ["write", "wait", "duplicate", "transit", "grant"]
+rights = ["write", "wait", "duplicate", "transfer"]
 mailbox = "fs.service.mailbox"
 
 [resource."fs.authority"]
 kind = "sender"
 payer = "fs"
-rights = ["write", "wait", "duplicate", "transit", "grant"]
+rights = ["write", "wait", "duplicate", "transfer"]
 mailbox = "fs.service.mailbox"
 
 [job.drivers]
@@ -104,18 +104,18 @@ inputs."memory.pool" = "self/memory.pool"
 inputs."platform.description" = "init/platform.description"
 inputs."platform.root" = "init/platform.root"
 inputs."device.receiver" = { from = "init/object.device.mailbox", rights = ["read", "wait", "manage"] }
-inputs."device.source.0" = { from = "init/object.device.driver", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+inputs."device.source.0" = { from = "init/object.device.driver", rights = ["write", "wait", "duplicate", "transfer"] }
 inputs."device.source_lifetime.0" = { from = "init/lifetime.device.driver", rights = ["wait"] }
-inputs."device.admin.0" = { from = "init/object.device.driver.admin", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+inputs."device.admin.0" = { from = "init/object.device.driver.admin", rights = ["write", "wait", "duplicate", "transfer"] }
 inputs."device.admin_lifetime.0" = { from = "init/lifetime.device.driver.admin", rights = ["wait"] }
-inputs."device.source.1" = { from = "init/object.device.view", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+inputs."device.source.1" = { from = "init/object.device.view", rights = ["write", "wait", "duplicate", "transfer"] }
 inputs."device.source_lifetime.1" = { from = "init/lifetime.device.view", rights = ["wait"] }
-inputs."device.admin.1" = { from = "init/object.device.view.admin", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+inputs."device.admin.1" = { from = "init/object.device.view.admin", rights = ["write", "wait", "duplicate", "transfer"] }
 inputs."device.admin_lifetime.1" = { from = "init/lifetime.device.view.admin", rights = ["wait"] }
-namespace."/" = { from = "init/object.fs.file", rights = ["write", "wait", "transit"] }
-namespace."/services" = { from = "init/object.fs.directory", rights = ["write", "wait", "transit"] }
-namespace."/devices" = { from = "init/object.device.view", rights = ["write", "wait", "transit"] }
-namespace."/drivers" = { from = "init/object.driver.observer", rights = ["write", "wait", "transit"] }
+namespace."/" = { from = "init/object.fs.file", rights = ["write", "wait", "transfer"] }
+namespace."/services" = { from = "init/object.fs.directory", rights = ["write", "wait", "transfer"] }
+namespace."/devices" = { from = "init/object.device.view", rights = ["write", "wait", "transfer"] }
+namespace."/drivers" = { from = "init/object.driver.observer", rights = ["write", "wait", "transfer"] }
 settings.sources = [
   { name = "driver", scope = "root", access = ["observe", "claim", "child_register", "report_stopped"] },
   { name = "view", scope = "root", access = ["observe"] },
@@ -130,17 +130,17 @@ inputs."driver.workers" = "init/job.drivers"
 inputs."driver.image.drv_pci_generic" = "init/image.drv_pci_generic"
 inputs."driver.image.drv_usb_xhci" = "init/image.drv_usb_xhci"
 inputs."driver.image.drv_usb_hid" = "init/image.drv_usb_hid"
-inputs."device.source" = { from = "init/object.device.driver", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+inputs."device.source" = { from = "init/object.device.driver", rights = ["write", "wait", "duplicate", "transfer"] }
 inputs."driver.control.receiver" = { from = "init/object.driver.control.mailbox", rights = ["read", "wait", "manage"] }
-inputs."driver.control.sender" = { from = "init/object.driver.control", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+inputs."driver.control.sender" = { from = "init/object.driver.control", rights = ["write", "wait", "duplicate", "transfer"] }
 inputs."driver.control.lifetime" = { from = "init/lifetime.driver.control", rights = ["wait"] }
 inputs."driver.observer.receiver" = { from = "init/object.driver.observer.mailbox", rights = ["read", "wait", "manage"] }
-inputs."driver.observer.sender" = { from = "init/object.driver.observer", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+inputs."driver.observer.sender" = { from = "init/object.driver.observer", rights = ["write", "wait", "duplicate", "transfer"] }
 inputs."driver.observer.lifetime" = { from = "init/lifetime.driver.observer", rights = ["wait"] }
-namespace."/" = { from = "init/object.fs.file", rights = ["write", "wait", "transit"] }
-namespace."/services" = { from = "init/object.fs.directory", rights = ["write", "wait", "transit"] }
-namespace."/devices" = { from = "init/object.device.view", rights = ["write", "wait", "transit"] }
-namespace."/drivers" = { from = "init/object.driver.observer", rights = ["write", "wait", "transit"] }
+namespace."/" = { from = "init/object.fs.file", rights = ["write", "wait", "transfer"] }
+namespace."/services" = { from = "init/object.fs.directory", rights = ["write", "wait", "transfer"] }
+namespace."/devices" = { from = "init/object.device.view", rights = ["write", "wait", "transfer"] }
+namespace."/drivers" = { from = "init/object.driver.observer", rights = ["write", "wait", "transfer"] }
 settings.declarations = [
   { implementation = "drv_pci_generic", identity = "platform:pci-host-ecam-generic", priority = 1, capacity = 1, reusable = false, child_registrar = true, trusted_physical = true },
   { implementation = "drv_usb_xhci", identity = "pci:0c0330", priority = 1, capacity = 1, reusable = false, child_registrar = true, trusted_physical = true },
@@ -154,33 +154,33 @@ inputs."memory.pool" = "self/memory.pool"
 inputs."file.receiver" = { from = "init/object.fs.file.mailbox", rights = ["read", "wait", "manage"] }
 inputs."file.management.receiver" = { from = "init/object.fs.management.mailbox", rights = ["read", "wait", "manage"] }
 inputs."service.receiver" = { from = "init/object.fs.service.mailbox", rights = ["read", "wait", "manage"] }
-inputs."file.root.0" = { from = "init/object.fs.file", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+inputs."file.root.0" = { from = "init/object.fs.file", rights = ["write", "wait", "duplicate", "transfer"] }
 inputs."file.root.lifetime.0" = { from = "init/lifetime.fs.file", rights = ["wait"] }
-inputs."file.management.0" = { from = "init/object.fs.management", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+inputs."file.management.0" = { from = "init/object.fs.management", rights = ["write", "wait", "duplicate", "transfer"] }
 inputs."file.management.lifetime.0" = { from = "init/lifetime.fs.management", rights = ["wait"] }
-inputs."service.directory.0" = { from = "init/object.fs.directory", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+inputs."service.directory.0" = { from = "init/object.fs.directory", rights = ["write", "wait", "duplicate", "transfer"] }
 inputs."service.directory.lifetime.0" = { from = "init/lifetime.fs.directory", rights = ["wait"] }
-inputs."service.authority.0" = { from = "init/object.fs.authority", rights = ["write", "wait", "duplicate", "transit", "grant"] }
+inputs."service.authority.0" = { from = "init/object.fs.authority", rights = ["write", "wait", "duplicate", "transfer"] }
 inputs."service.authority.lifetime.0" = { from = "init/lifetime.fs.authority", rights = ["wait"] }
-namespace."/" = { from = "init/object.fs.file", rights = ["write", "wait", "transit"] }
-namespace."/services" = { from = "init/object.fs.directory", rights = ["write", "wait", "transit"] }
-namespace."/devices" = { from = "init/object.device.view", rights = ["write", "wait", "transit"] }
-namespace."/drivers" = { from = "init/object.driver.observer", rights = ["write", "wait", "transit"] }
+namespace."/" = { from = "init/object.fs.file", rights = ["write", "wait", "transfer"] }
+namespace."/services" = { from = "init/object.fs.directory", rights = ["write", "wait", "transfer"] }
+namespace."/devices" = { from = "init/object.device.view", rights = ["write", "wait", "transfer"] }
+namespace."/drivers" = { from = "init/object.driver.observer", rights = ["write", "wait", "transfer"] }
 settings.registry = true
 [[instance.fs.settings.entries]]
 watches = 24
 sessions = 16
 [instance.fs.settings.entries.file]
 rights = ["traverse", "enumerate", "read_property", "write_property", "read_stream", "write_stream", "create", "remove", "watch", "describe", "derive"]
-output = ["read", "write", "signal", "wait", "manage", "transit", "duplicate", "grant"]
+output = ["read", "write", "signal", "wait", "manage", "duplicate", "transfer"]
 [instance.fs.settings.entries.management]
 rights = ["traverse", "enumerate", "read_property", "write_property", "read_stream", "write_stream", "create", "remove", "watch", "describe", "derive"]
-output = ["read", "write", "signal", "wait", "manage", "transit", "duplicate", "grant"]
+output = ["read", "write", "signal", "wait", "manage", "duplicate", "transfer"]
 [instance.fs.settings.entries.directory]
 scope = "/"
 rights = ["describe", "enumerate", "get_entry", "watch"]
-output = ["write", "wait", "transit", "duplicate"]
+output = ["write", "wait", "transfer", "duplicate"]
 [instance.fs.settings.entries.authority]
 scope = "/"
 rights = ["create", "replace", "delegate"]
-output = ["write", "wait", "transit", "duplicate", "grant"]
+output = ["write", "wait", "duplicate", "transfer"]

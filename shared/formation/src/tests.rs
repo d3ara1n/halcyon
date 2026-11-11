@@ -1,7 +1,7 @@
 use super::*;
 use alloc::{collections::BTreeMap, vec};
 fn call() -> Rights {
-    Rights::WRITE | Rights::WAIT | Rights::TRANSIT
+    Rights::WRITE | Rights::WAIT | Rights::TRANSFER
 }
 fn object(name: &str) -> Source {
     Source::Resource {
@@ -286,7 +286,7 @@ fn terminal_revoke_is_explicit_not_a_suffix_policy() {
     for missing in [
         Rights::WRITE,
         Rights::WAIT,
-        Rights::TRANSIT,
+        Rights::TRANSFER,
         Rights::DUPLICATE,
     ] {
         let mut f = formation();
@@ -374,4 +374,16 @@ fn expanded_platform_names_cannot_alias_ordinary_inputs() {
         .inputs
         .push(input(&"a".repeat(MAX_NAME), Source::PlatformRoot));
     assert!(f.validate_grants(1).is_err());
+}
+
+#[test]
+fn transfer_name_and_wire_rights_have_no_legacy_aliases() {
+    assert_eq!(right_by_name("transfer"), Some(Rights::TRANSFER));
+    assert_eq!(right_by_name("transit"), None);
+    assert_eq!(right_by_name("grant"), None);
+    let mut f = formation();
+    if let ResourceKind::Sender { rights, .. } = &mut f.resources[1].kind {
+        *rights |= Rights::from_raw(1 << 8);
+    }
+    assert!(f.validate(|_| true).is_err());
 }

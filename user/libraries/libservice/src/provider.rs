@@ -619,7 +619,7 @@ impl Request {
             .map_err(|f| f.error)?;
         if let Some(waiter) = self.waiter.take() {
             let rights = Rights::WAIT
-                | Rights::TRANSIT
+                | Rights::TRANSFER
                 | (self
                     .access
                     .as_ref()
@@ -748,14 +748,14 @@ fn prepare(
                 Rights::SIGNAL,
             )
             .map_err(system)?;
-            if !access.output().contains(Rights::WAIT | Rights::TRANSIT) {
+            if !access.output().contains(Rights::WAIT | Rights::TRANSFER) {
                 return Err(Status::Permission);
             }
             let notification = pair.owner;
             let signaler = pair.peer;
             let waiter = notification
                 .mint_observer(
-                    Rights::WAIT | Rights::TRANSIT | (access.output() & Rights::DUPLICATE),
+                    Rights::WAIT | Rights::TRANSFER | (access.output() & Rights::DUPLICATE),
                 )
                 .map_err(system)?;
             let minted = state

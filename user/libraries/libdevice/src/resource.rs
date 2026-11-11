@@ -94,7 +94,7 @@ impl Descriptor {
         if actual.kind != self.kind as u32
             || !actual
                 .rights
-                .contains(self.rights | Rights::DUPLICATE | Rights::TRANSIT)
+                .contains(self.rights | Rights::DUPLICATE | Rights::TRANSFER)
         {
             return Err(Error::Permission);
         }

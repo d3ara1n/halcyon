@@ -78,7 +78,7 @@ impl EndpointIdentity {
         if d.kind != ObjectKind::MailboxSender as u32
             || !d
                 .rights
-                .contains(Rights::WRITE | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT)
+                .contains(Rights::WRITE | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSFER)
         {
             return Err(Error::Permission);
         }

@@ -45,7 +45,7 @@ impl Page {
                 0,
                 PAGE,
                 dma::BIDIRECTIONAL,
-                Rights::READ | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT,
+                Rights::READ | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSFER,
             )?);
             return Ok(false);
         }

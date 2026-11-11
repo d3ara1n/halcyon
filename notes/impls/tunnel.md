@@ -6,7 +6,7 @@
 
 Connection的CONNECTION锁拥有双侧Prepared/Invited/Attached/Closed和root owner；侧状态仅Weak持Endpoint/Invitation，防止Arc成为业务寿命。Endpoint/Invitation强持Connection，各自真实Arc布局出生付款；Connection也持自己的费用，末字段保持原payer至last-live。Create的Connection/初始Endpoint/Invitation由显式Pool付款，Attach出生Endpoint及其来源维护Account由接入调用者Pool付款。MemoryObjectCore提供固定长度/来源身份/授权，Connection独占BackingOwner。
 
-Endpoint 允许 READ/WRITE/WAIT/SIGNAL/MANAGE，不允许复制、运输或 EXECUTE。Invitation 允许这些目标授权及 TRANSIT/GRANT，持有表项的范围决定 Attach 产出的 Endpoint 权限；它不允许等待和复制。接入权本身要求 MANAGE，映射随后要求 READ 或 READ|WRITE。权利收窄不能在 Attach 时恢复。
+Endpoint 允许 READ/WRITE/WAIT/SIGNAL/MANAGE，不允许复制、运输或 EXECUTE。Invitation 允许这些目标授权及 TRANSFER，持有表项的范围决定 Attach 产出的 Endpoint 权限；它不允许等待和复制。接入权本身要求 MANAGE，映射随后要求 READ 或 READ|WRITE。权利收窄不能在 Attach 时恢复。
 
 双方均 Closed 时，在 Connection 锁内取走唯一 root owner、锁外放弃。root 的内嵌维护记录退掉残余，但已发布 View 的 use 继续独立保留物理段；等待来源的普通 Arc loan 不保留 root。最后 View 退休及完成退款由 VM 记录推进。
 

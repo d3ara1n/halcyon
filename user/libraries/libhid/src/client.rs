@@ -27,7 +27,7 @@ impl Watch {
             || description.object_id == parent.object_id
             || !description
                 .rights
-                .contains(Rights::WRITE | Rights::WAIT | Rights::TRANSIT)
+                .contains(Rights::WRITE | Rights::WAIT | Rights::TRANSFER)
         {
             return Err(Error::Permission);
         }

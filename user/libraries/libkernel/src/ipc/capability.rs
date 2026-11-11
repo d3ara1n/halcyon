@@ -89,7 +89,7 @@ pub(crate) use capability_role;
 impl Capability {
     /// # Safety
     /// 调用者须独占合法 entry 的关闭责任。普通 View 另持 MapToken，Close 只释放
-    /// capability；本类型不增加 TRANSIT/GRANT，也不令 affine 类型变成可复制。
+    /// capability；本类型不增加 TRANSFER，也不令 affine 类型变成可复制。
     pub unsafe fn from_raw(handle: Handle) -> Self {
         Self {
             handle: Some(handle),

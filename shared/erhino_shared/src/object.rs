@@ -53,19 +53,18 @@ impl Rights {
     pub const WRITE: Self = Self(1 << 1);
     pub const WAIT: Self = Self(1 << 2);
     pub const SIGNAL: Self = Self(1 << 3);
-    /// 允许 entry 暂存于有缓冲消息并由接收方安装。
-    pub const TRANSIT: Self = Self(1 << 4);
+    /// 允许跨能力表转交：经有缓冲消息或 ProcessGrant 消费式移动。
+    pub const TRANSFER: Self = Self(1 << 4);
     pub const DUPLICATE: Self = Self(1 << 5);
     pub const MANAGE: Self = Self(1 << 6);
     // bit 7 保留（原 MAP，已删除：映射授权按 READ/WRITE/EXECUTE 矩阵检查）。
-    /// 允许 ProcessStart 等直接跨 HandleTable grant，不进入对象容器。
-    pub const GRANT: Self = Self(1 << 8);
+    // bit 8 保留（原独立直接转交位，已合并为 TRANSFER）。
     /// 允许在创建域内构造新对象：Job 中创建 Process/子 Job；Pool 上表示
     /// 创建由本 Pool 付款的资源（ProcessCreate、派生子 Pool、TunnelCreate）。
     pub const CREATE: Self = Self(1 << 9);
     /// 允许把对象内容映射为可执行页；与 READ/WRITE 正交。
     pub const EXECUTE: Self = Self(1 << 10);
-    pub const KNOWN: Self = Self(((1 << 11) - 1) & !(1 << 7));
+    pub const KNOWN: Self = Self(((1 << 11) - 1) & !((1 << 7) | (1 << 8)));
 
     pub const fn from_raw(raw: u64) -> Self {
         Self(raw)
@@ -310,13 +309,22 @@ mod tests {
 
     #[test]
     fn rights_wire_bits_are_stable_and_known() {
+        assert_eq!(Rights::TRANSFER.raw(), 1 << 4);
         assert_eq!(Rights::CREATE.raw(), 1 << 9);
         assert_eq!(Rights::EXECUTE.raw(), 1 << 10);
-        assert_eq!(Rights::KNOWN.raw(), ((1 << 11) - 1) & !(1 << 7));
+        assert_eq!(
+            Rights::KNOWN.raw(),
+            ((1 << 11) - 1) & !((1 << 7) | (1 << 8))
+        );
         assert!(
             !Rights::from_raw(1 << 7).is_known(),
             "retired MAP bit stays reserved"
         );
+        assert!(
+            !Rights::from_raw(1 << 8).is_known(),
+            "retired direct-transfer bit stays reserved"
+        );
+        assert!(Rights::TRANSFER.is_known());
         assert!(Rights::EXECUTE.is_known());
         assert!(!Rights::from_raw(1 << 11).is_known());
     }

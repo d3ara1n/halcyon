@@ -2,6 +2,7 @@
 //! 未 Dead Process core 的生命周期根是 Job 直接成员表；不存在全局进程表。
 
 pub(crate) mod cap;
+pub(crate) mod custody;
 pub mod delivery;
 pub mod handle;
 pub mod job;

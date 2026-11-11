@@ -62,7 +62,7 @@ fn io_status(error: RunnelError) -> Status {
     }
 }
 pub fn invitation_transport() -> Rights {
-    Rights::READ | Rights::WRITE | Rights::WAIT | Rights::SIGNAL | Rights::MANAGE | Rights::TRANSIT
+    Rights::READ | Rights::WRITE | Rights::WAIT | Rights::SIGNAL | Rights::MANAGE | Rights::TRANSFER
 }
 fn earlier(a: Deadline, b: Deadline) -> Deadline {
     match (a.instant().ok().flatten(), b.instant().ok().flatten()) {
@@ -273,7 +273,7 @@ impl StreamTable {
         if driver == 0 {
             return Err(Status::Invalid);
         }
-        let mandatory = Rights::WRITE | Rights::WAIT | Rights::TRANSIT;
+        let mandatory = Rights::WRITE | Rights::WAIT | Rights::TRANSFER;
         let output = access.output_transport();
         if !output.contains(mandatory | invitation_transport()) {
             return Err(Status::Permission);

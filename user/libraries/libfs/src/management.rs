@@ -131,7 +131,7 @@ impl ManagementTable {
             }
             let funding = Funding::new(domain, execution)?;
             let description =
-                minted.validate(mailbox, Rights::WRITE | Rights::WAIT | Rights::TRANSIT)?;
+                minted.validate(mailbox, Rights::WRITE | Rights::WAIT | Rights::TRANSFER)?;
             if description.related_object_id != self.mailbox_id
                 || self.entries.get(description.object_id).is_some()
             {

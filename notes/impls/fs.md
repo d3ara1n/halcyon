@@ -34,7 +34,7 @@ ObjectInfo 在借用期间按实际 body 编码：Directory 为 OAL Directory；
 
 ## 授权、RPC 与实际接收任务
 
-[authority](../../user/libraries/libfs/src/authority.rs) 的 AccessSnapshot 是不可外部构造的 root/FsRights/完整出口/账户/GrantLease 使用引用。GrantLease 持共享撤销位及 grant、来源、存储收费和槽；最后 sender 关闭与显式 revoke 不混为一个事实。Issuance 分别检查 sender 必需位、新 sender 的完整运输位以及新出口上限，后两者都不得超过母 output_transport；派生领域权限不得超过母 grant 与所选目录 ceiling。根业务权限与输出运输上限由 [srv_fs::startup::Config](../../user/services/srv_fs/src/startup.rs) 的每入口显式 file/management 政策拥有，不从输入 sender 权利推导，也没有 ALL 默认。输出缺少 Runnel invitation 所需 READ/WRITE/WAIT/SIGNAL/MANAGE/TRANSIT 时，Open/CreateOpen 在提交前返回 Permission；不会因业务 rights 含 READ_STREAM/WRITE_STREAM 自动放大运输上限。
+[authority](../../user/libraries/libfs/src/authority.rs) 的 AccessSnapshot 是不可外部构造的 root/FsRights/完整出口/账户/GrantLease 使用引用。GrantLease 持共享撤销位及 grant、来源、存储收费和槽；最后 sender 关闭与显式 revoke 不混为一个事实。Issuance 分别检查 sender 必需位、新 sender 的完整运输位以及新出口上限，后两者都不得超过母 output_transport；派生领域权限不得超过母 grant 与所选目录 ceiling。根业务权限与输出运输上限由 [srv_fs::startup::Config](../../user/services/srv_fs/src/startup.rs) 的每入口显式 file/management 政策拥有，不从输入 sender 权利推导，也没有 ALL 默认。输出缺少 Runnel invitation 所需 READ/WRITE/WAIT/SIGNAL/MANAGE/TRANSFER 时，Open/CreateOpen 在提交前返回 Permission；不会因业务 rights 含 READ_STREAM/WRITE_STREAM 自动放大运输上限。
 
 [GrantTable](../../user/libraries/libfs/src/grant.rs) 按内核 context 直接保存 AccessSnapshot，访问与输入能力校验从同一表项克隆使用引用；prepare_minted 显式借用真实 receiver，复用 MintedSender::validate 核真实 kind、receiver→sender→Lifetime 配对和权限；再核 sender 属于该表 receiver 及 context 未存在，重复身份在普通错误边界拒绝。宿主在所有准备前统一拒绝尚未装表的重复入口。prepare 阶段取得每项独立 permit/charge 和预建索引。PreparedGrant 分拆成尚未发布的 GrantPublication、sender 与 Lifetime；install 只插预建表项，是授权可见点。采用者须在此之前完成 Lifetime 来源登记、回复编码与输出能力准备。prepare_derive 接受已准入 AccessSnapshot，准备与最终提交分别复核当前目录弱父链范围、Traverse、母活动位、Derive 与目标 ceiling；不因普通母 sender 消散而重新查询已移除的入口索引。输入 Rename grant 按实际 kind/完整运输位、related mailbox 与 object_id 找真实目录授权，角色错误、跨 backing 和 revoke 分别返回 Permission、CrossFilesystem、Revoked。根和派生请求各自持真实 Lifetime，普通最后 sender 关闭只清入口索引与退款；provider 停止才 revoke，已准入使用和独立子授权按各自寿命结束。
 
@@ -50,7 +50,7 @@ Request.advance 先消费 CLOSED/timeout，再完成 Outbox 来源准入；随�
 
 MemoryBackend 的 RetirementState 从实际退休队列与记录计算：Ready 表示有立即工作，Waiting 表示仍有 pin 或尚未到期的失败记录，Empty 表示所有记录与 Watch 清空。退休任务仅 Ready 保持 runnable；Waiting 等最后引用释放通知或最近重试期限，timeout 后重新推进。停止得到 Empty 后继续撤来源，实际注销回执后才 Complete。
 
-[ManagementTable](../../user/libraries/libfs/src/management.rs) 独立登记真实管理 sender context、root、完整出口上限、可信 Funding 与活动 lease。普通 GrantTable 不含该角色。prepare_minted 显式借真实 receiver 复用完整 pair 校验，核 sender 必需位与同账户视图，普通错误拒绝重复 context；预备独立索引/permit/Grant、WaitSource、Bytes。Root task 先实际登记 Lifetime，再安装角色；静态 sender 仅为本地身份凭据，安装后释放，不再动态导出或由 init 等待报告交接。每入口管理政策显式指定可发行的最大文件业务权限与完整输出上限；管理角色和普通文件角色不合并。独立管理角色占自己的表槽，根 Budget 的 Grant 上限按普通 GRANTS 加静态管理入口数计费，不以漏计管理根保活容量。管理 Ingress 与 Request/Outbox 接入原 Runtime；Unbind 解码后以固定原父、版本/ceiling、原 Binding ID 准备和提交。管理父目录遍历只允许本地目录，Binding 与链接明确拒绝；最终沿当前弱父链复核管理根范围。Bind 在 RPC 前取得不可见 Binding 记录、原父/名字条件和成员 permit；记录先接管 issuer，真实 DeriveDirectory 返回完整核协议/槽/运输后接管 shared，成功体预编码后才复核并提交。
+[ManagementTable](../../user/libraries/libfs/src/management.rs) 独立登记真实管理 sender context、root、完整出口上限、可信 Funding 与活动 lease。普通 GrantTable 不含该角色。prepare_minted 显式借真实 receiver 复用完整 pair 校验，核 sender 必需位与同账户视图，普通错误拒绝重复 context；预备独立索引/permit/Grant、WaitSource、Bytes。Root task 先实际登记 Lifetime，再安装角色；静态 sender 仅为本地身份凭据，安装后释放，不再动态导出或由 init 等待报告交接。每入口管理政策显式指定可发行的最大文件业务权限与完整输出上限；管理角色和普通文件角色不合并。独立管理角色占自己的表槽，根 Budget 的 Grant 上限按普通 TRANSFERS 加静态管理入口数计费，不以漏计管理根保活容量。管理 Ingress 与 Request/Outbox 接入原 Runtime；Unbind 解码后以固定原父、版本/ceiling、原 Binding ID 准备和提交。管理父目录遍历只允许本地目录，Binding 与链接明确拒绝；最终沿当前弱父链复核管理根范围。Bind 在 RPC 前取得不可见 Binding 记录、原父/名字条件和成员 permit；记录先接管 issuer，真实 DeriveDirectory 返回完整核协议/槽/运输后接管 shared，成功体预编码后才复核并提交。
 
 [PendingOutbound](../../user/libraries/libfs/src/provider/outbound.rs) 留在原 Request，持用途、txid、冻结 Issuance、原 Binding pin 或原 Boundary（含父目录 pin 与未消费 suffix）、准备事务及临时 owner。宿主借 World 唯一 Dispatcher 与实际运输 task ID，begin_for 指定原业务 task 为 waiter；每请求最多一项下游，失败或未知结果均不重放。原 Outbox 已 Abandoned 时先取消/唤醒下游并推进原回复来源的真实注销，保留原 pending/pin/费用，避免关闭电平来源在等待期间持续唤醒；活回复未编码时不发送。取消仍等 Dispatcher.take 交付真实来源已注销的 Completion；解码采用一次后，其 service、未采用输出和错误 Packet 在同次推进由 typed owner 释放。回复最多 MESSAGE_HANDLE_MAX 个非映射能力，不保存逐 capability 关闭槽、已检查标记或叶 Close 退避期限。Bind 的迟到有效 shared 进入原不可见记录，不能提交时随 pin 释放进入统一退休；Boundary 新出口在原授权范围/原父与原稳定 Binding ID、期限和取消复核后才交原 Outbox。同名替代不会成为迟到请求的新目标。
 
@@ -58,7 +58,7 @@ MemoryBackend 的 RetirementState 从实际退休队列与记录计算：Ready �
 
 [StreamTable](../../user/libraries/libfs/src/stream.rs) 由 World 唯一持有。记录拥有业务 State、不可变 Funding、已选择的 NodeRef/AccessSnapshot、Runnel Producer/Consumer、固定起点/读末端、一个消息大小的待接受块，以及 Stream/Offer/Bytes/观察占用。控制身份是实际铸造 sender 的 object_id，不从正文 session_id 授权或选择账户。准备索引、块缓冲和费用先于 Tunnel 出生；创建失败的完整映射、Endpoint、Invitation 留在同一预建记录，由原 Request 在来源注销后逐步关闭。
 
-srv_fs 的 A/B 根由同一全局预算签发；部署 `Capacity::entry_sessions` 按实际 profile 限制 Stream/Offer 局部占用，B 可以用尚未被 A 占用的共享容量。Bytes 先于 Tunnel 出生预留映射几何与记录/块存储；局部、共享或 Bytes 拒绝均返回 Quota，CreateOpen 准备沿原 owner 退出，名字尚不可见。Invitation 的完整输出上限还包括 R/WRITE/WAIT/SIGNAL/MANAGE/TRANSIT；只允许普通 sender 必需位的派生 grant 无法输出合法 Invitation，fs 只读权限本身不补这些运输位。
+srv_fs 的 A/B 根由同一全局预算签发；部署 `Capacity::entry_sessions` 按实际 profile 限制 Stream/Offer 局部占用，B 可以用尚未被 A 占用的共享容量。Bytes 先于 Tunnel 出生预留映射几何与记录/块存储；局部、共享或 Bytes 拒绝均返回 Quota，CreateOpen 准备沿原 owner 退出，名字尚不可见。Invitation 的完整输出上限还包括 R/WRITE/WAIT/SIGNAL/MANAGE/TRANSFER；只允许普通 sender 必需位的派生 grant 无法输出合法 Invitation，fs 只读权限本身不补这些运输位。
 
 [建立与控制接缝](../../user/libraries/libfs/src/provider/streams.rs) 位于原 provider Request。创建任务持控制 Lifetime 和数据来源登记、回执及最近期限；业务与 Runnel 不在任务壳复制。Open 固定已选择实例，Read 固定末端但逐块读取实际当前内容。CreateOpen 的名字仍不可见，先备妥两种来源与回复，最终消费原准备事务并插入预建流记录；失败清理原准备，提交后丢失回复不删除名字。
 
@@ -74,7 +74,7 @@ Finish 在 Offered 返回 Conflict，Active/已开始 Stopping 只有一个等�
 
 文件订阅由 [WatchTable](../../user/libraries/libfs/src/watch.rs) 拥有。记录的逻辑 State 保存已鉴权目标的 NodeId、GrantLease 活动 token、事件序号及 mask，不持 NodeRef 或 Rust Weak；进入任何终态均释放目标和 token。控制壳独立保留原领域/execution Funding 配对、Watch/Bytes/WaitSource 收费、Counter permit 和通知角色。Create/Delete/Rename 在同一 backing 提交点只更新直接父目录，Modify 只更新实际文件；解除命名写 Unbound，实际节点进入退休给 TargetRetired，目录订阅不递归传播子节点内容。
 
-Watch 准备阶段出生 Owner[R|WAIT|MANAGE]、Signaler 和 Observer[WAIT|TRANSIT及母出口允许的D]，准备真实控制 sender/Lifetime、索引、收费及来源；提交前完成 Lifetime 来源准入和回复容量预留，提交只插入预建记录。创建请求提交后成为控制寿命任务，回复失败仍保持这个 owner。最后控制关闭或停止后，来源撤销入队即 Parked，直到真实 unregistered 回执才关闭 Lifetime、删除记录及退款；移除失败保留原角色和记录。维护轮转检查实际 backing 状态并推送提示。Query/Ack/Cancel 以真实控制 context 查原账户；Ack 只忽略 ObjectNotAvailable，旧序号不清新提示，重复 Cancel 不覆盖原终态理由。保留 Observer 而关闭最后控制仍结束订阅。
+Watch 准备阶段出生 Owner[R|WAIT|MANAGE]、Signaler 和 Observer[WAIT|TRANSFER及母出口允许的D]，准备真实控制 sender/Lifetime、索引、收费及来源；提交前完成 Lifetime 来源准入和回复容量预留，提交只插入预建记录。创建请求提交后成为控制寿命任务，回复失败仍保持这个 owner。最后控制关闭或停止后，来源撤销入队即 Parked，直到真实 unregistered 回执才关闭 Lifetime、删除记录及退款；移除失败保留原角色和记录。维护轮转检查实际 backing 状态并推送提示。Query/Ack/Cancel 以真实控制 context 查原账户；Ack 只忽略 ObjectNotAvailable，旧序号不清新提示，重复 Cancel 不覆盖原终态理由。保留 Observer 而关闭最后控制仍结束订阅。
 
 [文件 Watch 协议绑定](../../user/libraries/libfs/src/client/watch.rs) 为 libfs::client::Watch 实现 librpc::subscription::Protocol，负责 Query/Ack 编码、完整响应校验及 WatchInfo 的 sequence/pending/terminal 投影。通知、控制、捕获序号和来源/RPC 收束由[通用订阅客户端](rpc.md#带序号确认的订阅客户端)持有。文件目标的重查由应用完成，随后调用 acknowledge_read。
 

@@ -19,11 +19,9 @@ use erhino_shared::{
     proc::{ThreadCreateResult, ThreadStartContext},
 };
 
-pub(crate) const CONTROL_RIGHTS: Rights = Rights::from_raw(
-    Rights::WAIT.raw() | Rights::DUPLICATE.raw() | Rights::GRANT.raw() | Rights::TRANSIT.raw(),
-);
-const START_RIGHTS: Rights =
-    Rights::from_raw(Rights::MANAGE.raw() | Rights::GRANT.raw() | Rights::TRANSIT.raw());
+pub(crate) const CONTROL_RIGHTS: Rights =
+    Rights::from_raw(Rights::WAIT.raw() | Rights::DUPLICATE.raw() | Rights::TRANSFER.raw());
+const START_RIGHTS: Rights = Rights::from_raw(Rights::MANAGE.raw() | Rights::TRANSFER.raw());
 
 /// 只维护 DONE，既不强持 Thread 也不拥有 Pending 启动责任。
 pub(crate) struct ThreadControl {
@@ -87,6 +85,7 @@ impl KernelObject for ThreadControl {
 }
 
 /// Self ThreadCreate：调用者在 Running 的自身空间创建可独立委托的 Pending 线程。
+/// 此时只提交资源成员；直到 ThreadStart 成功才建立执行承诺。
 pub(crate) fn create(
     caller: &Thread,
     context_address: usize,

@@ -357,7 +357,7 @@ impl<'a> Client<'a> {
             .ok_or(LocalError::InvalidPath)?;
         liboal::path::validate_name(name)
             .map_err(|_| ClientError::Local(LocalError::InvalidPath))?;
-        let requested = Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE;
+        let requested = Rights::WRITE | Rights::WAIT | Rights::TRANSFER | Rights::DUPLICATE;
         let target = Request::DeriveDirectory {
             path: "",
             rights: FsRights::CREATE
@@ -443,11 +443,11 @@ impl<'a> Client<'a> {
                     if control_description.kind != ObjectKind::MailboxSender as u32
                         || !control_description
                             .rights
-                            .contains(Rights::WRITE | Rights::WAIT | Rights::TRANSIT)
+                            .contains(Rights::WRITE | Rights::WAIT | Rights::TRANSFER)
                         || observer_description.kind != ObjectKind::NotificationObserver as u32
                         || !observer_description
                             .rights
-                            .contains(Rights::WAIT | Rights::TRANSIT)
+                            .contains(Rights::WAIT | Rights::TRANSFER)
                     {
                         return Err(ClientError::Protocol);
                     }
@@ -457,7 +457,7 @@ impl<'a> Client<'a> {
                             handles.take(1)?,
                         )
                         .map_err(|f| ClientError::System(f.error))?;
-                    if !desc.rights.contains(Rights::WAIT | Rights::TRANSIT) {
+                    if !desc.rights.contains(Rights::WAIT | Rights::TRANSFER) {
                         return Err(ClientError::Protocol);
                     }
                     Ok(Watch {
@@ -494,7 +494,7 @@ fn sender(handles: &mut HandleSet, index: usize) -> Result<MailboxSender, Client
     let (sender, desc) = MailboxSender::from_capability(cap).map_err(ClientError::Adopt)?;
     if !desc
         .rights
-        .contains(Rights::WRITE | Rights::WAIT | Rights::TRANSIT)
+        .contains(Rights::WRITE | Rights::WAIT | Rights::TRANSFER)
     {
         return Err(ClientError::Protocol);
     }
@@ -575,7 +575,7 @@ fn rpc_request(
         protocol::encode_request(request, deadline, &mut bytes).map_err(ClientError::Status)?;
     let mut rpc = RpcRequest::new(protocol::ID, &bytes[..used])?;
     if let Some(input) = input {
-        let rights = Rights::WRITE | Rights::WAIT | Rights::TRANSIT;
+        let rights = Rights::WRITE | Rights::WAIT | Rights::TRANSFER;
         let handle = libkernel::ipc::object::duplicate(input.as_handle(), rights)?; // SAFETY: duplicate 为本函数交付唯一新handle，Packet失败仍返还cap owner。
         let cap = unsafe { Capability::from_raw(handle) };
         rpc.push(cap, rights)

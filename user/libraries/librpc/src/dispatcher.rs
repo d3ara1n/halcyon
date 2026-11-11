@@ -163,7 +163,7 @@ impl Dispatcher {
         let owner = Mailbox::create(Rights::READ | Rights::WAIT | Rights::MANAGE)?;
         let minted = owner.mint(
             0,
-            Rights::WRITE | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT,
+            Rights::WRITE | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSFER,
         )?;
         Ok(Self {
             owner,

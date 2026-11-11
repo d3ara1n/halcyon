@@ -83,8 +83,7 @@ fn output(table: settings::Table<'_>) -> Result<Rights, SystemCallError> {
             ("manage", Rights::MANAGE.raw()),
             ("create", Rights::CREATE.raw()),
             ("duplicate", Rights::DUPLICATE.raw()),
-            ("transit", Rights::TRANSIT.raw()),
-            ("grant", Rights::GRANT.raw()),
+            ("transfer", Rights::TRANSFER.raw()),
         ],
     )?))
 }
@@ -255,7 +254,7 @@ mod tests {
     fn file_policy() -> Owned {
         Owned::Table(table(&[
             ("rights", strings(&["read_property"])),
-            ("output", strings(&["write", "wait", "transit"])),
+            ("output", strings(&["write", "wait", "transfer"])),
         ]))
     }
     fn entry(registry: bool) -> BTreeMap<String, Owned> {
@@ -302,7 +301,10 @@ mod tests {
         let entry = config.entry(0);
         assert_eq!(entry.file.rights, FsRights::READ_PROPERTY);
         assert!(!entry.file.rights.contains(FsRights::DERIVE));
-        assert!(!entry.file.output.contains(Rights::GRANT));
+        assert_eq!(
+            entry.file.output,
+            Rights::WRITE | Rights::WAIT | Rights::TRANSFER
+        );
         let directory = entry.directory.unwrap();
         assert_eq!(directory.rights, AccessRights::GET_ENTRY);
         assert_eq!(directory.scope, "/");

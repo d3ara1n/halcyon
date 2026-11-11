@@ -48,7 +48,7 @@ impl Namespace {
                 .require(
                     &binding.input,
                     ObjectKind::MailboxSender,
-                    Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+                    Rights::WRITE | Rights::WAIT | Rights::TRANSFER,
                 )
                 .map_err(AdoptError::Birth)?;
             let (sender, _) = MailboxSender::from_capability(capability)

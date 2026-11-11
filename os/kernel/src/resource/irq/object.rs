@@ -24,8 +24,7 @@ pub(crate) const USE_RIGHTS: Rights = Rights::from_raw(
         | Rights::WAIT.raw()
         | Rights::MANAGE.raw()
         | Rights::DUPLICATE.raw()
-        | Rights::TRANSIT.raw()
-        | Rights::GRANT.raw(),
+        | Rights::TRANSFER.raw(),
 );
 pub(crate) const CONTROL_RIGHTS: Rights = Rights::from_raw(USE_RIGHTS.raw() | Rights::CREATE.raw());
 struct Object {

@@ -71,6 +71,9 @@ pub fn dispatch(frame: &mut UserContext, thread: &Thread) -> Outcome {
         }
         SystemCall::ThreadExit => {
             let _ = a0;
+            thread
+                .process
+                .exit_thread(thread.member(), crate::hart::current().slot());
             Outcome::Killed
         }
         SystemCall::ThreadYield => {

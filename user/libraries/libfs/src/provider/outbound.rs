@@ -185,7 +185,7 @@ impl Request {
         let transport = transport.ok_or(Status::Unavailable)?;
         let issuer = context.handles.get(1).map_err(failure)?;
         let description = issuer.description().map_err(failure)?;
-        let required = Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::DUPLICATE;
+        let required = Rights::WRITE | Rights::WAIT | Rights::TRANSFER | Rights::DUPLICATE;
         if description.kind != ObjectKind::MailboxSender as u32
             || !description.rights.contains(required)
         {
@@ -257,7 +257,7 @@ impl Request {
             rights: access.rights() & binding.max_rights(),
             sender_transport: Rights::WRITE
                 | Rights::WAIT
-                | Rights::TRANSIT
+                | Rights::TRANSFER
                 | (output & Rights::DUPLICATE),
             output_transport: output,
         };
@@ -265,7 +265,7 @@ impl Request {
         let rpc = derive_request(policy, self.header.deadline)?;
         let service = duplicate_sender(
             backend.binding_sender(binding, false)?,
-            Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+            Rights::WRITE | Rights::WAIT | Rights::TRANSFER,
         )?;
         let mut pending = PendingOutbound::new(Purpose::Boundary { boundary, used }, policy);
         pending.start(

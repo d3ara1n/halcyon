@@ -60,7 +60,7 @@
 - `Source` 保留平台描述/平台根列表、initfs Image、Job、Pool、SelfPool，删除 Export，新增 `Resource { name, output: Main | Lifetime }`。源字符串 `init/object.<资源名>` 与 `init/lifetime.<sender资源名>` 对应两个输出；不再接受 `<实例>/<导出>`。资源名沿用点分段语法；名字及其后缀都只作引用，不推导业务协议。
 - `Input { name, source, rights: Option<Rights> }` 只表达能力接线；`NamespaceBinding { prefix, source, rights }` 只允许实际 sender 主输出。每实例 TOML 的 `namespace."/前缀" = { from = "init/object.<名>", rights = [...] }` 显式描述完整初始视图。没有服务间 Wants/Requires、Ready/probe 或运行后拼树。
 - 构造依赖只来自 Job 父链和 Sender 对 Mailbox 的引用；先建 Pool/Job/所有 Mailbox，再 mint 全部 Sender。实例按确定声明顺序逐个构造/发布；相互 sender 引用合法，不形成实例启动环。静态检查验证名字、资源/付款/Job引用、唯一 receiver/Lifetime 去向、对象合法 rights 和所有衰减边；实例的普通输入不得占 `oal.entry.*`。
-- receiver 恰有一个实例输入 owner，必须 move，不能 duplicate；Lifetime 至多一个提供方输入 owner（无采用消费者时由 init 施工壳释放）。sender 可按同一身份复制；不同领域角色必须独立 mint，别名不产生新 authority。创建母本内部保留施工所需 GRANT，sender 母本另持 DUPLICATE；目标只收到声明权利，不因施工便利升级。
+- receiver 恰有一个实例输入 owner，必须 move，不能 duplicate；Lifetime 至多一个提供方输入 owner（无采用消费者时由 init 施工壳释放）。sender 可按同一身份复制；不同领域角色必须独立 mint，别名不产生新 authority。创建母本内部保留施工所需 TRANSFER，sender 母本另持 DUPLICATE；目标只收到声明权利，不因施工便利升级。
 - 输入展开数为普通 inputs（含平台根实际展开）加 Namespace binding 数；最终必须不超过 `PROCESS_MAX_GRANTS`。平台实际数量、初始授权表和 payload 长度在发布前 preflight；出生页数按实际 StartupBlock header、授权表、入口线程描述及 payload 推导，不继续假设固定一页。超过额度、缺失映像和非法引用在副作用前拒绝；实际对象分配或发布失败走致命终局。
 
 #### 纯描述、出生帧与 Namespace 的唯一归属
@@ -104,7 +104,7 @@
 
 System 每个宿主显式取得 `/`（文件根）、`/services`（registry Directory）、`/devices`（独立 observe-only `view` Source）、`/drivers`（driver observer）。driver 自身另收原有 claim/child_register/report_stopped Source；不把该权力或任何 admin/control 放入普通 Namespace。device 的 settings.sources 配置 driver 与 view 两份独立来源，使用既有根 Funding 政策；Pool 选择与用户态软账户分别建立。
 
-init 在所有实例 Pool 和静态入口存在后可逐个发布，不等业务 Ready。每次 Start 前持续登记内核 DONE；此前已运行实例的 DONE 在后续有界构造间隙同样消费。失败时保持现有“封 services → 有界 best-effort Revoke → 封平台根 → 有界收集 → 冷重启”底线，不新增恢复/重试/救援。静态 Sender 资源以显式 `terminal_revoke = true` 声明支持既有通用 revoke 协议并委托给故障终局使用；仅 Sender 可设置，静态校验其 WRITE/WAIT/TRANSIT/DUPLICATE 权利。terminal 从施工开始保存这些标记资源的必要别名；不从名字或 `.admin` 后缀推导协议/授权。不等服务回应才登记，不读领域 settings，不等待 Closed，不把进程死亡当作硬件静止。未声明终局角色的 sender/receiver 施工母本在接线完成后释放，不人为保活 Lifetime。
+init 在所有实例 Pool 和静态入口存在后可逐个发布，不等业务 Ready。每次 Start 前持续登记内核 DONE；此前已运行实例的 DONE 在后续有界构造间隙同样消费。失败时保持现有“封 services → 有界 best-effort Revoke → 封平台根 → 有界收集 → 冷重启”底线，不新增恢复/重试/救援。静态 Sender 资源以显式 `terminal_revoke = true` 声明支持既有通用 revoke 协议并委托给故障终局使用；仅 Sender 可设置，静态校验其 WRITE/WAIT/TRANSFER/DUPLICATE 权利。terminal 从施工开始保存这些标记资源的必要别名；不从名字或 `.admin` 后缀推导协议/授权。不等服务回应才登记，不读领域 settings，不等待 Closed，不把进程死亡当作硬件静止。未声明终局角色的 sender/receiver 施工母本在接线完成后释放，不人为保活 Lifetime。
 
 删除：formation旧字段/格式、实例拓扑业务排序、动态导出收集、所有 init Ready/Export/Stopped 编解码及 Reporter、instance.report/stop 自动资源与观察、三宿主专供其使用的 Stop/Release/Publication 状态、finish/task聚合及 init.stop_all 正常关机链。保留 libservice::instance::revoke（设备/原终局仍消费）、运行期 registry Register/Withdraw、所有实际领域退休/撤销和 driver worker出生协议。init 组件名和 system.toml 文件名不改。
 
@@ -149,7 +149,7 @@ init 在所有实例 Pool 和静态入口存在后可逐个发布，不等业务
 - `just clippy user` 首次退出 101，`artifacts/checks/20261110T074409.901112Z-75740/user.log`：完整 receiver/pair 采用使 ManagementTable::prepare_minted 具有八个独立参数。保留真实边界，以带中文理由的单项 expect 标明，不为 lint 新造无意义 adapter/参数壳；重跑 clippy 通过。
 - `just test-host srv_fs` 退出 101，`artifacts/checks/20261110T074628.484056Z-76994/srv_fs.log`：选择了整个 package，连带为 native 编译仅支持 RV64 的服务 binary，产生已 cfg 排除模块错误；不是三个纯 Config 用例失败。改选既有 library 边界 `-- --lib` 后三项通过，不给正式服务新增客体 harness 或 host runtime。
 
-System file/management 的 output 明确保留 READ/WRITE/SIGNAL/WAIT/MANAGE/TRANSIT/DUPLICATE/GRANT，既有流 Open/CreateOpen 需完整 invitation 权利，不将“静态 sender 的发送权利”误当成全部派生输出 ceiling；Directory 保持目录运输范围，Authority 另允许其显式发布/委托输出。设置均由 fs 解释，不由 init 推导。
+System file/management 的 output 明确保留 READ/WRITE/SIGNAL/WAIT/MANAGE/TRANSFER/DUPLICATE，既有流 Open/CreateOpen 需完整 invitation 权利，不将“静态 sender 的发送权利”误当成全部派生输出 ceiling；Directory 保持目录运输范围，Authority 另允许其显式发布/委托输出。设置均由 fs 解释，不由 init 推导。
 
 本轮新增测试核实资源 owner/权限/付款引用、实例环形接线合法、旧字段拒绝、Namespace纯描述/路径和birth section消费、pair真实身份及fs显式角色政策。现有领域 host 回归同时验证协议与纯机制；不能证明真实 syscall 选Pool、早到消息跨进程采用或硬件/DMA行为。正式运行没有授权，尚无 IF2 的 QEMU 运行证据；此前 Ready/Stopped 路线不是该版本的运行证据。
 
@@ -189,7 +189,7 @@ System file/management 的 output 明确保留 READ/WRITE/SIGNAL/WAIT/MANAGE/TRA
 |---|---|---|---|
 | 正常关机/重启服务入口（用户明确后置） | [电源管理服务](todo-2026-09-power-management-service.md) | 用户选择接续电源功能；开放正常电源请求前闭合 | 受权请求、动作/并发仲裁与已接管意图由服务稳定持有，交接关机完成事实后执行最终动作，失败有明确归属；以真实请求接通为准，不以服务退出代替 |
 | 跨服务正常收束与根监督衔接（用户明确后置） | [关机编排](todo-2026-09-system-shutdown-orchestration.md#服务系统定位与职责修订) | 电源服务开放正常操作前；持久服务接入另触发 drain/flush | 新 owner 下的封口、在途/供应顺序、领域完成、预期退出认证、期限及故障升级接通；最终 reset 前的许可来自真实责任完成，不用 DONE 冒充硬件静止 |
-| pm 与 driver 受托创建（既有后续，非 IF2 遗漏） | [服务装配](todo-2026-10-07-service-assembly.md#下一功能任务建议pm-与驱动进程委托) | 用户确认下一功能范围；引用新出生接口前重核详细设计 | 按该案闭合映像/委托授权、预算、取消到 DONE/退款并接通真实 driver 消费者，删除对应直接创建/竞争控制路径；sealed Image 不冒充 OAL 文件装载 |
+| pm 常规创建与领域创建归属（既有后续，非 IF2 遗漏） | [服务装配](todo-2026-10-07-service-assembly.md#当前接力) | 用户确认下一功能范围；按本轮 Image 输入及能力代理缺口闭合设计 | pm 接收 Image、共同初始 Namespace 与请求方能力集，提供名字列表和分别授权的全列表操作；具体设计由服务装配计划拥有。驱动和用户服务是否迁移尚待选择，不默认删除其直接创建路径 |
 | 服务管理与故障后继续可用（条件后续，非当前恢复承诺） | [服务装配条件表](todo-2026-10-07-service-assembly.md#条件后续与设计交付检查) | 出现真实独立管理或失败后必须继续可用的需求，且获相应范围授权 | 该案核定普通服务/基础集合责任，闭合恢复状态、旧权力/未知结果与新实例边界，接通真实故障消费者；在此之前保留现有基础实例失败终局，不宣称已有救援服务 |
 
 应用/driver bundle、持久存储/仓库、远程目录范围发行等属于各领域既有条件后续，不是 IF2 拆出未做完的功能；从服务装配条件表及对应领域入口按真实消费者接手，本轮不虚构排期。COW/fork 只作概念说明；公开共享 MemorySpace 不是本轮采用的范式；init/组态改名及全权 Tier 1 政策没有形成当前施工承诺。聚合根枚举明确不在前缀路由交付内；这些均不登记为 IF2 已承诺延期债务。

@@ -56,7 +56,7 @@ pub enum ExecutionProfile {
 }
 
 /// ProcessCreate 输出：Builder 与 Control 原子安装，同一事务交付。
-/// Builder持MANAGE|GRANT|TRANSIT、不可DUPLICATE；成功移交仍是同一启动authority。
+/// Builder持MANAGE|TRANSFER、不可DUPLICATE；成功移交仍是同一启动authority。
 /// 未消费的最后Builder释放则Aborted；Control权限为调用者请求的类型上限子集。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C, align(8))]

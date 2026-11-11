@@ -432,7 +432,7 @@ impl KernelObject for WaitSet {
         ObjectKind::WaitSet
     }
     fn allowed_rights(&self) -> Option<Rights> {
-        Some(Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT)
+        Some(Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::TRANSFER)
     }
     fn allowed_signals(&self) -> Option<ObjectSignals> {
         Some(ObjectSignals::READABLE | ObjectSignals::CLOSED)

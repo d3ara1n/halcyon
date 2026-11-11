@@ -172,7 +172,7 @@ impl Binding {
             .ok_or(liboal::protocol::Status::Busy)?
             .discover(core.reference, wire, handle_count, out)
     }
-    /// 只返回固定导出 rights 的描述；运输中的临时 alias 额外保留 TRANSIT，
+    /// 只返回固定导出 rights 的描述；运输中的临时 alias 额外保留 TRANSFER，
     /// 宿主 push 时必须用描述中的 rights，不能把临时运输权一并授予消费者。
     pub fn resource(
         &self,
@@ -196,7 +196,7 @@ impl Binding {
         let used = entry.encode(protocol::HEADER_LEN, out)?;
         let alias = item
             .capability
-            .duplicate(item.descriptor.rights | Rights::TRANSIT)?;
+            .duplicate(item.descriptor.rights | Rights::TRANSFER)?;
         let rights = item.descriptor.rights;
         // 同一 actor 内，在可用性门和复制成功之后、能力离开 owner 进入 Outbox 之前提交。
         let first = !core.resources_exposed;
@@ -277,7 +277,7 @@ impl Work {
         )?;
         let signal = notification::create(
             Rights::READ | Rights::WAIT,
-            Rights::SIGNAL | Rights::DUPLICATE | Rights::TRANSIT,
+            Rights::SIGNAL | Rights::DUPLICATE | Rights::TRANSFER,
         )?;
         let binding = Binding(
             Rc::try_new(RefCell::new(Shared {
@@ -700,7 +700,7 @@ impl Work {
         if matches!(command, ProvisionCommand::Prepare(_)) {
             let handle = libkernel::ipc::object::duplicate(
                 business.signal.peer.as_handle(),
-                Rights::SIGNAL | Rights::TRANSIT,
+                Rights::SIGNAL | Rights::TRANSFER,
             )?;
             // SAFETY: duplicate 返回的新 entry 只移交这次请求，供应者仅得 SIGNAL。
             request
@@ -731,7 +731,7 @@ fn step(step: Step) -> Advance {
 fn sender_alias(sender: &MailboxSender) -> Result<Capability, Error> {
     let handle = libkernel::ipc::object::duplicate(
         sender.as_handle(),
-        Rights::WRITE | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT,
+        Rights::WRITE | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSFER,
     )?;
     // SAFETY: 新 entry 的唯一关闭责任移交给返回值。
     Ok(unsafe { Capability::from_raw(handle) })

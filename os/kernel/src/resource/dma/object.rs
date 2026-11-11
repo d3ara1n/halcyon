@@ -27,15 +27,10 @@ pub(crate) const DOMAIN_RIGHTS: Rights = Rights::from_raw(
         | Rights::MANAGE.raw()
         | Rights::CREATE.raw()
         | Rights::DUPLICATE.raw()
-        | Rights::TRANSIT.raw()
-        | Rights::GRANT.raw(),
+        | Rights::TRANSFER.raw(),
 );
 const MAPPING_RIGHTS: Rights = Rights::from_raw(
-    Rights::READ.raw()
-        | Rights::WAIT.raw()
-        | Rights::DUPLICATE.raw()
-        | Rights::TRANSIT.raw()
-        | Rights::GRANT.raw(),
+    Rights::READ.raw() | Rights::WAIT.raw() | Rights::DUPLICATE.raw() | Rights::TRANSFER.raw(),
 );
 struct Domain {
     header: ObjectHeader,

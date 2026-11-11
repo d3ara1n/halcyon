@@ -37,7 +37,7 @@ fn pair(
         .require(
             &format!("{prefix}.{entry}"),
             ObjectKind::MailboxSender,
-            Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+            Rights::WRITE | Rights::WAIT | Rights::TRANSFER,
         )
         .map_err(|_| SystemCallError::IllegalArgument)?;
     let lifetime = birth
@@ -51,7 +51,7 @@ fn pair(
         receiver,
         sender,
         lifetime,
-        Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+        Rights::WRITE | Rights::WAIT | Rights::TRANSFER,
     )
     .map_err(|failure| failure.error)
 }
@@ -118,7 +118,7 @@ fn main() {
         .take(
             startup::AUTHORITY_INPUT,
             ObjectKind::MailboxSender,
-            Rights::WRITE | Rights::WAIT | Rights::TRANSIT,
+            Rights::WRITE | Rights::WAIT | Rights::TRANSFER,
         )
         .expect("provider publication authority invalid")
         .map(|capability| {

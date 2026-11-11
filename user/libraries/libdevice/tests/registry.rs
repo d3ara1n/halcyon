@@ -85,7 +85,7 @@ fn request(seq: u64, parent: Option<DeviceId>, name: &str, claimable: bool) -> R
             related_object_id: 2000,
             kind: ObjectKind::MailboxSender as u32,
             reserved0: 0,
-            rights: Rights::WRITE | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT,
+            rights: Rights::WRITE | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSFER,
             badge: 0,
             reserved: 0,
         })

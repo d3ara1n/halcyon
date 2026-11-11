@@ -1,4 +1,4 @@
-//! 独立线程的 Pending 启动责任；观察 Control 不持有放弃权。
+//! 独立线程的 Pending 启动责任；票据与 Created 资源不保活进程执行寿命。
 
 use alloc::sync::{Arc, Weak};
 use core::any::Any;
@@ -80,6 +80,8 @@ impl ThreadStartTicket {
                 }
             }
         };
+        // 已释放票据锁；真正发布由 Shell→Members 与最后 ThreadExit 仲裁。
+        // 最后执行器先退出时，即便 Weak 尚能升级也不得恢复已冻结进程。
         let result = thread
             .upgrade()
             .ok_or(SystemCallError::ObjectClosed)
@@ -139,7 +141,7 @@ impl KernelObject for ThreadStartTicket {
     }
 
     fn allowed_rights(&self) -> Option<Rights> {
-        Some(Rights::MANAGE | Rights::GRANT | Rights::TRANSIT)
+        Some(Rights::MANAGE | Rights::TRANSFER)
     }
 
     fn allowed_signals(&self) -> Option<ObjectSignals> {

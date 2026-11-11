@@ -60,6 +60,8 @@ pub enum SystemCallError {
     ClockRange = 0x3c,
     /// 投递线性化点前期限已到，全部源能力未消费。
     DeadlineExpired = 0x3d,
+    /// 转交将形成门控托管环，全部源能力未消费。
+    CyclicTransfer = 0x3e,
 }
 
 impl SystemCallError {
@@ -91,6 +93,7 @@ impl SystemCallError {
             0x3b => Some(Self::StaleHandle),
             0x3c => Some(Self::ClockRange),
             0x3d => Some(Self::DeadlineExpired),
+            0x3e => Some(Self::CyclicTransfer),
             _ => None,
         }
     }
@@ -193,7 +196,7 @@ pub enum SystemCall {
     Peek = 0x42,
     /// 非阻塞原子接收完整消息。
     Receive = 0x43,
-    /// 丢弃队头及其 transit Handles。
+    /// 丢弃队头及其转交能力。
     Discard = 0x44,
     /// 从具 DUPLICATE 权的 sender 派生一次性投递权（send-once）。
     MailboxMakeSendOnce = 0x45,
@@ -276,6 +279,23 @@ pub enum SystemCall {
 #[cfg(test)]
 mod tests {
     use super::{SystemCall, SystemCallError};
+
+    #[test]
+    fn cyclic_transfer_error_round_trips() {
+        use num_traits::{FromPrimitive, ToPrimitive};
+
+        assert_eq!(SystemCallError::CyclicTransfer as u32, 0x3e);
+        assert_eq!(
+            SystemCallError::from_u32(0x3e),
+            Some(SystemCallError::CyclicTransfer)
+        );
+        assert_eq!(
+            <SystemCallError as FromPrimitive>::from_usize(0x3e),
+            Some(SystemCallError::CyclicTransfer)
+        );
+        assert_eq!(SystemCallError::CyclicTransfer.to_u32(), Some(0x3e));
+        assert_eq!(SystemCallError::from_u32(0x3f), None);
+    }
 
     #[test]
     fn memory_pool_numbers_are_stable() {

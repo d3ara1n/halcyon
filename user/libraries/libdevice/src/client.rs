@@ -25,7 +25,7 @@ impl Watch {
         if description.related_object_id != registry
             || !description
                 .rights
-                .contains(Rights::WRITE | Rights::WAIT | Rights::TRANSIT)
+                .contains(Rights::WRITE | Rights::WAIT | Rights::TRANSFER)
         {
             return Err(Error::Permission);
         }

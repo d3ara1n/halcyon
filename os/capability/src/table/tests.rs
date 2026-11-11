@@ -57,7 +57,7 @@ fn obj(policy: ZeroPolicy) -> Obj {
 }
 
 const RW: Rights = Rights::from_raw(Rights::READ.raw() | Rights::WRITE.raw());
-const MOVE: Rights = Rights::GRANT;
+const MOVE: Rights = Rights::TRANSFER;
 
 fn all() -> Rights {
     RW | Rights::DUPLICATE | MOVE
@@ -195,16 +195,16 @@ fn claimed_transfer_attenuates_only_at_commit() {
     let object = obj(ZeroPolicy::Terminal);
     let mut source = CapTable::try_new(&funding()).unwrap();
     let mut destination = CapTable::try_new(&funding()).unwrap();
-    let handle = install(&mut source, &object, RW | Rights::TRANSIT);
-    let (mut cap, ticket) = source.claim(handle, Rights::TRANSIT).unwrap();
+    let handle = install(&mut source, &object, RW | Rights::TRANSFER);
+    let (mut cap, ticket) = source.claim(handle, Rights::TRANSFER).unwrap();
     assert_eq!(cap.attenuate(Rights::MANAGE), Err(TableError::RightsDenied));
     assert!(matches!(source.restore(ticket, cap), Restore::Restored));
     assert_eq!(
         source.get(handle, Rights::WRITE).unwrap().rights(),
-        RW | Rights::TRANSIT
+        RW | Rights::TRANSFER
     );
 
-    let (mut cap, ticket) = source.claim(handle, Rights::TRANSIT).unwrap();
+    let (mut cap, ticket) = source.claim(handle, Rights::TRANSFER).unwrap();
     cap.attenuate(Rights::READ).unwrap();
     source.commit_claim(ticket);
     let received = destination
@@ -476,4 +476,97 @@ fn installation_scratch_is_paid_until_its_owner_is_released() {
     assert_eq!(funds.live.get(), capacity);
     drop(table);
     assert_eq!(funds.live.get(), 0);
+}
+
+// 内层图锁中的实际公开不释放付款存储；预约/迭代器均由外层继续持有。
+#[test]
+fn borrowed_commit_keeps_storage_owners_outside_inner_lock() {
+    let payer = funding();
+    let o = obj(ZeroPolicy::Terminal);
+    let mut table = CapTable::try_new(&payer).unwrap();
+    let reservation = table.reserve(1, &payer).unwrap();
+    let handle = reservation.handles()[0];
+    let mut caps = Buffer::try_empty(1, &payer).unwrap();
+    caps.push(Cap::mint(o.clone(), RW).unwrap());
+    let mut caps = caps.into_iter();
+    let paid = payer.live.get();
+    table.validate_reserved(&reservation, caps.len()).unwrap();
+    table.commit_reserved(&reservation, &mut caps).unwrap();
+    assert_eq!(payer.live.get(), paid, "commit released prepaid storage");
+    assert_eq!(caps.len(), 0);
+    assert_eq!(o.0.count(), 1);
+    assert_eq!(table.get(handle, RW).unwrap().rights(), RW);
+    drop(caps);
+    drop(reservation);
+    assert!(payer.live.get() < paid);
+    assert!(close_release(&mut table, handle).is_some());
+    assert_eq!(o.0.count(), 0);
+}
+
+// 失败必须先于第一项移动；即使第一个槽有效、第二个预约失效，也不部分公开。
+#[test]
+fn borrowed_commit_validates_whole_reservation_before_consuming() {
+    let payer = funding();
+    let o = obj(ZeroPolicy::Terminal);
+    let mut table = CapTable::try_new(&payer).unwrap();
+    let reservation = table.reserve(2, &payer).unwrap();
+    let first = reservation.handles()[0];
+    table.advance_generation(reservation.handles()[1].slot() as usize);
+    let mut caps = vec![
+        Cap::mint(o.clone(), RW).unwrap(),
+        Cap::mint(o.clone(), RW).unwrap(),
+    ]
+    .into_iter();
+    let paid = payer.live.get();
+    assert_eq!(
+        table.commit_reserved(&reservation, &mut caps),
+        Err(TableError::BadReservation)
+    );
+    assert_eq!(caps.len(), 2);
+    assert_eq!(payer.live.get(), paid);
+    assert!(table.get(first, Rights::NONE).is_err());
+    table.rollback(reservation);
+    let last = caps.map(Cap::release).filter(Option::is_some).count();
+    assert_eq!(last, 1);
+    assert_eq!(o.0.count(), 0);
+}
+
+#[test]
+fn borrowed_commit_closed_and_wrong_count_do_not_consume_authority() {
+    let payer = funding();
+    let o = obj(ZeroPolicy::Terminal);
+    let mut table = CapTable::try_new(&payer).unwrap();
+    let reservation = table.reserve(1, &payer).unwrap();
+    let mut caps = vec![
+        Cap::mint(o.clone(), RW).unwrap(),
+        Cap::mint(o.clone(), RW).unwrap(),
+    ]
+    .into_iter();
+    assert_eq!(
+        table.commit_reserved(&reservation, &mut caps),
+        Err(TableError::BadReservation)
+    );
+    assert_eq!(caps.len(), 2);
+    table.shut();
+    assert_eq!(
+        table.commit_reserved(&reservation, &mut caps),
+        Err(TableError::Closed)
+    );
+    assert_eq!(caps.len(), 2);
+    assert_eq!(o.0.count(), 2);
+    table.rollback(reservation);
+    assert_eq!(caps.map(Cap::release).filter(Option::is_some).count(), 1);
+    assert_eq!(o.0.count(), 0);
+}
+
+#[test]
+fn borrowed_commit_accepts_empty_batch_without_dropping_reservation() {
+    let payer = funding();
+    let mut table = CapTable::<Obj, TestCharge>::try_new(&payer).unwrap();
+    let reservation = table.reserve(0, &payer).unwrap();
+    let mut caps = core::iter::empty();
+    let paid = payer.live.get();
+    table.commit_reserved(&reservation, &mut caps).unwrap();
+    assert_eq!(payer.live.get(), paid);
+    drop(reservation);
 }

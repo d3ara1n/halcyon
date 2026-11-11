@@ -70,7 +70,7 @@ impl KernelObject for SystemReset {
     }
 
     fn allowed_rights(&self) -> Option<Rights> {
-        Some(Rights::MANAGE | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT)
+        Some(Rights::MANAGE | Rights::DUPLICATE | Rights::TRANSFER)
     }
 
     fn allowed_signals(&self) -> Option<ObjectSignals> {

@@ -20,7 +20,7 @@ impl Issuance {
         }
         if !self
             .sender_transport
-            .contains(Rights::WRITE | Rights::WAIT | Rights::TRANSIT)
+            .contains(Rights::WRITE | Rights::WAIT | Rights::TRANSFER)
         {
             return Err(crate::protocol::Status::Permission);
         }

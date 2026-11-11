@@ -228,7 +228,7 @@ impl Registry {
             PublishRights::CREATE
         };
         authority.check(Some(name), required)?;
-        let mandatory = Rights::WRITE | Rights::WAIT | Rights::TRANSIT;
+        let mandatory = Rights::WRITE | Rights::WAIT | Rights::TRANSFER;
         let description = endpoint.description().map_err(system)?;
         if context == 0 || !export_transport.is_known() {
             return Err(Status::Invalid);
@@ -445,7 +445,7 @@ impl Registry {
             .ok_or(Status::Internal)?;
         let body = record.body.as_ref().ok_or(Status::Internal)?;
         let transport = body.export_transport & access.output();
-        if !transport.contains(Rights::WRITE | Rights::WAIT | Rights::TRANSIT) {
+        if !transport.contains(Rights::WRITE | Rights::WAIT | Rights::TRANSFER) {
             return Err(Status::Permission);
         }
         let descriptors = bytes(&body.descriptors)?;

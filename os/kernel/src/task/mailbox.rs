@@ -185,6 +185,7 @@ impl CoreState {
 pub struct MailboxCore {
     header: ObjectHeader,
     state: Spinlock<CoreState>,
+    pub(crate) custody: capability::forest::Domain,
     source: WaitQueue,
     _metadata: super::resources::MetadataCharge,
 }
@@ -195,6 +196,7 @@ impl MailboxCore {
         let queue = MessageQueue::new(&pool)?;
         let core = Arc::try_new(Self {
             header: ObjectHeader::try_new().ok_or(SystemCallError::ReachLimit)?,
+            custody: capability::forest::Domain::new(true),
             state: Spinlock::new(
                 crate::sync::ranks::MAILBOX,
                 CoreState {
@@ -252,7 +254,7 @@ impl MailboxCore {
         self.kick();
     }
 
-    /// 此方法内只取 core 锁。cap claim/extract 由 caller 在表锁外准备，
+    /// core → FOREST 仲裁；cap claim 由 caller 在所有目标锁外准备，
     /// 已接管 authority 保证 Pending/使用域在入队线性化前不会消散。
     fn enqueue(
         self: &Arc<Self>,
@@ -265,8 +267,9 @@ impl MailboxCore {
             header,
             payload,
             delivery,
-            mut handles,
+            handles,
         } = message;
+        let gates = super::custody::Gates::prepare(handles.iter());
         let mut state = self.state.lock();
         if let Err(error) = state.admit() {
             return Err((error, delivery, handles));
@@ -274,17 +277,30 @@ impl MailboxCore {
         if let Err(error) = crate::clock::check_delivery(deadline) {
             return Err((error, delivery, handles));
         }
-        for (cap, rights) in handles.iter_mut().zip(rights) {
-            cap.attenuate(*rights)
-                .expect("validated transit rights changed under claimed owner");
-        }
-        state.queue.push_back(Message {
+        // owner 留在图锁外层；闭包只在所有准入成功后取走，失败不裁权。
+        let mut prepared = Some(Message {
             header,
             payload,
             handles,
             delivery,
         });
-        accepted(&mut state);
+        let moved = gates.transfer(Some(&self.custody), || {
+            let mut message = prepared
+                .take()
+                .expect("custody commit lost prepared message");
+            for (cap, rights) in message.handles.iter_mut().zip(rights) {
+                cap.attenuate(*rights)
+                    .expect("validated transfer rights changed under claimed owner");
+            }
+            state.queue.push_back(message);
+            accepted(&mut state);
+        });
+        if let Err(error) = moved {
+            let Message {
+                delivery, handles, ..
+            } = prepared.take().expect("custody failure lost message");
+            return Err((error, delivery, handles));
+        }
         self.publish(&state);
         Ok(())
     }
@@ -383,6 +399,7 @@ impl MailboxCore {
                 return;
             }
             state.closed = true;
+            super::custody::make_root(&self.custody);
             self.publish(&state);
         }
         self.kick();
@@ -471,6 +488,12 @@ pub struct MailboxReceiver {
     _metadata: super::resources::MetadataCharge,
 }
 
+impl MailboxReceiver {
+    pub(crate) fn custody_core(&self) -> Arc<MailboxCore> {
+        self.core.clone()
+    }
+}
+
 impl KernelObject for MailboxReceiver {
     fn holders(&self) -> &capability::Holders {
         &self.holders
@@ -484,7 +507,7 @@ impl KernelObject for MailboxReceiver {
         ObjectKind::MailboxReceiver
     }
     fn allowed_rights(&self) -> Option<Rights> {
-        Some(Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::GRANT)
+        Some(Rights::READ | Rights::WAIT | Rights::MANAGE | Rights::TRANSFER)
     }
     fn allowed_signals(&self) -> Option<ObjectSignals> {
         Some(ObjectSignals::READABLE | ObjectSignals::PEER_CLOSED | ObjectSignals::CLOSED)
@@ -549,7 +572,7 @@ impl KernelObject for MailboxSender {
         self.badge
     }
     fn allowed_rights(&self) -> Option<Rights> {
-        Some(Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::GRANT | Rights::DUPLICATE)
+        Some(Rights::WRITE | Rights::WAIT | Rights::TRANSFER | Rights::DUPLICATE)
     }
     fn allowed_signals(&self) -> Option<ObjectSignals> {
         Some(ObjectSignals::WRITABLE | ObjectSignals::CLOSED)
@@ -616,13 +639,13 @@ impl KernelObject for MailboxOnceSender {
     }
     fn allowed_rights(&self) -> Option<Rights> {
         // 不可复制：每份一次性额度是独立对象。
-        Some(Rights::WRITE | Rights::WAIT | Rights::TRANSIT | Rights::GRANT)
+        Some(Rights::WRITE | Rights::WAIT | Rights::TRANSFER)
     }
     fn allowed_signals(&self) -> Option<ObjectSignals> {
         Some(ObjectSignals::WRITABLE | ObjectSignals::CLOSED)
     }
     core_wait_delegate!();
-    /// 本地 Close、transit 丢弃、进程回收、restore 撤销同一路径：
+    /// 本地 Close、转交丢弃、进程回收、restore 撤销同一路径：
     /// Pending 恰好一次转 Abandoned；未 armed（未发布准备回滚）只退款不产生事件。
     fn on_last_capability(&self) {
         let abandoned = {
@@ -656,7 +679,7 @@ enum ReplyResult {
 }
 
 /// OnceSender 结果的观察壳：只存 OnceSender 数值身份、结果与等待源。
-/// 只可 READ/WAIT（及 DUPLICATE/TRANSIT/GRANT），无设置结果或取消发送的权限。
+/// 只可 READ/WAIT（及 DUPLICATE/TRANSFER），无设置结果或取消发送的权限。
 pub struct ReplyObserver {
     holders: capability::Holders,
     header: ObjectHeader,
@@ -709,7 +732,7 @@ impl KernelObject for ReplyObserver {
         self.once_id.0.load(Ordering::Relaxed)
     }
     fn allowed_rights(&self) -> Option<Rights> {
-        Some(Rights::READ | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT)
+        Some(Rights::READ | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSFER)
     }
     fn allowed_signals(&self) -> Option<ObjectSignals> {
         Some(ObjectSignals::DONE | ObjectSignals::PEER_CLOSED)
@@ -811,7 +834,7 @@ pub fn mint_sender(
     let sender_cap = handle::mint(sender, rights);
     let observer_cap = handle::mint(
         observer,
-        Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT,
+        Rights::WAIT | Rights::DUPLICATE | Rights::TRANSFER,
     );
     let (sender_cap, observer_cap) = match (sender_cap, observer_cap) {
         (Ok(s), Ok(o)) => (s, o),
@@ -893,7 +916,7 @@ pub fn make_send_once(
     let once_cap = handle::mint(once_ref, rights)?;
     let observation_cap = match handle::mint(
         observation_ref,
-        Rights::READ | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT | Rights::GRANT,
+        Rights::READ | Rights::WAIT | Rights::DUPLICATE | Rights::TRANSFER,
     ) {
         Ok(cap) => cap,
         Err(error) => {
@@ -1074,9 +1097,9 @@ pub fn send(
     let mut rights =
         MetadataBuffer::try_empty(input.moves.len(), &funding).map_err(map_storage_error)?;
     let delivery = super::delivery::Delivery::create(object.header().koid(), usage, pool.clone())?;
-    let delivery = handle::mint(delivery, Rights::TRANSIT | Rights::GRANT)?;
+    let delivery = handle::mint(delivery, Rights::TRANSFER)?;
     for (handle, wanted) in input.moves.iter() {
-        match Invocation::claim(thread, *handle, Rights::TRANSIT) {
+        match Invocation::claim(thread, *handle, Rights::TRANSFER) {
             Ok(claim) if wanted.is_known() && wanted.is_subset_of(claim.cap().rights()) => {
                 rights.push(*wanted);
                 claims.push(claim);
@@ -1268,22 +1291,40 @@ fn finish_receive(
             error,
         );
     }
-    let committed = body.handles.lock().commit(reservation, handles);
+    let gates = super::custody::Gates::prepare(handles.iter());
+    // 所有存储 owner 留在图锁外；commit_reserved 只搬移到已验证空槽。
+    let mut caps = handles.into_iter();
+    let committed = {
+        let mut table = body.handles.lock();
+        match table.validate_reserved(&reservation, caps.len()) {
+            Ok(()) => {
+                // 执行进程表是独立根；安装与 cut 由同一表锁/图锁嵌套公开，
+                // 不留下迟到 cut 误删另一线程刚转交到新邮箱的边。
+                gates
+                    .transfer(None, || {
+                        table
+                            .commit_reserved(&reservation, &mut caps)
+                            .expect("validated receive reservation changed under table lock");
+                    })
+                    .expect("root receive transfer cannot fail");
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    };
     // 复制完成后出队责任不可回退；shut 只撤销新槽公开，不撤销消息 Sent。
+    // 预约/空迭代器付款与未安装 Cap 全部在 FOREST 外收束；core 仍 pin 原父域。
+    if committed.is_err() {
+        body.handles.lock().rollback(reservation);
+    } else {
+        drop(reservation);
+    }
     core.commit_receive(token);
+    handle::release_all(caps);
     core.kick();
     match committed {
-        Ok(capability::Commit::Installed(_)) => Ok(()),
-        Ok(capability::Commit::Released { events, .. }) => {
-            for event in events {
-                super::cap::deliver(Some(event));
-            }
-            Ok(())
-        }
-        Err((caps, error)) => {
-            handle::release_all(caps);
-            Err(handle::map_error(error))
-        }
+        Ok(()) | Err(capability::TableError::Closed) => Ok(()),
+        Err(error) => Err(handle::map_error(error)),
     }
 }
 fn rollback(

@@ -68,7 +68,7 @@ VM/backing退款由[`mm.md`](mm.md)拥有，生命周期与启动门由[`task.md
 
 根的对象/节点/Work 由 root Pool 付款；全部描述、cap 槽和启动输入准备成功后才允许 Start。铸根或安装前失败先释放已铸 capabilities，再沿原 Shell/Builder 失败路径收束。记录只关联节点和真实 handle 槽，不复制物理几何；几何由 control 查询和只读 DT 对应。
 
-平台对象使用正常 root Pool funding 和 MemoryObject owner，分配页清零。初始化仅在初始进程 Building、无可运行消费者时经 `initialize_boot_page` 写入，单次范围不得跨目标页；这不是公开对象的写权限旁路。对象只交付 READ/WAIT/DUPLICATE/TRANSIT/GRANT，不交 WRITE/EXECUTE/MANAGE。用户看不到原 DTB 首尾页的其他内容；对象尾部 padding 为零，原 reservation 可在初始进程 Start 前归还。
+平台对象使用正常 root Pool funding 和 MemoryObject owner，分配页清零。初始化仅在初始进程 Building、无可运行消费者时经 `initialize_boot_page` 写入，单次范围不得跨目标页；这不是公开对象的写权限旁路。对象只交付 READ/WAIT/DUPLICATE/TRANSFER，不交 WRITE/EXECUTE/MANAGE。用户看不到原 DTB 首尾页的其他内容；对象尾部 padding 为零，原 reservation 可在初始进程 Start 前归还。
 
 [`srv_init::platform`](../../user/services/srv_init/src/platform.rs) 用 Description::parse 严格核完整初始数组长度与逐项槽关系；[`libpci::platform`](../../user/libraries/libpci/src/platform.rs) 共同拥有只读 View、描述格式、DTB totalsize、节点 token、尾部零填充及实际 kind/rights/几何核验，供 init 和设备服务复用。后继只解码只读事实，不把初始 handle_index 当成自己的授权。共享解析器 [`shared/dtb`](../../shared/dtb/src/lib.rs) 的 `node_at_offset` 从结构块按文法推进，拒绝属性值中伪装的 BEGIN_NODE 字样。每条 MMIO 记录必须有真实 MmioControl、完整启动权限、未关闭/无成员状态，并与节点 ECAM 或 memory window 的 CPU 几何一致；拒绝 PIO、重复物理根和不支持的资源类型。IRQ 记录必须为唯一 IrqControl，初始 flags/generation 为零，source 范围与 DT 的 PCI interrupt-map 相符且 target 非空。init 将只读对象/映射与 typed 控制根保存到进程退出。失败不发布输入，已有 root owner 正常关闭，Unmap 失败时实际 View 归 VM 自动退出。DMA 记录必须为唯一 DmaDomainControl，快照的显式模式与一致性匹配支持 profile，flags/members/reserved 为零，DT host 声明 coherent。通用 `libprocess::context` 的可采用类型表包含 MMIO/IRQ control/use 和 DMA domain/use/mapping，可正常 Grant 给后继进程；它不解释平台数据。
 
@@ -121,7 +121,7 @@ Preparation 首次失败后冻结状态，重复 advance 返回同一错误。�
 
 Executor 先派生全部具名/实例 Pool，建立 Job，再按声明的 payer 预建所有 Mailbox，最后铸造各 Sender/Lifetime。Mailbox receiver 只持一个施工 owner，sender 主输出可按同一真实身份复制，Lifetime 是独立输出。各工厂的选定 Pool 直接支付对象及持久派生存储；能力转授不迁费。init 自有共享 Image 缓存、输入拷贝及装载暂存继续由自身付款。付款工厂和运输寿命见 [IPC 实现](ipc.md)。
 
-实例按确定序逐个经原 Preparation 构造和 ProcessStart，不等待其他服务 Ready；彼此引用 sender 不产生启动排序。receiver/Lifetime 输入 move，普通 sender 输入和 Namespace binding 使用缩权别名；只有施工源保留所需 GRANT，目标按声明接收。借用 grants 的所有退出边，包括中途观察到另一服务 DONE，均按 Preparation 的 GrantOutcome 兑现消费事实，不能在消费后再次关闭源 handle。所有进程 Start 前均在同一 WaitSet 登记 DONE；装载/拷贝的有界步之间同时消费已发布进程的观察。发布完成后丢弃普通施工 sender 和未交付的 Lifetime，不保留多余 receiver；仅明确声明终局角色的 sender 持续由 init 持有。
+实例按确定序逐个经原 Preparation 构造和 ProcessStart，不等待其他服务 Ready；彼此引用 sender 不产生启动排序。receiver/Lifetime 输入 move，普通 sender 输入和 Namespace binding 使用缩权别名；只有施工源保留所需 TRANSFER，目标按声明接收。借用 grants 的所有退出边，包括中途观察到另一服务 DONE，均按 Preparation 的 GrantOutcome 兑现消费事实，不能在消费后再次关闭源 handle。所有进程 Start 前均在同一 WaitSet 登记 DONE；装载/拷贝的有界步之间同时消费已发布进程的观察。发布完成后丢弃普通施工 sender 和未交付的 Lifetime，不保留多余 receiver；仅明确声明终局角色的 sender 持续由 init 持有。
 
 ### 出生与初始 Namespace
 

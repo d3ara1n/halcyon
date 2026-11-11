@@ -127,7 +127,7 @@ pub fn derive_job(
 
 /// ProcessCreate：Building process + affine ProcessBuilder + ProcessControl
 /// 同一事务交付；control_rights 显式请求并被校验为最大 rights 子集。
-/// 返回唯一Builder（MANAGE|GRANT|TRANSIT）及按显式rights铸造的Control。
+/// 返回唯一Builder（MANAGE|TRANSFER）及按显式rights铸造的Control。
 /// Builder运输/授予失败返原owner；Start成功消费启动权，随后由Kernel持责任。
 pub fn create(
     job: Handle,

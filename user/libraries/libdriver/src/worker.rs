@@ -24,11 +24,7 @@ use libkernel::ipc::{
 };
 use librpc::outbox::Outbox;
 pub const TRANSPORT: Rights = Rights::from_raw(
-    Rights::WRITE.raw()
-        | Rights::WAIT.raw()
-        | Rights::DUPLICATE.raw()
-        | Rights::TRANSIT.raw()
-        | Rights::GRANT.raw(),
+    Rights::WRITE.raw() | Rights::WAIT.raw() | Rights::DUPLICATE.raw() | Rights::TRANSFER.raw(),
 );
 pub fn alias(sender: &MailboxSender) -> Result<Capability, Error> {
     let handle = object::duplicate(sender.as_handle(), TRANSPORT)?;
@@ -458,7 +454,7 @@ impl ActivationSlot {
                     Rights::READ | Rights::WAIT | Rights::MANAGE,
                     Rights::SIGNAL,
                 )?;
-                let rights = Rights::WAIT | Rights::DUPLICATE | Rights::TRANSIT;
+                let rights = Rights::WAIT | Rights::DUPLICATE | Rights::TRANSFER;
                 let observer = pair.owner.mint_observer(rights)?;
                 self.observers[index] = Some(Observer {
                     context: identity,
