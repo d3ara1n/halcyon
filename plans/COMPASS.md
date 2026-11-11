@@ -26,6 +26,7 @@ host 验证与正式运行按[构建与验证手册](BUILD-AND-TEST.md)选择；
 
 | 类型 | 入口 |
 |---|---|
+| TRANSFER 与发布执行寿命交付的可选独立 Review | [固定 0481656 的登记](todo-2026-11-11-capability-transfer-review.md)，含本轮 pm 范围设计，未执行 |
 | IF2 静态资源与 OAL 组态装配交付的可选独立 Review | [固定 c8c54da 的登记](todo-2026-11-10-if2-review.md)，未执行 |
 | 五批 Review 当前责任与处置 | [统一报告](review-2026-10-12-consolidated.md) |
 | 审计剩余发现 | [架构审计发现承接](todo-2026-09-14-architecture-audit-findings.md) |
